@@ -310,6 +310,10 @@ rate limit.
 
 ## Scripts
 
+Viberon is an Electron desktop application. The web server is only the local
+renderer used by Electron during development and by AI test runs; use
+`pnpm dev:desktop` for the product experience.
+
 ```bash
 pnpm dev            # Next.js dev server
 pnpm build          # production build (typechecks)

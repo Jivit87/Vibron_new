@@ -4,6 +4,7 @@ const { spawn } = require('child_process');
 const http = require('http');
 const net = require('net');
 const path = require('path');
+const { getDevServerUrl } = require('./dev-server-url');
 
 let mainWindow;
 let nextProcess;
@@ -60,7 +61,7 @@ function createWindow() {
   }
 
   if (isDev) {
-    window.loadURL('http://localhost:3000');
+    window.loadURL(getDevServerUrl());
   } else {
     // Production: start Next.js server
     void startNextServer(window);
