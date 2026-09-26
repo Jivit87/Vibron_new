@@ -53,6 +53,8 @@ export interface HeadlessOptions {
   /** Final `reviewDiff` pass on an accepted fix (off by default). */
   review?: boolean;
   reviewModel?: string;
+  /** Run a blind independent issue test after the verification gate accepts. */
+  independentTest?: boolean;
   /** Deliver a resolved fix: branch, commit, push, draft PR. Never changes the exit code. */
   deliver?: boolean;
   /** Issue to comment on after delivery (default: the task, when it is an issue URL). */
@@ -320,6 +322,7 @@ export async function runHeadless(options: HeadlessOptions, deps: HeadlessDeps =
         },
         useRepoRules: false,
         ...(options.review ? { review: true, ...(options.reviewModel ? { reviewModel: options.reviewModel } : {}) } : {}),
+        ...(options.independentTest ? { independentTest: true } : {}),
       });
     } finally {
       if (timer) clearTimeout(timer);

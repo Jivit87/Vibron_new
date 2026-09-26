@@ -105,18 +105,23 @@ export function resolveOpenAiCompatEnv(): OpenAiCompatConfig {
   const key = env("AI_API_KEY") || env("OPENAI_API_KEY") || null;
   const baseUrl = env("AI_BASE_URL") || env("VIBERON_OPENAI_BASE_URL");
   const explicit = env("AI_PROVIDER").toLowerCase() as DetectedProvider | "";
+  const requestedModel = env("AI_MODEL") || env("VIBERON_MODEL");
   let provider: DetectedProvider;
   if (explicit && explicit in PROVIDER_TABLE) provider = explicit;
   else if (baseUrl) {
     const detected = detectProvider(key);
     provider = isAzureUrl(baseUrl)
       ? "azure"
+      : /^https?:\/\/api\.deepseek\.com(?::\d+)?(?:\/|$)/i.test(baseUrl)
+        ? "deepseek"
       : detected && detected !== "anthropic"
         ? detected
         : "openai-compatible";
   } else {
     const detected = detectProvider(key);
-    provider = detected && detected !== "anthropic" ? detected : "openai";
+    provider = detected === "openai" && /^deepseek(?:[-/]|$)/i.test(requestedModel)
+      ? "deepseek"
+      : detected && detected !== "anthropic" ? detected : "openai";
   }
   const spec = PROVIDER_TABLE[provider];
   const url = (baseUrl || spec.baseUrl || PROVIDER_TABLE.openai.baseUrl).replace(/\/+$/, "");
@@ -124,7 +129,7 @@ export function resolveOpenAiCompatEnv(): OpenAiCompatConfig {
   return {
     provider,
     baseUrl: url,
-    model: env("AI_MODEL") || env("VIBERON_MODEL") || spec.model,
+    model: requestedModel || spec.model,
     apiKey: key,
     azure,
     apiVersion: env("AI_API_VERSION") || (azure ? "2024-10-21" : ""),

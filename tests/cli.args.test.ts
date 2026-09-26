@@ -64,6 +64,20 @@ describe("parseCliArgs", () => {
     expect(parseCliArgs(["run", "--help"])).toEqual({ command: "help" });
   });
 
+  it("parses an arena report input", () => {
+    expect(parseCliArgs(["arena", "report", "results/sonnet.jsonl", "--json"])).toEqual({
+      command: "arena",
+      action: "report",
+      file: "results/sonnet.jsonl",
+      json: true,
+    });
+  });
+
+  it("enables the blind test writer only when requested", () => {
+    expect(parseCliArgs(["run", "--repo", "/r", "--task", "fix", "--independent-test"]))
+      .toMatchObject({ command: "run", independentTest: true });
+  });
+
   it("rejects bad input", () => {
     expect(() => parseCliArgs(["run", "--task", "x"])).toThrow(CliError);
     expect(() => parseCliArgs(["run", "--repo", "r"])).toThrow(/--task/);

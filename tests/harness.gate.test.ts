@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { Gate, guessReproduction, isTestPath, summarizeOutput, type GateOptions } from "@/lib/harness/gate";
+import { Gate, guessReproduction, isTestPath, rootRelative, summarizeOutput, type GateOptions } from "@/lib/harness/gate";
 import { snapshot } from "@/lib/harness/snapshot";
 import type { VerifyCommand } from "@/lib/verify/types";
 import { eventLog } from "./helpers/harness-workspace";
@@ -92,6 +92,15 @@ describe("Gate", () => {
     expect(log.of("checkpoint").at(-1)).toMatchObject({ kind: "best", ref: res.tree });
   });
 
+  it("runs a reproduction that cds into the work tree against the original code too", async () => {
+    repo.write("lib.js", RIGHT);
+    // Without rewriting, this `cd` would run the "original" side in the patched tree.
+    const res = await gate.verify({ summary: "guard empty input", reproduction: `cd ${repo.root} && ${REPRO}` });
+    expect(res.checks[0]).toMatchObject({ origin: "agent", command: `cd . && ${REPRO}`, verdict: "fixes" });
+    expect(res).toMatchObject({ decision: "accept", strength: "strong" });
+    expect(rootRelative(`python ${repo.root}/x.py ${repo.root}2/y.py`, repo.root)).toBe(`python ./x.py ${repo.root}2/y.py`);
+  });
+
   it("rejects a reproduction that still fails", async () => {
     repo.write("lib.js", `${ORIGINAL}// touched\n`);
     const res = await gate.verify({ summary: "noop", reproduction: REPRO });
@@ -141,6 +150,13 @@ describe("Gate", () => {
     expect(await gate.compare("node test/lib.test.js", 30_000)).toMatch(/Verdict: regression/);
     expect(await gate.compare("node -e 'process.exit(1)'", 30_000)).toMatch(/Verdict: pre_existing/);
     expect(repo.read("lib.js")).toBe(WRONG);
+  });
+
+  it("returns structured original and patched outcomes for a blind test", async () => {
+    repo.write("lib.js", RIGHT);
+    const result = await gate.compareIndependent(REPRO);
+    expect(result).toMatchObject({ beforePassed: false, afterPassed: true });
+    expect(result.beforeOutput).toMatch(/AssertionError|ERR_ASSERTION/);
   });
 });
 

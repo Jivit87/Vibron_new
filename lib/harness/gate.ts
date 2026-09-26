@@ -20,7 +20,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -186,6 +186,27 @@ export function isTestPath(p: string): boolean {
 
 function tailOf(output: string, lines = 40): string {
   return output.trimEnd().split("\n").slice(-lines).join("\n");
+}
+
+/**
+ * The agent's command with the work tree's absolute path replaced by `.`.
+ * Models often write `cd /abs/repo && python repro.py`; run in the temporary
+ * checkout of the original code, that `cd` would jump back into the PATCHED
+ * tree, and "original vs patched" would compare the patch with itself.
+ */
+export function rootRelative(command: string, root: string): string {
+  const roots = new Set([root.replace(/\/+$/, "")]);
+  try {
+    roots.add(realpathSync(root).replace(/\/+$/, ""));
+  } catch {
+    // Missing root: nothing to resolve.
+  }
+  let out = command;
+  for (const r of [...roots].filter((r) => r.length > 1).sort((a, b) => b.length - a.length)) {
+    const escaped = r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`${escaped}(?=[/\\s'";&|)]|$)`, "g"), ".");
+  }
+  return out;
 }
 
 /** Python resolves the package from the directory under test, not from an editable install. */
@@ -467,8 +488,9 @@ export class Gate {
   }
 
   /** The `compare` tool: one command on the original code and on the current code. */
-  async compare(command: string, timeoutMs: number): Promise<string> {
+  async compare(raw: string, timeoutMs: number): Promise<string> {
     const { root, baseRef } = this.options;
+    const command = rootRelative(raw, root);
     const run = (cwd: string) => this.runner(command, { cwd, timeoutMs, signal: this.options.signal, env: pythonPath(cwd) });
     const mine = await run(root);
     const fmt = (r: RawRun) => summarizeOutput(r.output, r.exitCode, r.timedOut);
@@ -494,6 +516,23 @@ export class Gate {
     let body = `ORIGINAL code: ${fmt(orig)}\nYOUR code:     ${fmt(mine)}\nVerdict: ${verdict}\n\nOutput with your code (tail):\n${tailOf(mine.output, 30)}`;
     if (o !== m || !o) body += `\n\nOutput with the original code (tail):\n${tailOf(orig.output, 15)}`;
     return body;
+  }
+
+  /** Execute a blind regression script on both trees without changing the gate ruling. */
+  async compareIndependent(command: string): Promise<{
+    beforePassed: boolean;
+    afterPassed: boolean;
+    beforeOutput: string;
+    afterOutput: string;
+  }> {
+    const after = await this.runOnce(command, this.options.root);
+    const before = await this.onOriginal((dir) => this.runOnce(command, dir));
+    return {
+      beforePassed: before.passed,
+      afterPassed: after.passed,
+      beforeOutput: before.output,
+      afterOutput: after.output,
+    };
   }
 
   /**
@@ -550,7 +589,7 @@ export class Gate {
         checks.push({ command: c, origin, before: null, after: null, verdict: "error", newFailures: [], fixed: [] });
       }
     };
-    if (input.reproduction) add(input.reproduction, "agent");
+    if (input.reproduction) add(rootRelative(input.reproduction, root), "agent");
     const related = await this.relatedCommands(changed.filter((c) => c.status !== "D").map((c) => c.path));
     for (const c of related) add(c, "related-tests");
     if (!related.length) for (const s of this.options.suite) add(s.command, "suite");

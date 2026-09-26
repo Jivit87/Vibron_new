@@ -22,8 +22,10 @@ export interface OpenAiMessage {
   }[];
   tool_call_id?: string;
   name?: string;
-  /** Passed-back reasoning (gpt-oss is trained to see its own earlier analysis). */
+  /** Passed-back reasoning for gpt-oss and other compatible endpoints. */
   reasoning?: string;
+  /** DeepSeek thinking mode requires this field on prior assistant turns. */
+  reasoning_content?: string;
 }
 
 /** Google's documented value for a function call that has no signature of its own. */
@@ -34,6 +36,7 @@ export function toOpenAiMessages(
   options: {
     toolNames?: boolean;
     reasoningWindow?: number;
+    reasoningField?: "reasoning" | "reasoning_content";
     /**
      * Gemini: every function call must carry the `thought_signature` the
      * model returned with it. Calls without one (made by another model before
@@ -89,7 +92,9 @@ export function toOpenAiMessages(
         role: "assistant",
         content: text || null,
         ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-        ...(reasoning ? { reasoning } : {}),
+        ...(options.reasoningField === "reasoning_content"
+          ? { reasoning_content: reasoning }
+          : reasoning ? { reasoning } : {}),
       });
       continue;
     }

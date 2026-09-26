@@ -1,9 +1,10 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { runRunCommand } from "@/lib/harness/workspace-services";
 import {
   getSession,
   killSession,
@@ -47,6 +48,18 @@ describe.runIf(posix)("terminal sessions", () => {
     expect(json.runId).toBe("r0");
     expect(json.offset).toBe(json.output.length);
     expect(session.chunks.at(-1)!.offset).toBe(session.buffer.end);
+  });
+
+  it("runs agent commands with the repo's virtualenv first on PATH", async () => {
+    const repo = mkdtempSync(path.join(tmpdir(), "vb-venv-"));
+    const bin = path.join(repo, ".venv", "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(path.join(bin, "python"), "#!/bin/sh\necho venv-python\n");
+    chmodSync(path.join(bin, "python"), 0o755);
+    // The same runner the agent's run_command and the gate's checks use.
+    const agent = await runRunCommand({ repoKey: "t", command: "python", cwd: repo, runId: "r-venv" });
+    expect(agent.exitCode).toBe(0);
+    expect(agent.output).toContain("venv-python");
   });
 
   it("does not leak API keys into child processes", async () => {

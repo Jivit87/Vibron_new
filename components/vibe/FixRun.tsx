@@ -135,6 +135,12 @@ const PHASE_LABEL: Record<VerificationRecord["phase"], string> = {
   final: "Final check",
 };
 
+/** A check with no test counts (a compile or syntax check) is summarised by its exit code. */
+function resultLabel(record: VerificationRecord): string {
+  if (record.passed + record.failed > 0) return `${record.passed} passed · ${record.failed} failed`;
+  return record.exitCode === 0 ? "ok" : `exit ${record.exitCode ?? "?"}`;
+}
+
 /** One harness-run check, inline in the trace. */
 export function VerificationRow({ record }: { record: VerificationRecord }) {
   const regressions = record.checks.filter((c) => c.verdict === "regression").length;
@@ -151,7 +157,7 @@ export function VerificationRow({ record }: { record: VerificationRecord }) {
         {PHASE_LABEL[record.phase]}
       </span>
       <span className="shrink-0 font-mono text-[11.5px]" style={{ color: "var(--vb-text-dim)" }}>
-        {record.passed} passed · {record.failed} failed
+        {resultLabel(record)}
         {record.timedOut ? " · timed out" : ""}
       </span>
       {record.phase !== "baseline" && fixes > 0 && (

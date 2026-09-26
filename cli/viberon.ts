@@ -12,6 +12,7 @@
  *   viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--no-deliver] [--model <id>] [--json]
  *   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
  *   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
+ *   viberon arena report <results.jsonl> [--json]
  */
 
 export const USAGE = `Usage:
@@ -28,6 +29,7 @@ export const USAGE = `Usage:
       --json              print result.json to stdout
       --review            review an accepted fix with a cheap model; a high finding sends it back once
       --review-model <id> model for --review (default: the cheapest agentic model)
+      --independent-test  generate and execute a blind issue test with local runner permissions
       --deliver           on a verified fix: branch viberon/<slug>, commit, push, open a draft PR
       --issue-url <url>   with --deliver: comment the PR and evidence on this issue
                           (default: the task, when it is an issue URL)
@@ -38,6 +40,8 @@ export const USAGE = `Usage:
       worktree of origin/<default>, and opens a draft PR for every fix its checks prove
   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
+  viberon arena report <results.jsonl> [--json]
+      compares harnesses on tasks completed by every harness; ranks by fixes, tokens, then time
 
 Exit codes (run): 0 resolved/unverified, 1 failed/incomplete, 2 error (delivery never changes them).
 Exit codes (review): 0 reviewed, 2 error.
@@ -62,6 +66,7 @@ export interface RunArgs {
   issueUrl?: string;
   review?: boolean;
   reviewModel?: string;
+  independentTest?: boolean;
 }
 
 export interface ReviewArgs {
@@ -100,11 +105,18 @@ export interface EvalArgs {
   timeoutSec?: number;
 }
 
-export type CliArgs = RunArgs | ReviewArgs | IssuesArgs | CloneArgs | EvalArgs | { command: "help" };
+export interface ArenaArgs {
+  command: "arena";
+  action: "report";
+  file: string;
+  json: boolean;
+}
+
+export type CliArgs = RunArgs | ReviewArgs | IssuesArgs | CloneArgs | EvalArgs | ArenaArgs | { command: "help" };
 
 export class CliError extends Error {}
 
-const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-deliver"]);
+const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-deliver", "independent-test"]);
 
 function splitFlags(argv: string[]): { flags: Map<string, string | true>; positionals: string[] } {
   const flags = new Map<string, string | true>();
@@ -150,12 +162,13 @@ const KNOWN: Record<string, Set<string>> = {
   run: new Set([
     "repo", "task", "task-file", "task-id", "worktree", "keep-worktree", "out", "test-cmd",
     "no-gate", "max-turns", "timeout", "model", "json", "help", "deliver", "issue-url",
-    "review", "review-model",
+    "review", "review-model", "independent-test",
   ]),
   review: new Set(["repo", "base", "pr", "model", "json", "help"]),
   issues: new Set(["repo", "label", "fix", "no-deliver", "model", "json", "help"]),
   clone: new Set(["ref", "depth", "setup", "json", "help"]),
   eval: new Set(["only", "model", "max-turns", "timeout", "help"]),
+  arena: new Set(["json", "help"]),
 };
 
 export function parseCliArgs(argv: string[]): CliArgs {
@@ -166,6 +179,13 @@ export function parseCliArgs(argv: string[]): CliArgs {
   if (flags.has("help")) return { command: "help" };
   for (const name of flags.keys()) {
     if (!KNOWN[command]!.has(name)) throw new CliError(`Unknown option for ${command}: --${name}`);
+  }
+
+  if (command === "arena") {
+    if (positionals[0] !== "report" || !positionals[1] || positionals.length > 2) {
+      throw new CliError("arena: use report <results.jsonl>");
+    }
+    return { command, action: "report", file: positionals[1], json: flags.has("json") };
   }
 
   if (command === "run") {
@@ -198,6 +218,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
       ...(issueUrl ? { issueUrl } : {}),
       ...(flags.has("review") ? { review: true } : {}),
       ...(reviewModel ? { reviewModel } : {}),
+      ...(flags.has("independent-test") ? { independentTest: true } : {}),
     };
   }
   if (command === "review") {
@@ -273,6 +294,21 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
+  if (args.command === "arena") {
+    try {
+      const [{ readFile }, { parseArenaJsonl, summarizeArena, renderArenaMarkdown }] = await Promise.all([
+        import("node:fs/promises"),
+        import("@/eval/arena"),
+      ]);
+      const report = summarizeArena(parseArenaJsonl(await readFile(args.file, "utf8")));
+      process.stdout.write(args.json ? `${JSON.stringify(report, null, 2)}\n` : renderArenaMarkdown(report));
+      return report.commonTasks.length ? 0 : 1;
+    } catch (error) {
+      log(`arena report failed: ${error instanceof Error ? error.message : String(error)}`);
+      return 2;
+    }
+  }
+
   if (args.command === "run") {
     const { runHeadless } = await import("@/lib/headless/run");
     const outcome = await runHeadless({
@@ -293,6 +329,7 @@ export async function main(argv: string[]): Promise<number> {
       issueUrl: args.issueUrl,
       review: args.review,
       reviewModel: args.reviewModel,
+      independentTest: args.independentTest,
     });
     if (args.json) process.stdout.write(`${JSON.stringify(outcome.result, null, 2)}\n`);
     else {
