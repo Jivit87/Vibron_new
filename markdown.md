@@ -130,3 +130,21 @@ Status: **built** = merged on main with tests green · **in progress** = an agen
   - Planner: `tests/contract.round5.test.ts` (engine events and settings route through the UI readers); `eval/swe/results/` ignored.
   - Merged the other session's token-usage UI (ledger attribution, usage panel, token heatmap layer, status chip; `turn_usage` emission survives the runner changes).
   - 835 tests pass; tsc and eslint clean; clean-checkout next build green.
+- **2026-09-27, speed round** (the user asked: seconds per task, fewer tokens). Every change was measured on real `config-merge` runs through the Claude CLI (Sonnet) and graded with the hidden tests:
+
+  | Run | Change | Time | Calls | Hidden |
+  |---|---|---|---|---|
+  | 1 | round 5, all layers after accept | 117 s | 17 | 6/6 |
+  | 2 | criteria/writer off the critical path | 72 s | 15 | **5/6** (dicts but not lists) |
+  | 3 | generalizing criteria + reviewer on | 152 s | 18 | 6/6 |
+  | 4 | **fast path** (one agent; escalate only on weak proof; CLI thinking off for side calls) | 39 s | 5 | 6/6 |
+  | 5 | repo on PYTHONPATH for scratch scripts | 41 s | 5 | 6/6 |
+  | 6 | text protocol allows batched calls | 25 s | 2 | 6/6 |
+  | 7, 8 | fast attempt at medium effort | **16 s, 11 s** | **1** | 6/6 |
+
+  - Root causes found:
+    - the CLI thinks by default and ignores max_tokens (4,591 tokens / 44 s for criteria);
+    - "ONE tool call per reply" in the text protocol;
+    - scratch scripts could not import the repo;
+    - every task ran four agents.
+  - Merged the Stop fix and per-task usage (d9), the live usage panel (developer-dd), and delivery hardening (d9: rate limits/ETag, stable issue branches, locks, secret redaction). 882 tests pass; clean build is green.
