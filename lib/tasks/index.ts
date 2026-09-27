@@ -56,6 +56,21 @@ export interface Task {
   deliver?: boolean;
   model?: string;
   /**
+   * A batch (`issueUrls`) only: "per-issue" opens one PR per proven issue
+   * (each delivered off its own worktree/branch); "combined" (the original
+   * behaviour) cherry-picks every proven fix onto one branch and opens one
+   * PR for the lot. Default "combined" so a plain `combined: true` request
+   * keeps behaving exactly as before; pass `prMode: "per-issue"` to opt in.
+   */
+  prMode?: "per-issue" | "combined";
+  /**
+   * "per-issue" mode only: true (default) opens each issue's PR as soon as
+   * that issue is proven; false collects proven fixes without delivering
+   * them (their commits stay reachable; nothing is pushed or opened) —
+   * unproven issues never get a PR either way.
+   */
+  autoPr?: boolean;
+  /**
    * Token use and cost: live while running (summed from the task's
    * `turn_usage` events), final once it ends (the solve's own metrics win
    * when they account for more). Persisted with the task.
@@ -63,6 +78,14 @@ export interface Task {
   usage?: TaskUsage;
   /** A batch's per-issue outcome: which issues its PR actually fixes. */
   issueResults?: IssueResult[];
+  /**
+   * A batch's live/final per-issue state: status, phase, timing, usage,
+   * per-issue PR. See `IssueProgress`. Updated live from the task's
+   * `issue_progress` marker events (see `EventLog`/`run()` below), so it is
+   * visible from GET /api/tasks/:id and the SSE stream while the batch runs,
+   * not only once it ends.
+   */
+  issueProgress?: IssueProgress[];
 }
 
 export interface TaskUsage {
@@ -79,6 +102,57 @@ export interface IssueResult {
   url: string;
   fixed: boolean;
   detail?: string;
+}
+
+/** One issue's live/final state within a running or finished batch. */
+export type IssueRunStatus = "queued" | "running" | "verified" | "unproven" | "failed" | "cancelled";
+
+/** Wall time spent in each phase of one issue's solve, derived from its events. */
+export interface IssueTiming {
+  modelMs: number;
+  toolsMs: number;
+  proofMs: number;
+}
+
+/** Token use of one issue's solve, summed from its `turn_usage` events. */
+export interface IssueUsage {
+  input: number;
+  output: number;
+  cached: number;
+  calls: number;
+}
+
+export interface IssueProgress {
+  url: string;
+  number: number;
+  title: string;
+  status: IssueRunStatus;
+  /** Short human phase text ("fetching issue", "solving", "verifying", "opening PR", …). */
+  phase?: string;
+  startedAt?: number;
+  finishedAt?: number;
+  timing?: IssueTiming;
+  usage?: IssueUsage;
+  /** Set once this issue's own PR is opened (per-issue PR mode, or the item's share of a combined PR). */
+  prUrl?: string;
+  /** True when the solve resolved it in one turn from context already at hand (SolveResult.metrics.fastPath, when the harness sets it). */
+  fastPath?: boolean;
+  detail?: string;
+}
+
+/**
+ * Marker event a batch runner emits additively (its own module, not part of
+ * `OrchestrationEvent`) to push `issueProgress` live: `{ type:
+ * "issue_progress", items: IssueProgress[] }`. `TaskQueue.run()`'s `emit`
+ * wrapper recognizes it by `type` alone (structurally, since it is not in
+ * the shared union) and mirrors `items` onto the running task, the same way
+ * it already mirrors `turn_usage` onto `task.usage`. Consumers reading the
+ * SSE/event log can treat any event whose `type` is `"issue_progress"` as
+ * this shape.
+ */
+export interface IssueProgressEvent {
+  type: "issue_progress";
+  items: IssueProgress[];
 }
 
 export const EMPTY_USAGE: TaskUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0, calls: 0 };
@@ -141,6 +215,8 @@ export interface EnqueueInput {
   instructions?: string;
   deliver?: boolean;
   model?: string;
+  prMode?: "per-issue" | "combined";
+  autoPr?: boolean;
 }
 
 export interface TaskOutcome {
@@ -152,6 +228,8 @@ export interface TaskOutcome {
   /** Usage the events did not carry (e.g. a batch's inner solves). */
   usage?: TaskUsage;
   issueResults?: IssueResult[];
+  /** Final per-issue state (batches only); see `IssueProgress`. */
+  issueProgress?: IssueProgress[];
 }
 
 export type TaskRunner = (
@@ -265,6 +343,8 @@ export class TaskQueue {
       ...(input.instructions ? { instructions: input.instructions } : {}),
       ...(input.deliver ? { deliver: true } : {}),
       ...(input.model ? { model: input.model } : {}),
+      ...(input.prMode ? { prMode: input.prMode } : {}),
+      ...(input.autoPr === false ? { autoPr: false } : {}),
     };
     this.tasks.push(task);
     await this.persist();
@@ -407,6 +487,14 @@ export class TaskQueue {
         // Visible to list()/GET /api/tasks while it runs (persisted at the end).
         if (task.state === "running") task.usage = live;
       }
+      // A batch's own additive marker (see `IssueProgressEvent`): not part of
+      // `OrchestrationEvent`, recognized structurally so `issueProgress` is
+      // live on GET /api/tasks/:id (and the SSE stream) while it runs, the
+      // same way `usage` already is from `turn_usage`.
+      if ((event as { type?: string }).type === "issue_progress" && task.state === "running") {
+        const items = (event as unknown as IssueProgressEvent).items;
+        if (Array.isArray(items)) task.issueProgress = items;
+      }
       log.push(event);
     };
     try {
@@ -419,6 +507,7 @@ export class TaskQueue {
         ...(out.prUrl ? { prUrl: out.prUrl } : {}),
         ...(out.note ? { note: out.note } : {}),
         ...(out.issueResults ? { issueResults: out.issueResults } : {}),
+        ...(out.issueProgress ? { issueProgress: out.issueProgress } : {}),
       });
       const final = addUsage(usageFromResult(out.result), out.usage);
       if (usageTokens(final) >= usageTokens(live) && usageTokens(final) > 0) task.usage = final;
