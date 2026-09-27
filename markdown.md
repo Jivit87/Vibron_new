@@ -158,3 +158,15 @@ Status: **built** = merged on main with tests green · **in progress** = an agen
     - a real `cancelled` todo status;
     - `refreshMemory` memoised (about 181 ms saved per call).
   - 924 tests pass; clean build is green.
+- **2026-09-27, real benchmark** (Sonnet 5 = `claude-cli:sonnet`, which reports `claude-sonnet-5`; 2 parallel workers).
+  - **Eval:** 5/6 by hidden tests in 58 s wall time (10–25 s and 1–4 calls per task, about 8.9k tokens in total). The miss was config-merge (lists not deep-copied), after which the fast path keeps one cheap reviewer (2 fast+review runs: 18 s, 6/6).
+  - **SWE-bench Verified, 4/4 resolved** by the hidden tests, about 18 minutes wall time. `--gold` validation found 2 of 6 chosen environments broken on this machine (django-14999, pytest-7432), so they were set aside.
+    - django-15127: 165 s, 573k tokens, 16 calls
+    - django-13933: 348 s, 1.5M tokens, 39 calls
+    - pytest-10051: 219 s, 307k tokens, 24 calls
+    - sympy-15345: 893 s, 284k tokens, 16 calls; 736 s of that was the gate running huge related test files
+  - For comparison, Claude Code (Sonnet 4.5, arena) did django-15127 in 48 s with 364k tokens.
+  - Next targets:
+    - target related tests down to the changed symbols, with a time cap;
+    - keep a persistent CLI session so turns send only new content;
+    - make large-repo exploration cheaper.
