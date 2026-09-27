@@ -9,6 +9,7 @@
  */
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
 import { GitBranch, Loader2, X } from "lucide-react";
 
 import {
@@ -25,6 +26,7 @@ import { Kbd } from "@/components/vibe/primitives";
 type Phase = "idle" | "running" | "done" | "error";
 
 export function CloneDialog() {
+  const router = useRouter();
   const open = useViberon((s) => s.cloneOpen);
   const setOpen = useViberon((s) => s.setCloneOpen);
   const [value, setValue] = useState("");
@@ -86,14 +88,16 @@ export function CloneDialog() {
     if (result.repoKey === store.repoKey) {
       // Same workspace (mock mode, or a re-clone): no navigation needed.
       if (result.issue) {
+        if (store.appMode === "ide") store.setAgentDockOpen(true);
         store.setComposerDraft({ text: "", interaction: "fix", issue: result.issue });
-        store.setAppMode("chat");
       }
       setOpen(false);
       return;
     }
     if (result.issue) stashPendingFix(result.repoKey, result.issue);
-    window.location.href = `/workspace/${encodeURIComponent(result.repoKey)}${isMockMode() ? "?mock=1" : ""}`;
+    // Client-side navigation: no full reload, and the shell (chat or IDE) stays as it is.
+    router.push(`/workspace/${encodeURIComponent(result.repoKey)}${isMockMode() ? "?mock=1" : ""}`);
+    setOpen(false);
   }
 
   const hint = !value.trim()

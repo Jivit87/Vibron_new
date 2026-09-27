@@ -82,17 +82,32 @@ export async function runTurn(
 ): Promise<EnrichedTurnResult> {
   // A model already known to be retired/unavailable is swapped before the
   // call, so a long run does not pay a failing request on every turn.
-  let model = await usableCatalogModel(request.model);
+  let model = await usableModel(request.model);
   for (let hop = 0; ; hop += 1) {
     try {
       return await runTurnOnce({ ...request, model }, handlers);
     } catch (error) {
-      if (!(error instanceof ModelUnavailableError) || hop >= 3) throw error;
-      const next = await usableCatalogModel(model);
+      if (!(error instanceof ModelUnavailableError) || hop >= 8) throw error;
+      const next = await usableModel(model);
       if (next === model) throw error;
       model = next;
     }
   }
+}
+
+/**
+ * `model`, or the next usable model of its provider, or, when every model of
+ * that provider is gone for this key (e.g. a free tier with no quota), the
+ * best model of another configured provider. Models that already failed are
+ * excluded by the live catalogs.
+ */
+async function usableModel(model: string): Promise<string> {
+  const next = await usableCatalogModel(model);
+  if (next !== model) return next;
+  const spec = getModel(model);
+  const usable = spec ? await catalogCheck(spec.provider) : null;
+  if (!usable || usable(model)) return model;
+  return resolveModel("auto", { agenticOnly: true }).catch(() => model);
 }
 
 /**

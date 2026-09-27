@@ -124,10 +124,16 @@ export function getPullRequestDiff(pr: PrRef, opts?: ApiOptions): Promise<string
   });
 }
 
-export function findOpenPullRequest(repo: RepoId, branch: string, opts?: ApiOptions): Promise<PullRequest | null> {
+/** The open PR from `branch` (on `headOwner`'s copy, default the repo's owner), or null. */
+export function findOpenPullRequest(
+  repo: RepoId,
+  branch: string,
+  opts?: ApiOptions,
+  headOwner = repo.owner,
+): Promise<PullRequest | null> {
   return call<PullRequest[]>(
     "GET",
-    `/repos/${repo.owner}/${repo.repo}/pulls?state=open&head=${encodeURIComponent(`${repo.owner}:${branch}`)}`,
+    `/repos/${repo.owner}/${repo.repo}/pulls?state=open&head=${encodeURIComponent(`${headOwner}:${branch}`)}`,
     undefined,
     opts,
   ).then((list) => list[0] ?? null);
@@ -135,7 +141,7 @@ export function findOpenPullRequest(repo: RepoId, branch: string, opts?: ApiOpti
 
 export function createPullRequest(
   repo: RepoId,
-  input: { title: string; body: string; head: string; base: string; draft?: boolean },
+  input: { title: string; body: string; head: string; base: string; draft?: boolean; maintainer_can_modify?: boolean },
   opts?: ApiOptions,
 ): Promise<PullRequest> {
   return call("POST", `/repos/${repo.owner}/${repo.repo}/pulls`, input, opts);
@@ -147,6 +153,33 @@ export function updatePullRequest(
   opts?: ApiOptions,
 ): Promise<PullRequest> {
   return call("PATCH", `/repos/${pr.owner}/${pr.repo}/pulls/${pr.number}`, input, opts);
+}
+
+/** False only when GitHub says the token's user cannot push to `repo` (→ deliver through a fork). */
+export function canPush(repo: RepoId, opts?: ApiOptions): Promise<boolean> {
+  return call<{ permissions?: { push?: boolean } }>("GET", `/repos/${repo.owner}/${repo.repo}`, undefined, opts).then(
+    (r) => r.permissions?.push !== false,
+  );
+}
+
+/**
+ * The token user's fork of `repo`, created if needed. GitHub creates forks
+ * asynchronously, so this waits until the fork answers (up to ~60s).
+ */
+export async function ensureFork(repo: RepoId, opts?: ApiOptions): Promise<RepoId> {
+  const fork = await call<{ owner: { login: string }; name: string }>(
+    "POST",
+    `/repos/${repo.owner}/${repo.repo}/forks`,
+    { default_branch_only: true },
+    opts,
+  );
+  const id = { owner: fork.owner.login, repo: fork.name };
+  for (let i = 0; i < 20; i += 1) {
+    const ready = await call("GET", `/repos/${id.owner}/${id.repo}`, undefined, opts).then(() => true, () => false);
+    if (ready) return id;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  throw new GitHubApiError(`GitHub did not finish creating the fork ${id.owner}/${id.repo} in time; try again shortly.`, 504);
 }
 
 export function getDefaultBranch(repo: RepoId, opts?: ApiOptions): Promise<string> {
@@ -262,23 +295,29 @@ function toSummary(i: RawIssue): IssueSummary {
   };
 }
 
-/** Open issues, newest activity first. The issues endpoint also returns PRs; they are dropped. */
+/** Open issues, newest activity first. Fetch pages until the requested issue limit is reached. */
 export async function listIssues(
   repo: RepoId,
   query: { labels?: string[]; state?: "open" | "closed" | "all"; limit?: number } = {},
   opts?: ApiOptions,
 ): Promise<IssueSummary[]> {
-  const params = new URLSearchParams({
-    state: query.state ?? "open",
-    sort: "updated",
-    direction: "desc",
-    per_page: String(Math.min(100, Math.max(1, query.limit ?? 50))),
-  });
-  if (query.labels?.length) params.set("labels", query.labels.join(","));
-  const raw = await call<RawIssue[]>("GET", `/repos/${repo.owner}/${repo.repo}/issues?${params}`, undefined, opts);
-  return raw
-    .filter((i) => !i.pull_request)
-    .map(toSummary);
+  const limit = Math.max(1, query.limit ?? 50);
+  const issues: IssueSummary[] = [];
+  const perPage = Math.min(100, limit);
+  for (let page = 1; issues.length < limit; page += 1) {
+    const params = new URLSearchParams({
+      state: query.state ?? "open",
+      sort: "updated",
+      direction: "desc",
+      per_page: String(perPage),
+      page: String(page),
+    });
+    if (query.labels?.length) params.set("labels", query.labels.join(","));
+    const raw = await call<RawIssue[]>("GET", `/repos/${repo.owner}/${repo.repo}/issues?${params}`, undefined, opts);
+    issues.push(...raw.filter((i) => !i.pull_request).map(toSummary));
+    if (raw.length < perPage) break;
+  }
+  return issues.slice(0, limit);
 }
 
 export function getIssue(issue: PrRef, opts?: ApiOptions): Promise<IssueSummary> {

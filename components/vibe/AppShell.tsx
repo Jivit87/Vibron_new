@@ -27,6 +27,7 @@ import { takePendingFix } from "@/lib/client/clone";
 import { CommandPalette } from "@/components/vibe/CommandPalette";
 import { IdeShell } from "@/components/vibe/IdeShell";
 import { refreshWorkspace } from "@/lib/client/agent-stream";
+import { fixAllIssuesInOnePr, takePendingIssueBatch } from "@/lib/client/issues";
 import { isMockMode } from "@/lib/client/mock-run";
 import { openFolderDialog, recordWorkspace } from "@/lib/client/recent-workspaces";
 import type { Graph } from "@/lib/graph";
@@ -77,9 +78,14 @@ export function AppShell({ repoKey, repoLabel, repoRef, rootPath, graph }: AppSh
     // Arrived here from "Clone and fix": hand the issue to the composer.
     const pendingIssue = takePendingFix(repoKey);
     if (pendingIssue) {
-      store.setAppMode("chat");
+      // Stay in the current shell; in the IDE the draft goes to the agent dock.
+      if (store.appMode === "ide") store.setAgentDockOpen(true);
       store.setComposerDraft({ text: "", interaction: "fix", issue: pendingIssue });
     }
+    const pendingBatch = takePendingIssueBatch(repoKey);
+    if (pendingBatch) void fixAllIssuesInOnePr(repoKey, pendingBatch.model, pendingBatch.prompt).then((error) => {
+      if (error) toast.error(error);
+    });
     void refreshWorkspace();
     useScm.getState().reset();
     void useScm.getState().refresh(repoKey);

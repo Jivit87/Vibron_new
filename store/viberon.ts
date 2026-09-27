@@ -206,6 +206,27 @@ function persistSettings(settings: AppSettings): void {
   }
 }
 
+const APP_MODE_KEY = "viberon.appMode";
+
+/** The last shell the user chose, so a reload or a new workspace opens in it. */
+function loadAppMode(): AppMode {
+  if (typeof window === "undefined") return "chat";
+  try {
+    return window.localStorage.getItem(APP_MODE_KEY) === "ide" ? "ide" : "chat";
+  } catch {
+    return "chat";
+  }
+}
+
+function persistAppMode(appMode: AppMode): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(APP_MODE_KEY, appMode);
+  } catch {
+    // Private mode / quota: the mode just does not survive a reload.
+  }
+}
+
 /* ------------------------------- store ----------------------------------- */
 
 let idCounter = 0;
@@ -502,9 +523,16 @@ export const useViberon = create<ViberonState>((set) => ({
 
   /* ------------------------------ shell ----------------------------- */
 
-  setAppMode: (appMode) => set({ appMode }),
+  setAppMode: (appMode) => {
+    persistAppMode(appMode);
+    set({ appMode });
+  },
   toggleAppMode: () =>
-    set((state) => ({ appMode: state.appMode === "chat" ? "ide" : "chat" })),
+    set((state) => {
+      const appMode: AppMode = state.appMode === "chat" ? "ide" : "chat";
+      persistAppMode(appMode);
+      return { appMode };
+    }),
   setSidebarView: (sidebarView) => set({ sidebarView, sidebarOpen: true }),
   setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
   toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
@@ -574,10 +602,16 @@ export const useViberon = create<ViberonState>((set) => ({
   openGraphTab: () => set((state) => openTabState(state, GRAPH_TAB)),
 
   openSettingsTab: () =>
-    set((state) => ({ ...openTabState(state, SETTINGS_TAB), appMode: "ide" as AppMode })),
+    set((state) => {
+      persistAppMode("ide");
+      return { ...openTabState(state, SETTINGS_TAB), appMode: "ide" as AppMode };
+    }),
 
   openReviewTab: () =>
-    set((state) => ({ ...openTabState(state, REVIEW_TAB), appMode: "ide" as AppMode })),
+    set((state) => {
+      persistAppMode("ide");
+      return { ...openTabState(state, REVIEW_TAB), appMode: "ide" as AppMode };
+    }),
 
   /* ------------------------------ chat ------------------------------ */
 
@@ -906,7 +940,7 @@ export const useViberon = create<ViberonState>((set) => ({
 
   setMemory: (memory) => set({ memory }),
 
-  hydrateSettings: () => set({ settings: loadSettings(), settingsHydrated: true }),
+  hydrateSettings: () => set({ settings: loadSettings(), appMode: loadAppMode(), settingsHydrated: true }),
 
   setSettings: (patch) =>
     set((state) => {

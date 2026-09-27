@@ -1,8 +1,9 @@
 /**
- * POST /api/issues/fix { repoKey, numbers: number[], deliver?: boolean = true, model? }
+ * POST /api/issues/fix { repoKey, numbers?: number[], all?: boolean, combined?: boolean, deliver?: boolean = true, model? }
  *   → { tasks: Task[], skipped: { number, reason }[] }
- * Queues one fix task per issue. Each runs in its own worktree of
- * origin/<default> and, when its checks prove the fix, opens a draft PR.
+ * Queues one fix task per issue (each in its own worktree of origin/<default>,
+ * a draft PR per proven fix), or with `combined` one task that fixes them all
+ * on one branch and opens ONE PR. `all` takes every open issue.
  */
 
 import { fixIssues } from "@/lib/issues";
@@ -19,15 +20,18 @@ export async function POST(request: Request) {
   }
   const repoKey = typeof body.repoKey === "string" ? body.repoKey : "";
   if (!repoKey) return Response.json({ error: "repoKey is required" }, { status: 400 });
-  if (!Array.isArray(body.numbers) || !body.numbers.every((n) => Number.isInteger(n) && (n as number) > 0)) {
-    return Response.json({ error: "numbers must be an array of issue numbers" }, { status: 400 });
+  const all = body.all === true;
+  if (!all && (!Array.isArray(body.numbers) || !body.numbers.every((n) => Number.isInteger(n) && (n as number) > 0))) {
+    return Response.json({ error: "numbers must be an array of issue numbers (or pass all: true)" }, { status: 400 });
   }
   try {
     const result = await fixIssues({
       repoKey,
-      numbers: body.numbers as number[],
+      ...(all ? { all } : { numbers: body.numbers as number[] }),
+      combined: body.combined === true,
       deliver: body.deliver !== false,
       source: "ui",
+      ...(typeof body.prompt === "string" ? { prompt: body.prompt.slice(0, 4000) } : {}),
       ...(typeof body.model === "string" && body.model ? { model: body.model } : {}),
     });
     return Response.json(result, { status: result.tasks.length ? 201 : 200 });

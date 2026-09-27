@@ -281,9 +281,20 @@ export async function fetchIssues(
   }
 }
 
-export async function fixIssues(repoKey: string, numbers: number[]): Promise<FixResult> {
-  const payload = { repoKey, numbers, deliver: true };
-  if (isMockMode()) return normalizeFix(mockFixIssues(numbers), 200);
+export async function fixIssues(
+  repoKey: string,
+  numbers: number[] | "all",
+  options: { combined?: boolean; model?: string; prompt?: string } = {},
+): Promise<FixResult> {
+  const payload = {
+    repoKey,
+    ...(numbers === "all" ? { all: true } : { numbers }),
+    deliver: true,
+    ...(options.combined ? { combined: true } : {}),
+    ...(options.model && options.model !== "auto" ? { model: options.model } : {}),
+    ...(options.prompt?.trim() ? { prompt: options.prompt.trim() } : {}),
+  };
+  if (isMockMode()) return normalizeFix(mockFixIssues(numbers === "all" ? [] : numbers), 200);
   try {
     const response = await fetch("/api/issues/fix", {
       method: "POST",
@@ -330,5 +341,54 @@ export async function saveWatch(
     return { ok: true, watch: normalizeWatch(body) };
   } catch {
     return { ok: false, error: "Network error" };
+  }
+}
+
+/**
+ * Fix mode's "fix every GitHub issue": one task solves the open issues one by
+ * one on a single branch and opens ONE pull request; its live run is attached
+ * to the run view. Returns an error message, or null when it started.
+ */
+export async function fixAllIssuesInOnePr(repoKey: string, model?: string, prompt?: string): Promise<string | null> {
+  const result = await fixIssues(repoKey, "all", { combined: true, model, prompt });
+  if (!result.ok) return result.error?.message ?? "Could not queue the fix.";
+  const task = result.tasks[0];
+  if (!task) return result.skipped.length ? `Nothing to fix: ${result.skipped.map((s) => `#${s.number} ${s.reason}`).join("; ")}` : "No open issues.";
+  const { attachTaskRun } = await import("@/lib/client/agent-stream");
+  void attachTaskRun(task);
+  return null;
+}
+
+/** Route an explicit request to fix the repository's issues through the issue pipeline. */
+export function isAllIssuesFixRequest(prompt: string): boolean {
+  return /\b(fix|resolve|solve|repair|address|implement)\b/i.test(prompt)
+    && /\b(all|every|each)\b[\s\S]{0,60}\bissues?\b|\bissues?\b[\s\S]{0,60}\b(all|every|each)\b/i.test(prompt);
+}
+
+/** A repository named in the prompt takes precedence over the open workspace. */
+export function issuePromptRepo(prompt: string): string | null {
+  const match = /https?:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\.git)?(?:[/?#\s]|$)/i.exec(prompt);
+  if (match) return `https://github.com/${match[1]}/${match[2].replace(/\.git$/, "")}`;
+  const short = /\b(?:repo(?:sitory)?\s*(?:at|on|is|:)?|issues?\s+(?:of|in|for|from))\s+([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\b/i.exec(prompt);
+  return short ? `${short[1]}/${short[2]}` : null;
+}
+
+const PENDING_BATCH_KEY = "viberon.pendingIssueBatch.v1";
+
+export function stashPendingIssueBatch(repoKey: string, prompt: string, model?: string): void {
+  window.sessionStorage.setItem(PENDING_BATCH_KEY, JSON.stringify({ repoKey, prompt, model }));
+}
+
+export function takePendingIssueBatch(repoKey: string): { prompt: string; model?: string } | null {
+  const raw = window.sessionStorage.getItem(PENDING_BATCH_KEY);
+  if (!raw) return null;
+  try {
+    const pending = JSON.parse(raw) as { repoKey?: string; prompt?: string; model?: string };
+    if (pending.repoKey !== repoKey || typeof pending.prompt !== "string") return null;
+    window.sessionStorage.removeItem(PENDING_BATCH_KEY);
+    return { prompt: pending.prompt, model: pending.model };
+  } catch {
+    window.sessionStorage.removeItem(PENDING_BATCH_KEY);
+    return null;
   }
 }

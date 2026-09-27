@@ -8,7 +8,7 @@
  * instead of hanging on a credential prompt.
  */
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
@@ -120,7 +120,22 @@ export async function resolveGithubToken(): Promise<string | null> {
   } catch {
     // No settings store (bare headless run): fall through to the environment.
   }
-  return process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim() || null;
+  return process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim() || ghCliToken();
+}
+
+let ghToken: string | null | undefined;
+
+/** The GitHub CLI's login (`gh auth token`), read once: a local fallback when nothing else is set. */
+function ghCliToken(): string | null {
+  if (ghToken !== undefined) return ghToken;
+  if (process.env.VITEST) return (ghToken = null); // Tests never use the real login.
+  try {
+    const out = execFileSync("gh", ["auth", "token"], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] });
+    ghToken = /^[\w-]{20,}$/.test(out.trim()) ? out.trim() : null;
+  } catch {
+    ghToken = null;
+  }
+  return ghToken;
 }
 
 /**

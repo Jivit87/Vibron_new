@@ -354,6 +354,15 @@ export async function push(rootPath: string, upstream: string | null): Promise<s
  * url.*.insteadOf: the configured URL names the hosting repository, and git
  * applies any rewrite itself when it connects.
  */
+/**
+ * The remote that holds the real project: `upstream` when it exists (origin
+ * is then usually the user's fork), else `origin`. Issues are read from it,
+ * fixes start from its default branch, and pull requests target it.
+ */
+export async function projectRemote(root: string): Promise<"upstream" | "origin"> {
+  return (await configuredRemoteUrl(root, "upstream")) ? "upstream" : "origin";
+}
+
 export async function configuredRemoteUrl(root: string, remote = "origin"): Promise<string | null> {
   if (!/^[\w.-]+$/.test(remote)) return null;
   const r = await runGit(root, ["config", "--get", `remote.${remote}.url`], { allowFailure: true });

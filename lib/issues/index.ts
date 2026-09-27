@@ -5,7 +5,7 @@
  * in an isolated worktree per issue. See docs/PLAN-ISSUES.md.
  */
 
-import { configuredRemoteUrl } from "@/lib/git";
+import { configuredRemoteUrl, projectRemote } from "@/lib/git";
 import {
   getIssue,
   listIssueComments,
@@ -38,7 +38,7 @@ export const issueUrl = (repo: RepoId, n: number) => `https://github.com/${repo.
 export async function workspaceRepo(repoKey: string): Promise<{ root: string; repo: RepoId }> {
   const root = (await openWorkspace(repoKey).catch(() => null))?.rootPath;
   if (!root) throw new IssuesError("Open a local folder or clone a repository first.", "no_folder");
-  const origin = await configuredRemoteUrl(root);
+  const origin = await configuredRemoteUrl(root, await projectRemote(root));
   const repo = origin ? parseRemote(origin) : null;
   if (!repo) throw new IssuesError("This folder has no GitHub remote named origin.", "no_github_remote");
   return { root, repo };
@@ -85,10 +85,12 @@ function tasksByIssue(tasks: Task[]): Map<string, Task> {
   const out = new Map<string, Task>();
   const active = (t: Task) => t.state === "queued" || t.state === "running";
   for (const t of tasks) {
-    if (!t.issueUrl) continue;
-    const prev = out.get(t.issueUrl);
-    if (!prev || (active(t) && !active(prev)) || (active(t) === active(prev) && t.createdAt > prev.createdAt)) {
-      out.set(t.issueUrl, t);
+    // A batch task covers every issue it lists.
+    for (const url of t.issueUrls ?? (t.issueUrl ? [t.issueUrl] : [])) {
+      const prev = out.get(url);
+      if (!prev || (active(t) && !active(prev)) || (active(t) === active(prev) && t.createdAt > prev.createdAt)) {
+        out.set(url, t);
+      }
     }
   }
   return out;
@@ -135,16 +137,35 @@ export async function issueRows(repoKey: string, labels: string[] = [], opts?: A
   };
 }
 
-/** Enqueue one fix (+ deliver) task per issue, skipping duplicates and closed issues. */
+/**
+ * Enqueue fix (+ deliver) tasks, skipping duplicates and closed issues: one
+ * task (and PR) per issue, or with `combined` one task that fixes them all on
+ * one branch and opens ONE PR. `all` takes every open issue.
+ */
 export async function fixIssues(
-  input: { repoKey: string; numbers: number[]; deliver?: boolean; model?: string; source?: "ui" | "api" | "cli" | "issue" },
+  input: {
+    repoKey: string;
+    numbers?: number[];
+    all?: boolean;
+    combined?: boolean;
+    prompt?: string;
+    deliver?: boolean;
+    model?: string;
+    source?: "ui" | "api" | "cli" | "issue";
+  },
   opts?: ApiOptions,
 ): Promise<{ tasks: Task[]; skipped: { number: number; reason: string }[] }> {
-  const numbers = [...new Set(input.numbers)].filter((n) => Number.isInteger(n) && n > 0);
-  if (!numbers.length) throw new IssuesError("numbers must list at least one issue number.", "invalid_input");
   const { repo } = await workspaceRepo(input.repoKey);
+  const listedIssues = input.all ? await listIssues(repo, { limit: 500 }, opts) : [];
+  const listedByNumber = new Map(listedIssues.map((issue) => [issue.number, issue]));
+  const listed = input.all ? listedIssues.map((i) => i.number) : (input.numbers ?? []);
+  const numbers = [...new Set(listed)].filter((n) => Number.isInteger(n) && n > 0).sort((a, b) => a - b);
+  if (!numbers.length) {
+    throw new IssuesError(input.all ? "This repository has no open issues." : "numbers must list at least one issue number.", "invalid_input");
+  }
   const byIssue = tasksByIssue(await getTaskQueue().list(input.repoKey));
   const tasks: Task[] = [];
+  const batch: IssueSummary[] = [];
   const skipped: { number: number; reason: string }[] = [];
   for (const number of numbers) {
     const url = issueUrl(repo, number);
@@ -153,13 +174,17 @@ export async function fixIssues(
       skipped.push({ number, reason });
       continue;
     }
-    const issue = await getIssue({ ...repo, number }, opts).catch((error: unknown) => {
+    const issue = await Promise.resolve(listedByNumber.get(number) ?? getIssue({ ...repo, number }, opts)).catch((error: unknown) => {
       skipped.push({ number, reason: error instanceof Error ? error.message : String(error) });
       return null;
     });
     if (!issue) continue;
     if (issue.state !== "open") {
       skipped.push({ number, reason: "issue is closed" });
+      continue;
+    }
+    if (input.combined) {
+      batch.push(issue);
       continue;
     }
     tasks.push(
@@ -170,6 +195,21 @@ export async function fixIssues(
         task: `#${number} ${issue.title}`,
         source: input.source ?? "ui",
         issueUrl: issue.html_url,
+        deliver: input.deliver !== false,
+        ...(input.model ? { model: input.model } : {}),
+      }),
+    );
+  }
+  if (batch.length) {
+    tasks.push(
+      await enqueue({
+        kind: "fix",
+        repoKey: input.repoKey,
+        task: `Fix ${batch.length} issue${batch.length === 1 ? "" : "s"} in one PR: ${batch.map((i) => `#${i.number}`).join(", ")}`,
+        source: input.source ?? "ui",
+        issueUrls: batch.map((i) => i.html_url),
+        issueTitles: batch.map((i) => i.title),
+        ...(input.prompt?.trim() ? { instructions: input.prompt.trim().slice(0, 4000) } : {}),
         deliver: input.deliver !== false,
         ...(input.model ? { model: input.model } : {}),
       }),

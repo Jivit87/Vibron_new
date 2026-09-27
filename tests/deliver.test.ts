@@ -13,6 +13,7 @@ import {
   branchName,
   deliver,
   DeliverError,
+  deliveryTarget,
   evidenceFromResult,
   MAX_BRANCH_LENGTH,
   renderPrBody,
@@ -92,6 +93,34 @@ describe("branchName", () => {
     const second = branchName(title, [first]);
     expect(second.length).toBeLessThanOrEqual(MAX_BRANCH_LENGTH);
     expect(second.endsWith("-2")).toBe(true);
+  });
+});
+
+describe("deliveryTarget", () => {
+  const fork = { owner: "me", repo: "x" };
+  const original = { owner: "them", repo: "x" };
+
+  it("opens the PR on upstream and pushes to origin as the fork, when origin already points at a different repo", () => {
+    // This is exactly the bug that shipped: a repo already set up with
+    // origin = fork, upstream = original silently opened the PR on the fork.
+    expect(deliveryTarget(fork, original)).toEqual({ repo: original, originIsFork: true });
+  });
+
+  it("targets origin directly when there is no upstream remote", () => {
+    expect(deliveryTarget(original, null)).toEqual({ repo: original, originIsFork: false });
+  });
+
+  it("does not call origin a fork of itself", () => {
+    expect(deliveryTarget(original, original)).toEqual({ repo: original, originIsFork: false });
+  });
+
+  it("an explicit repo wins over both", () => {
+    const explicit = { owner: "explicit", repo: "y" };
+    expect(deliveryTarget(fork, original, explicit)).toEqual({ repo: explicit, originIsFork: true });
+  });
+
+  it("null when origin cannot be identified and nothing else names a repo", () => {
+    expect(deliveryTarget(null, null)).toBeNull();
   });
 });
 

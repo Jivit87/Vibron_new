@@ -17,6 +17,7 @@ import {
   canFix,
   clampInterval,
   fetchIssues,
+  fixAllIssuesInOnePr,
   fixIssues,
   INTERVAL_MAX,
   INTERVAL_MIN,
@@ -63,6 +64,7 @@ export function IssuesPanel() {
   const [labelInput, setLabelInput] = useState("");
   const [label, setLabel] = useState("");
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [fixingAll, setFixingAll] = useState(false);
   const [pending, setPending] = useState<Set<number>>(new Set());
   const [skipped, setSkipped] = useState<Map<number, string>>(new Map());
   const [fixError, setFixError] = useState<IssuesError | null>(null);
@@ -119,6 +121,16 @@ export function IssuesPanel() {
     const id = window.setInterval(() => void refresh(), interval);
     return () => window.clearInterval(id);
   }, [refresh, interval, stop]);
+
+  async function fixAll() {
+    if (!repoKey) return;
+    setFixingAll(true);
+    const error = await fixAllIssuesInOnePr(repoKey, useViberon.getState().settings.model);
+    setFixingAll(false);
+    if (error) toast.error(error);
+    else toast.success("Fixing all open issues; one pull request at the end.");
+    void refresh();
+  }
 
   async function fix(numbers: number[]) {
     if (!repoKey || numbers.length === 0) return;
@@ -223,12 +235,24 @@ export function IssuesPanel() {
         </IconButton>
         <button
           type="button"
-          className="vb-btn vb-btn-primary"
+          className="vb-btn"
           style={{ height: 22, padding: "0 8px" }}
           disabled={selectedCount === 0}
+          title="One pull request per issue"
           onClick={() => void fix([...selected])}
         >
           Fix selected{selectedCount > 0 ? ` (${selectedCount})` : ""}
+        </button>
+        <button
+          type="button"
+          className="vb-btn vb-btn-primary"
+          style={{ height: 22, padding: "0 8px" }}
+          disabled={fixable.length === 0 || fixingAll}
+          title="Fix every open issue on one branch and open one pull request"
+          onClick={() => void fixAll()}
+        >
+          {fixingAll ? <Loader2 className="size-3.5 animate-spin" /> : null}
+          Fix all → 1 PR
         </button>
       </div>
 
