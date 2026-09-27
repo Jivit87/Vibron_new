@@ -58,6 +58,10 @@ export interface RunSweOptions {
   dataFile?: string;
   resultsDir?: string;
   gold?: boolean;
+  /** Run label: rows go to `results-<tag>.jsonl` and ids already there are skipped (resume). */
+  tag?: string;
+  /** `k/n`: run every n-th instance starting at k (parallel shards share one tag). */
+  shard?: string;
   log?: (line: string) => void;
   /** Scratch space for checkouts and venvs (default `$VIBERON_SWE_WORK` or the OS temp dir). */
   workDir?: string;
@@ -143,6 +147,18 @@ export interface SweGrade {
   p2p: string;
   failedF2p: string[];
   failedP2p: string[];
+  /** Every PASS_TO_PASS test that failed (gold runs record these as env-broken). */
+  allFailedP2p: string[];
+  error?: string;
+}
+
+/** Gold validation per instance, cached in `<results>/gold.json`. */
+export interface GoldEntry {
+  f2pOk: boolean;
+  /** PASS_TO_PASS tests that fail even with the official patch here: excluded from grading. */
+  envBroken: string[];
+  f2p: string;
+  p2p: string;
   error?: string;
 }
 
@@ -152,6 +168,7 @@ export async function gradeInstance(
   dir: string,
   exec: ShellRunner = execInRepo,
   base = "HEAD",
+  envBroken: string[] = [],
 ): Promise<SweGrade> {
   const none = (error: string): SweGrade => ({
     resolved: false,
@@ -159,6 +176,7 @@ export async function gradeInstance(
     p2p: `0/${instance.PASS_TO_PASS.length}`,
     failedF2p: instance.FAIL_TO_PASS.slice(0, 5),
     failedP2p: [],
+    allFailedP2p: [],
     error,
   });
   const files = [...instance.test_patch.matchAll(/^diff --git a\/.* b\/(.*)$/gm)].map((m) => m[1]!);
@@ -177,9 +195,12 @@ export async function gradeInstance(
   const ok = (id: string) => tests[id] === "pass";
   const failedF2p = instance.FAIL_TO_PASS.filter((t) => !ok(t));
   const failedP2p = instance.PASS_TO_PASS.filter((t) => !ok(t));
+  const broken = new Set(envBroken);
   const count = (all: string[], failed: string[]) => `${all.length - failed.length}/${all.length}`;
   return {
-    resolved: failedF2p.length === 0 && failedP2p.length === 0,
+    // Pramana: P2P tests that fail with the gold patch in this env (platform-specific) do not count.
+    resolved: failedF2p.length === 0 && failedP2p.every((t) => broken.has(t)),
+    allFailedP2p: failedP2p,
     f2p: count(instance.FAIL_TO_PASS, failedF2p),
     p2p: count(instance.PASS_TO_PASS, failedP2p),
     failedF2p: failedF2p.slice(0, 5),
@@ -209,7 +230,16 @@ export function renderSweMarkdown(rows: SweRow[]): string {
   return `${lines.join("\n")}\n`;
 }
 
-async function readRows(file: string): Promise<SweRow[]> {
+/** `k/n` → every n-th id starting at k; no shard → all. */
+export function shardIds(ids: string[], shard?: string): string[] {
+  if (!shard) return ids;
+  const m = /^(\d+)\/(\d+)$/.exec(shard);
+  if (!m || Number(m[2]) < 1 || Number(m[1]) >= Number(m[2])) throw new Error(`bad shard "${shard}" (want k/n with k < n)`);
+  const [k, n] = [Number(m[1]), Number(m[2])];
+  return ids.filter((_, i) => i % n === k);
+}
+
+export async function readRows(file: string): Promise<SweRow[]> {
   if (!existsSync(file)) return [];
   const latest = new Map<string, SweRow>();
   for (const line of (await readFile(file, "utf8")).split("\n")) {
@@ -224,15 +254,29 @@ export async function runSwe(options: RunSweOptions): Promise<{ total: number; r
   const log = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   const resultsDir = path.resolve(options.resultsDir ?? path.join(SWE_DIR, "results"));
   const workDir = options.workDir ?? process.env.VIBERON_SWE_WORK ?? path.join(os.tmpdir(), "viberon-swe");
-  const ids = options.limit ? options.ids.slice(0, options.limit) : options.ids;
+  const shardSuffix = options.tag && options.shard ? `-shard${options.shard.replace("/", "of")}` : "";
+  const jsonl = path.join(resultsDir, options.tag ? `results-${options.tag}${shardSuffix}.jsonl` : "results.jsonl");
+  const done = new Set<string>();
+  if (options.tag && !options.gold) {
+    const { loadTag } = await import("@/eval/swe/report");
+    for (const id of (await loadTag(resultsDir, options.tag)).keys()) done.add(id);
+  }
+  let ids = options.limit ? options.ids.slice(0, options.limit) : options.ids;
+  ids = shardIds(ids, options.shard).filter((id) => !done.has(id));
+  const goldFile = path.join(resultsDir, "gold.json");
+  const gold: Record<string, GoldEntry> = existsSync(goldFile) ? JSON.parse(await readFile(goldFile, "utf8")) : {};
   const instances =
     options.instances?.filter((i) => ids.includes(i.instance_id)) ??
     (await loadInstances(ids, { dataFile: options.dataFile, cacheDir: path.join(SWE_DIR, "..", ".cache", "swe") }));
   await mkdir(resultsDir, { recursive: true });
-  const jsonl = path.join(resultsDir, "results.jsonl");
 
   const rows: SweRow[] = [];
   for (const instance of instances) {
+    const g = gold[instance.instance_id];
+    if (!options.gold && g && !g.f2pOk) {
+      log(`── ${instance.instance_id}: skipped (the gold patch does not pass FAIL_TO_PASS in this env)`);
+      continue;
+    }
     log(`── ${instance.instance_id} (${instance.repo} ${instance.version})`);
     const started = Date.now();
     const scratch = path.join(workDir, instance.instance_id);
@@ -287,7 +331,17 @@ export async function runSwe(options: RunSweOptions): Promise<{ total: number; r
           ...(outcome.result.error ? { error: outcome.result.error } : {}),
         };
       }
-      const grade = await gradeInstance(instance, dir, options.exec, base);
+      const grade = await gradeInstance(instance, dir, options.exec, base, options.gold ? [] : (g?.envBroken ?? []));
+      if (options.gold) {
+        gold[instance.instance_id] = {
+          f2pOk: grade.failedF2p.length === 0 && !grade.error,
+          envBroken: grade.allFailedP2p,
+          f2p: grade.f2p,
+          p2p: grade.p2p,
+          ...(grade.error ? { error: grade.error } : {}),
+        };
+        await writeFile(goldFile, `${JSON.stringify(gold, null, 1)}\n`);
+      }
       row = {
         ...row,
         resolved: grade.resolved,
@@ -308,8 +362,10 @@ export async function runSwe(options: RunSweOptions): Promise<{ total: number; r
     log(`   ${row.resolved ? "RESOLVED" : "not resolved"}  f2p ${row.f2p}  p2p ${row.p2p}  (${row.status})${row.error ? `  ${row.error.slice(0, 200)}` : ""}`);
   }
 
-  await writeFile(path.join(resultsDir, "results.md"), renderSweMarkdown(await readRows(jsonl)));
+  const md = path.join(resultsDir, options.tag ? `results-${options.tag}.md` : "results.md");
+  const all = options.tag ? [...(await (await import("@/eval/swe/report")).loadTag(resultsDir, options.tag)).values()] : await readRows(jsonl);
+  await writeFile(md, renderSweMarkdown(all));
   const resolved = rows.filter((r) => r.resolved).length;
-  log(`resolved ${resolved}/${rows.length} → ${path.join(resultsDir, "results.md")}`);
+  log(`resolved ${resolved}/${rows.length} → ${md}`);
   return { total: rows.length, resolved, rows };
 }
