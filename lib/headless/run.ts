@@ -5,6 +5,10 @@
  *   <out>/trajectory.jsonl  {type:"meta"} line, {type:"event"} per event, {type:"result"} line
  *   <out>/patch.diff        the change (git apply-able)
  *   <out>/report.md         human-readable evidence (Pramana style)
+ *   <out>/report.html       the same, styled, with the diff
+ *   <out>/evidence.json     machine-readable verdict/checks/usage/config (never a key)
+ *   <out>/scratch/          the agent's reproduction scripts (moved out of the repo)
+ *   <out>/../index.html     every run at a glance
  *
  * Exit codes: 0 resolved|unverified, 1 failed|incomplete, 2 error.
  * `solve` is injectable so the CLI, eval runner and tests share this path.
@@ -20,6 +24,8 @@ import type { OrchestrationEvent } from "@/lib/agents/events";
 import type { DeliverOptions, DeliverResult, reportOnIssue } from "@/lib/deliver";
 import { fetchGitHubIssue, parseGitHubIssueUrl } from "@/lib/github";
 import type { SolveOptions, SolveResult, SolveStatus } from "@/lib/harness/solve-types";
+import { SCRATCH_DIR } from "@/lib/harness/snapshot";
+import { writeEvidenceBundle } from "@/lib/headless/evidence";
 import { renderReport } from "@/lib/headless/report";
 import { registerLocalWorkspace } from "@/lib/local-disk-workspace";
 import { recordFixNote } from "@/lib/memory/graph";
@@ -421,6 +427,31 @@ export async function runHeadless(options: HeadlessOptions, deps: HeadlessDeps =
       renderReport({ taskId, task, repo, model, result, verifyCommands, exitCode }),
     ),
   ]);
+
+  // Evidence bundle; the scratch dir moves in, so the repo keeps only the fix.
+  await writeEvidenceBundle({
+    taskId,
+    task,
+    repo,
+    model,
+    exitCode,
+    startedAt: json.startedAt,
+    result,
+    verifyCommands,
+    outDir,
+    workRoot,
+    scratchRel: SCRATCH_DIR,
+    config: {
+      worktree: Boolean(options.worktree),
+      noGate: Boolean(options.noGate),
+      maxTurns: options.maxTurns ?? 40,
+      timeoutMs: options.timeoutMs ?? null,
+      review: options.review ?? null,
+      thorough: Boolean(options.thorough),
+      independentTest: Boolean(options.independentTest),
+      deliver: Boolean(options.deliver),
+    },
+  }).catch((error) => log(`evidence bundle incomplete: ${error instanceof Error ? error.message : String(error)}`));
 
   // Run memory: the next task on the same area sees what was fixed and why.
   if (result.status !== "error" && result.filesChanged.length) {

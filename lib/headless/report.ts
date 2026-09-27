@@ -4,6 +4,7 @@
  */
 
 import type { SolveResult, SolveStatus } from "@/lib/harness/solve-types";
+import { evidenceChecks, VERDICT_ICON } from "@/lib/headless/evidence";
 import type { VerificationReport, VerifyCommand } from "@/lib/verify/types";
 
 export const STATUS_TEXT: Record<SolveStatus, string> = {
@@ -58,6 +59,7 @@ export function renderReport(input: {
     `- Task id: \`${input.taskId}\` (exit code ${input.exitCode})`,
     `- Repository: \`${input.repo}\``,
     `- Model: \`${input.model}\``,
+    `- Attempts: ${1 + result.recovery.rollbacks}`,
     `- Cost: ${(m.inputTokens + m.outputTokens).toLocaleString()} tokens (${m.inputTokens.toLocaleString()} in, ${m.cacheReadTokens.toLocaleString()} cached, ${m.outputTokens.toLocaleString()} out) in ${m.modelCalls} model calls, ${m.toolCalls} tool calls${m.costUsd ? `, $${m.costUsd.toFixed(4)}` : ""}`,
     `- Context: ${m.contextSentTokens.toLocaleString()} tokens sent, ${m.contextSavedTokens.toLocaleString()} saved by graph retrieval; cache hit rate ${(m.cacheHitRate * 100).toFixed(0)}%; ${m.compactions} compactions`,
     `- Wall time: ${(m.durationMs / 1000).toFixed(0)}s (verification ${(m.verifyMs / 1000).toFixed(0)}s over ${m.verifyRuns} runs)`,
@@ -82,6 +84,15 @@ export function renderReport(input: {
     if (g.fixed.length) lines.push("", `Fixed (failing before, passing after): ${g.fixed.map((t) => `\`${t}\``).join(", ")}`);
     if (g.newFailures.length) lines.push("", `**New failures (regressions):** ${g.newFailures.map((t) => `\`${t}\``).join(", ")}`);
     if (g.final?.failureExcerpt) lines.push("", "Final failure excerpt:", "", "```", g.final.failureExcerpt.trim(), "```");
+  }
+  const checks = evidenceChecks(result);
+  if (checks.length) {
+    lines.push(
+      "",
+      "| verdict | origin | check | original code | with patch |",
+      "|---|---|---|---|---|",
+      ...checks.map((c) => `| ${VERDICT_ICON[c.verdict]} | ${c.origin} | \`${c.command.replace(/\|/g, "\\|")}\` | ${c.before} | ${c.after} |`),
+    );
   }
   if (input.verifyCommands.length) {
     lines.push("", "Detected checks:", ...input.verifyCommands.map((c) => `- \`${c.command}\` (${c.kind}; ${c.source})`));
