@@ -33,6 +33,8 @@ export type ScriptedTurn =
       calls?: ScriptedCall[];
       stopReason?: AiTurnResult["stopReason"];
       usage?: Partial<AiUsage>;
+      /** Answer only after this long (a slow model). */
+      delayMs?: number;
     }
   /** Throw this (after streaming `streamed`, if given). */
   | { error: unknown; streamed?: string }
@@ -87,6 +89,7 @@ export class FakeProvider implements AiProvider {
     }
 
     const turn = step as Exclude<ScriptedTurn, { error: unknown } | { hang: true } | ((r: AiTurnRequest) => ScriptedTurn)>;
+    if (turn.delayMs) await new Promise((resolve) => setTimeout(resolve, turn.delayMs));
     if (turn.thinking) handlers.onThinking?.(turn.thinking);
     if (turn.text) handlers.onText?.(turn.text);
 

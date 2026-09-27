@@ -8,6 +8,7 @@ import { resetMemoryStoreForTests } from "@/lib/store";
 import { openWorkspace } from "@/lib/workspace";
 import { installFakeProvider, uninstallFakeProvider, type ScriptedTurn } from "./helpers/fake-provider";
 import { eventLog } from "./helpers/harness-workspace";
+import { routed } from "./helpers/routed";
 import { makeTmpRepo, shellRunner, type TmpRepo } from "./helpers/tmp-repo";
 
 const ORIGINAL = "exports.mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;";
@@ -54,20 +55,6 @@ async function options(overrides: Partial<SolveOptions> = {}): Promise<SolveOpti
     independentTest: false,
     ...overrides,
   };
-}
-
-type Who = "solver" | "writer" | "reviewer" | "criteria";
-const whoAsked = (req: AiTurnRequest): Who => {
-  const system = JSON.stringify(req.system);
-  if (system.includes("independent QA engineer")) return "writer";
-  if (system.includes("reviewing a code change")) return "reviewer";
-  if (system.includes("meticulous senior maintainer")) return "criteria";
-  return "solver";
-};
-/** The writer and the reviewer run concurrently: route each request to its own script. */
-function routed(queues: Partial<Record<Who, ScriptedTurn[]>>): ScriptedTurn[] {
-  const total = Object.values(queues).reduce((n, q) => n + q.length, 0);
-  return Array.from({ length: total }, () => (req: AiTurnRequest) => queues[whoAsked(req)]?.shift() ?? { text: "Done." });
 }
 
 const BLIND = "node .viberon/scratch/test_independent.js";
@@ -171,14 +158,16 @@ describe("solve-loop reviewer", () => {
     // One follow-up in total, carrying both.
     expect(log.of("agent_start").filter((a) => a.role === "solver").map((a) => a.title)).toEqual(["Solve task", "Address review finding"]);
     expect(log.of("recovery").map((r) => r.failureClass).filter((c) => c !== "no_progress")).toEqual(["test_failure", "review"]);
-    // Overlap: each phase started before the other ended.
     const phase = (name: string) => {
       const ms = result.metrics.phaseMs?.[name] ?? 0;
       return { end: at.get(name)!, start: at.get(name)! - ms };
     };
-    const [w, r] = [phase("testWriter"), phase("review")];
-    expect(w.start).toBeLessThanOrEqual(r.end);
-    expect(r.start).toBeLessThanOrEqual(w.end);
+    // The blind draft runs during the solve, before anything is accepted;
+    // after the accept, running the drafted test overlaps the reviewer.
+    const [w, ir, r] = [phase("testWriter"), phase("independentRun"), phase("review")];
+    expect(w.start).toBeLessThan(r.start);
+    expect(ir.start).toBeLessThanOrEqual(r.end);
+    expect(r.start).toBeLessThanOrEqual(ir.end);
   });
 
   it("sends an accepted change back once on a high finding and keeps the revised change", async () => {
@@ -244,5 +233,40 @@ describe("solve-loop reviewer", () => {
     const off = installFakeProvider([...solve]);
     expect((await solveTask(await options())).status).toBe("resolved");
     expect(off.requests.every((r) => r.model === "claude-opus-5")).toBe(true);
+  });
+
+  it("a slow criteria call never holds the loop; late criteria are appended to a later turn", async () => {
+    const started: Record<string, number> = {};
+    const fake = installFakeProvider(routed({
+      solver: [
+        (req) => {
+          started.solver ??= Date.now();
+          expect(JSON.stringify(req.messages)).not.toContain("predicted_acceptance_criteria");
+          return { calls: [{ name: "create_file", input: { path: REPRO_PATH, content: "require('assert').strictEqual(require('../../lib').mean([]), 0);\n" } }] };
+        },
+        { calls: [{ name: "run_command", input: { command: "sleep 2" } }] },
+        (req) => {
+          // Appended to the end of an earlier turn, never inserted into the first message.
+          expect(JSON.stringify(req.messages[0])).not.toContain("predicted_acceptance_criteria");
+          expect(JSON.stringify(req.messages.slice(1))).toContain("predicted_acceptance_criteria");
+          return { calls: [{ name: "edit_file", input: { path: "lib.js", find: ORIGINAL, replace: FIXED, summary: "fix" } }] };
+        },
+        { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+      ],
+      criteria: [
+        (() => {
+          started.criteria = Date.now();
+          return { text: "1. mean([]) -> 0", delayMs: 2_500 };
+        }) as ScriptedTurn,
+      ],
+    }));
+    const result = await solveTask(await options({ criteria: true, maxAttempts: 1 }));
+    expect(result.status).toBe("resolved");
+    expect(result.criteria).toEqual(["mean([]) -> 0"]);
+    // Ordering, not wall-clock thresholds: the solver asked before the 2.5 s
+    // criteria answered, and setup ended before the criteria call did.
+    expect(started.solver!).toBeLessThan(started.criteria! + 2_500);
+    expect(result.metrics.phaseMs?.setup ?? Infinity).toBeLessThan(result.metrics.phaseMs?.criteria ?? 0);
+    expect(fake.remaining).toBe(0);
   });
 });

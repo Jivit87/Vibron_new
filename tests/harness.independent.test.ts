@@ -1,10 +1,10 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ContextLedger, type EngineInput } from "@/lib/context/engine";
-import { diff, snapshot } from "@/lib/harness/snapshot";
-import { classifyIndependent, writeIndependentTest, type TestWriterOptions } from "@/lib/harness/testwriter";
+import { snapshot } from "@/lib/harness/snapshot";
+import { classifyIndependent, draftIndependentTest, runIndependentTest, type DraftOptions } from "@/lib/harness/testwriter";
 import { registerLocalWorkspace } from "@/lib/local-disk-workspace";
 import { getFileInfo, resetMemoryStoreForTests } from "@/lib/store";
 import { fullReindex, openWorkspace, readFile } from "@/lib/workspace";
@@ -29,8 +29,8 @@ afterEach(() => {
   repo.cleanup();
 });
 
-async function writerOptions(overrides: Partial<TestWriterOptions> = {}): Promise<TestWriterOptions> {
-  const handle = await openWorkspace((await registerLocalWorkspace(repo.root)).repoKey);
+async function engineFor(dir: string) {
+  const handle = await openWorkspace((await registerLocalWorkspace(dir)).repoKey);
   const { graph, memory } = await fullReindex(handle);
   const engine: EngineInput = {
     graph,
@@ -39,28 +39,31 @@ async function writerOptions(overrides: Partial<TestWriterOptions> = {}): Promis
     readFile: (p) => readFile(handle, p),
     ledger: new ContextLedger(),
   };
+  return { handle, engine };
+}
+
+/** The original is committed; the solver's patch sits in the work tree while the writer drafts. */
+async function writerOptions(overrides: Partial<DraftOptions> = {}): Promise<DraftOptions> {
+  const baseRef = await snapshot(repo.root);
   repo.write("lib.js", PATCHED);
   return {
     root: repo.root,
-    acceptedTree: await snapshot(repo.root),
+    baseRef,
     task: "answer() should return 2.",
     criteria: ["answer() -> 2"],
     summary: "Files: 1",
     relatedTests: ["test/lib.test.js"],
     model: "claude-opus-5",
-    handle,
-    engine,
+    open: engineFor,
     emit: log.emit,
-    compare: async () => ({ beforePassed: false, afterPassed: true, beforeOutput: "AssertionError", afterOutput: "" }),
     ...overrides,
   };
 }
 
 describe("blind independent test writer", () => {
-  it("never sees the patch, may write only in scratch, and restores the accepted patch exactly", async () => {
+  it("drafts blind in a throwaway checkout of the original; nothing it does reaches the solver's tree", async () => {
     const options = await writerOptions();
-    const baseDiff = await diff(repo.root, options.acceptedTree);
-    let compared = "";
+    let writerDir = "";
     const fake = installFakeProvider([
       (req) => {
         const prompt = JSON.stringify(req.messages);
@@ -71,12 +74,10 @@ describe("blind independent test writer", () => {
         expect((req.tools ?? []).map((t) => t.name).sort()).toEqual(
           ["create_file", "done", "edit_file", "find_symbols", "run_command", "view"],
         );
-        return { calls: [{ name: "edit_file", input: { path: "lib.js", find: "2", replace: "3", summary: "cheat" } }] };
+        return { calls: [{ name: "edit_file", input: { path: "lib.js", find: "1", replace: "3", summary: "cheat" } }] };
       },
       (req) => {
         expect(JSON.stringify(req.messages.at(-1))).toContain("Refused: you may only create or edit files under .viberon/scratch/");
-        // A shell side effect on a source file (what `run_command` could do).
-        writeFileSync(path.join(repo.root, "lib.js"), "exports.answer = () => 99;\n");
         return {
           calls: [{
             name: "create_file",
@@ -86,16 +87,32 @@ describe("blind independent test writer", () => {
       },
       { calls: [{ name: "done", input: { command: COMMAND, notes: "answer is 2" } }] },
     ]);
-    const outcome = await writeIndependentTest({ ...options, compare: async (command) => {
-      compared = command;
-      return { beforePassed: false, afterPassed: true, beforeOutput: "AssertionError", afterOutput: "" };
-    } });
+    const draft = await draftIndependentTest({
+      ...options,
+      open: async (dir) => {
+        writerDir = dir;
+        // The writer sees the ORIGINAL code, not the solver's patch.
+        expect(readFileSync(path.join(dir, "lib.js"), "utf8")).toBe("exports.answer = () => 1;\n");
+        // A shell side effect (what run_command could do) lands in the throwaway checkout only.
+        writeFileSync(path.join(dir, "lib.js"), "exports.answer = () => 99;\n");
+        return engineFor(dir);
+      },
+    });
 
     expect(fake.remaining).toBe(0);
+    expect(draft?.command).toBe(COMMAND);
+    expect(draft?.files.map((f) => f.path)).toEqual([TEST_PATH]);
+    expect(repo.read("lib.js")).toBe(PATCHED);
+    expect(existsSync(path.join(repo.root, TEST_PATH))).toBe(false);
+    expect(existsSync(writerDir)).toBe(false);
+
+    let compared = "";
+    const outcome = await runIndependentTest(repo.root, draft!, async (command) => {
+      compared = command;
+      return { beforePassed: false, afterPassed: true, beforeOutput: "AssertionError", afterOutput: "" };
+    }, log.emit);
     expect(outcome).toEqual({ status: "fixes", command: COMMAND });
     expect(compared).toBe(COMMAND);
-    expect(repo.read("lib.js")).toBe(PATCHED);
-    expect(await diff(repo.root, options.acceptedTree)).toBe(baseDiff);
     expect(existsSync(path.join(repo.root, TEST_PATH))).toBe(true);
     expect(log.of("independent_test").map((e) => [e.status, e.command, e.verdict])).toEqual([
       ["written", COMMAND, undefined],
@@ -103,13 +120,10 @@ describe("blind independent test writer", () => {
     ]);
   });
 
-  it("gives up without a command and reports inconclusive", async () => {
+  it("gives up without a command and says so", async () => {
     const options = await writerOptions({ maxSteps: 3 });
     installFakeProvider([{ text: "I cannot." }, { text: "Still no." }]);
-    const outcome = await writeIndependentTest({ ...options, compare: async () => {
-      throw new Error("must not run");
-    } });
-    expect(outcome.status).toBe("inconclusive");
+    expect(await draftIndependentTest(options)).toBeNull();
     expect(log.of("independent_test")).toEqual([expect.objectContaining({ status: "gave_up" })]);
   });
 

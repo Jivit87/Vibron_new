@@ -41,7 +41,7 @@ describe("engine events → run view", () => {
 
   it("knows every phase the solver times", () => {
     // SolveResult.metrics.phaseMs keys from lib/harness/solve.ts.
-    for (const name of ["setup", "localize", "criteria", "loop", "gate", "testWriter", "review"]) {
+    for (const name of ["setup", "localize", "criteria", "loop", "gate", "testWriter", "independentRun", "review"]) {
       expect(PHASE_ORDER).toContain(name);
       expect(normalizePhase({ type: "phase", name, ms: 12 })).toMatchObject({ name, ms: 12 });
     }

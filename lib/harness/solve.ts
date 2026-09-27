@@ -55,13 +55,20 @@ import {
   snapshot,
 } from "@/lib/harness/snapshot";
 import type { SolveOptions, SolveResult, SolveStatus } from "@/lib/harness/solve-types";
-import { classifyIndependent, writeIndependentTest, type IndependentTestOutcome } from "@/lib/harness/testwriter";
+import {
+  classifyIndependent,
+  draftIndependentTest,
+  runIndependentTest,
+  type IndependentDraft,
+  type IndependentTestOutcome,
+} from "@/lib/harness/testwriter";
+import { registerLocalWorkspace } from "@/lib/local-disk-workspace";
 import { localize, type LocalizeResult } from "@/lib/localize";
 import { reviewDiff, type Finding, type TurnOutcome } from "@/lib/review";
 import { getFileInfo, getGraph } from "@/lib/store";
 import { createEditSession, numberLines } from "@/lib/tools/editor";
 import type { VerificationReport, VerifyCommand } from "@/lib/verify/types";
-import { fullReindex, readFile as wsReadFile, refreshMemory } from "@/lib/workspace";
+import { fullReindex, openWorkspace, readFile as wsReadFile, refreshMemory } from "@/lib/workspace";
 
 export type { SolveOptions, SolveResult, SolveStatus } from "@/lib/harness/solve-types";
 
@@ -84,6 +91,8 @@ const DIGEST_CODE = /\.(py|pyi|js|jsx|mjs|cjs|ts|tsx|go|rs|java|kt|rb|php|c|h|cc
 const DIGEST_SKIP =
   /(^|\/)(\.viberon|vendor|vendored|third_party|thirdparty|node_modules|dist|build|_vendor|migrations)(\/|$)|\.min\.js$|\.d\.ts$/i;
 /** A repository whose non-test source fits in this many characters (~12k tokens) is sent whole. */
+/** How long the loop waits for the criteria call once the rest of setup is done. */
+const CRITERIA_GRACE_MS = 1_500;
 const DIGEST_MAX_CHARS = 48_000;
 const DIGEST_MAX_FILES = 40;
 const DIGEST_README_CHARS = 6_000;
@@ -114,6 +123,8 @@ class SolveController implements RunController {
   summary = "";
   checkpoints = 0;
   private reprompted = false;
+  /** Harness notes that arrived mid-attempt (late criteria); appended, never inserted. */
+  private pending: string[] = [];
   private proofChecks = 0;
   private lastProofStep = 0;
   private step = 0;
@@ -139,6 +150,11 @@ class SolveController implements RunController {
 
   isDone(): boolean {
     return this.ruling !== null || this.finishedWithoutGate;
+  }
+
+  /** Queue a note for the end of the agent's current turn. */
+  addNote(text: string): void {
+    this.pending.push(text);
   }
 
   budgetExceeded({ usage }: { iteration: number; usage: AiUsage }): string | null {
@@ -193,7 +209,7 @@ class SolveController implements RunController {
         });
       }
     }
-    const notes: string[] = [];
+    const notes: string[] = this.pending.splice(0);
     const proof = await this.harnessCheckpoint(step);
     if (proof) notes.push(proof);
     for (const g of this.guards.guards(step)) notes.push(this.recovery(g));
@@ -553,6 +569,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
     const workRoot = root;
     await ensureModelReady(options.model);
 
+    let activeController: SolveController | null = null;
     // Setup runs concurrently where the data allows. Localize waits for the
     // snapshot because its snippet runs execute in the tree.
     const setupStarted = Date.now();
@@ -597,19 +614,31 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
     // The baseline runs on a temporary checkout, so the agent can edit meanwhile.
     if (options.verify.enabled && options.verify.baseline) baseline = gate.startBaseline().catch(() => undefined);
 
-    const [loc, rules, source, criteria] = await Promise.all([
-      locP,
-      rulesP,
-      sourceDigest(workRoot, ref).catch(() => null),
-      criteriaP,
-    ]);
+    const [loc, rules, source] = await Promise.all([locP, rulesP, sourceDigest(workRoot, ref).catch(() => null)]);
     emit({
       type: "localize",
       files: loc.files.slice(0, 8),
       ...(loc.snippetRun ? { snippetReproduced: loc.snippetRun.exitCode !== 0 } : {}),
     });
-    if (criteria.length) emit({ type: "criteria", items: criteria });
-    result.criteria = criteria;
+    // Criteria are one model call; on a slow model (the CLI takes ~25 s) they
+    // must not hold the loop. Wait a short grace; if they arrive later they are
+    // appended to the agent's next turn (append-only, so the prompt cache holds).
+    let criteria: string[] = [];
+    let criteriaLate = false;
+    const early = await Promise.race([
+      criteriaP.then((items) => ({ items })),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), CRITERIA_GRACE_MS)),
+    ]);
+    if (early) criteria = early.items;
+    else criteriaLate = true;
+    const criteriaReady = criteriaP.then((items) => {
+      criteria = items;
+      result.criteria = items;
+      if (items.length) emit({ type: "criteria", items });
+      if (criteriaLate && items.length) activeController?.addNote(`[harness] ${renderCriteria(items)}`);
+      return items;
+    });
+    if (!criteriaLate) await criteriaReady;
     endPhase("setup", setupStarted);
     const test = gate.testCommand;
     const overview = [
@@ -629,6 +658,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
      */
     const reviewAttempt = async (record: AttemptRecord, v: GateResult): Promise<Finding | null> => {
       try {
+        await criteriaReady;
         const wide = await diff(workRoot, ref, { toRef: record.tree, context: 25 }).catch(() => "");
         const review = await reviewDiff({
           diff: wide.trim() && wide.length < 80_000 ? wide : record.patch,
@@ -644,35 +674,52 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         return null;
       }
     };
-    /** The blind test writer; it restores the accepted tree itself and never fails the solve. */
-    const independentAttempt = async (record: AttemptRecord): Promise<IndependentTestOutcome> => {
+    const writerOn = options.independentTest ?? options.verify.enabled;
+    /**
+     * The blind test writer is blind, so it does not wait for a patch: it
+     * drafts its test now, in a throwaway checkout of the original code,
+     * while the solver works. It never fails the solve.
+     */
+    const draftP: Promise<IndependentDraft | null> = !writerOn
+      ? Promise.resolve(null)
+      : criteriaReady
+          .then(() =>
+            timed("testWriter", () =>
+              draftIndependentTest({
+                root: workRoot,
+                baseRef: ref,
+                task: options.task,
+                criteria,
+                summary: overview,
+                relatedTests: loc.testFiles,
+                model: options.reviewModel ?? options.model,
+                open: async (dir) => {
+                  const scratchHandle = await openWorkspace((await registerLocalWorkspace(dir)).repoKey);
+                  return { handle: scratchHandle, engine: await prepareEngine({ ...options, handle: scratchHandle }) };
+                },
+                emit,
+                signal: options.signal,
+                runId: options.runId,
+                onRun: (run) => {
+                  usage = addUsage(usage, run.usage);
+                  cost += run.cost;
+                  uncachedCost += run.uncachedCost;
+                  result.metrics.modelCalls += run.metrics?.modelCalls ?? 0;
+                },
+              }),
+            ),
+          )
+          .catch(() => null);
+    /** Run the drafted blind test on the accepted change (original ∥ patched). */
+    const independentAttempt = async (): Promise<IndependentTestOutcome> => {
+      const draft = await draftP;
+      if (!draft) return { status: "inconclusive", reason: "The independent writer gave up without a test command." };
       try {
-        return await writeIndependentTest({
-          root: workRoot,
-          acceptedTree: record.tree,
-          task: options.task,
-          criteria,
-          summary: overview,
-          relatedTests: loc.testFiles,
-          model: options.reviewModel ?? options.model,
-          handle,
-          engine: eng,
-          emit,
-          signal: options.signal,
-          runId: options.runId,
-          compare: (command) => gate.compareIndependent(command),
-          onRun: (run) => {
-            usage = addUsage(usage, run.usage);
-            cost += run.cost;
-            uncachedCost += run.uncachedCost;
-            result.metrics.modelCalls += run.metrics?.modelCalls ?? 0;
-          },
-        });
+        return await runIndependentTest(workRoot, draft, (command) => gate.compareIndependent(command), emit);
       } catch (error) {
         return { status: "inconclusive", reason: error instanceof Error ? error.message : String(error) };
       }
     };
-    const writerOn = options.independentTest ?? options.verify.enabled;
     const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
     let lessons: string | null = null;
     let retryReason: string | undefined;
@@ -698,7 +745,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         gate.resetAttempt();
       }
       const editSession = createEditSession();
-      const controller = new SolveController({
+      const controller: SolveController = new SolveController({
         gate,
         root,
         baseRef,
@@ -711,6 +758,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         startedAt,
         timed,
       });
+      activeController = controller;
       const run = await timed("loop", () => runAgent({
         agentId,
         stepId: `attempt-${n}`,
@@ -833,7 +881,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         } else {
           const accepted = verification;
           const [blind, finding] = await Promise.all([
-            writerOn ? timed("testWriter", () => independentAttempt(record)) : null,
+            writerOn ? timed("independentRun", () => independentAttempt()) : null,
             options.review ? timed("review", () => reviewAttempt(record, accepted)) : null,
           ]);
           if (blind) result.independentTest = blind;

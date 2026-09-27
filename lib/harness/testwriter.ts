@@ -2,17 +2,21 @@
  * The blind independent test writer (ported from Pramana
  * `agent/testwriter.py` and `_independent`).
  *
- * After the gate accepts a change with strong evidence, a second agent that
- * never sees the patch gets the task, the predicted acceptance criteria, a
- * repository summary and the related test names. It reads the code, writes
- * the regression test a maintainer would add (only under
- * `.viberon/scratch/`, so it is never part of the patch) and calls `done`
- * with the command. The harness runs that command on the original and the
- * patched code: evidence that does not come from the solver's own reading.
- * Anything the writer changed outside the scratch dir is undone, restoring
- * the accepted patch exactly.
+ * A second agent that never sees the patch gets the task, the predicted
+ * acceptance criteria, a repository summary and the related test names. It
+ * reads the code, writes the regression test a maintainer would add (only
+ * under `.viberon/scratch/`, so it is never part of the patch) and calls
+ * `done` with the command. The harness runs that command on the original and
+ * the patched code: evidence that does not come from the solver's own reading.
+ *
+ * Because it is blind, it does not wait for the patch: `draftIndependentTest`
+ * runs *during* the solve, in a throwaway checkout of the original code (so
+ * nothing it does can touch the solver's tree), and `runIndependentTest`
+ * runs the drafted test once the gate accepts. On a real run this took the
+ * writer's ~40 s off the critical path.
  */
 
+import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import type { EventSink } from "@/lib/agents/events";
@@ -20,7 +24,7 @@ import { runAgent, type AgentRunResult, type RunController } from "@/lib/agents/
 import type { EngineInput } from "@/lib/context/engine";
 import { renderCriteria } from "@/lib/harness/criteria";
 import { rootRelative } from "@/lib/harness/gate";
-import { restore, SCRATCH_DIR, snapshot } from "@/lib/harness/snapshot";
+import { SCRATCH_DIR, withOriginal } from "@/lib/harness/snapshot";
 import type { WorkspaceHandle } from "@/lib/workspace";
 
 export const WRITER_MAX_STEPS = 12;
@@ -39,27 +43,35 @@ export interface IndependentTestOutcome {
   reason?: string;
 }
 
-export interface TestWriterOptions {
+export interface DraftOptions {
+  /** The solver's work tree; the writer runs in a throwaway checkout of `baseRef` instead. */
   root: string;
-  /** The accepted change's snapshot: the work tree is put back to it exactly afterwards. */
-  acceptedTree: string;
+  baseRef: string;
   task: string;
   criteria: string[];
   /** Repository overview (stack, file count, test command). */
   summary: string;
   relatedTests: string[];
   model: string;
-  handle: WorkspaceHandle;
-  engine: EngineInput;
+  /** Workspace and engine for a directory (the isolated original checkout). */
+  open: (dir: string) => Promise<{ handle: WorkspaceHandle; engine: EngineInput }>;
   emit: EventSink;
   signal?: AbortSignal;
   runId?: string;
   maxSteps?: number;
-  /** Runs the command on the original and on the patched code (`Gate.compareIndependent`). */
-  compare: (command: string) => Promise<IndependentComparison>;
   /** The writer's agent run, for cost accounting. */
   onRun?: (run: AgentRunResult) => void;
 }
+
+/** A written test: its command (root-relative) and the scratch files it needs. */
+export interface IndependentDraft {
+  command: string;
+  files: { path: string; content: string }[];
+  started: number;
+}
+
+const MAX_DRAFT_FILES = 20;
+const MAX_DRAFT_BYTES = 256 * 1024;
 
 /** An assertion failed, as opposed to an import error or a crash in the test itself. */
 export function assertionFailure(output: string): boolean {
@@ -80,32 +92,52 @@ function inScratch(root: string, raw: unknown): boolean {
   return path.resolve(root, raw.trim()).startsWith(`${path.join(path.resolve(root), SCRATCH_DIR)}${path.sep}`);
 }
 
-function writerTask(options: TestWriterOptions): string {
+function writerTask(options: DraftOptions): string {
   const criteria = renderCriteria(options.criteria);
   const related = options.relatedTests.length ? `\nExisting related tests: ${options.relatedTests.slice(0, 6).join(", ")}` : "";
   return `<task>\n${options.task.slice(0, 12_000)}\n</task>\n\n${criteria ? `${criteria}\n\n` : ""}<repository>\n${options.summary}${related}\n</repository>\n\nWrite the independent regression test now, in ${SCRATCH_DIR}/.`;
 }
 
-export async function writeIndependentTest(options: TestWriterOptions): Promise<IndependentTestOutcome> {
-  const { root, emit } = options;
+/** Scratch files with their mtimes, to tell what the writer added or changed. */
+async function scratchFiles(dir: string): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const base = path.join(dir, SCRATCH_DIR);
+  const walk = async (rel: string): Promise<void> => {
+    const entries = await readdir(path.join(base, rel), { withFileTypes: true }).catch(() => []);
+    for (const e of entries) {
+      const child = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) await walk(child);
+      else if (e.isFile()) out.set(child, (await stat(path.join(base, child))).mtimeMs);
+    }
+  };
+  await walk("");
+  return out;
+}
+
+/**
+ * Run the blind writer in a throwaway checkout of the original code, while
+ * the solver works. Returns null when it gives up (and says so).
+ */
+export async function draftIndependentTest(options: DraftOptions): Promise<IndependentDraft | null> {
+  const { emit } = options;
   const started = Date.now();
   const seconds = () => Math.round((Date.now() - started) / 100) / 10;
-  let command: string | null = null;
-  let nudged = false;
-  const refusal = `Refused: you may only create or edit files under ${SCRATCH_DIR}/. Never modify source files.`;
-  const controller: RunController = {
-    isDone: () => command !== null,
-    beforeMutation: async ({ input }) => (inScratch(root, input.path) ? null : refusal),
-    onFinishAttempt: async () => {
-      if (command !== null || nudged) return null;
-      nudged = true;
-      return { feedback: "Use a tool, or call `done` with the command that runs your test." };
-    },
-  };
-
-  let run: AgentRunResult | null = null;
-  try {
-    run = await runAgent({
+  const draft = await withOriginal(options.root, options.baseRef, async (dir) => {
+    const before = await scratchFiles(dir);
+    const { handle, engine } = await options.open(dir);
+    let command: string | null = null;
+    let nudged = false;
+    const refusal = `Refused: you may only create or edit files under ${SCRATCH_DIR}/. Never modify source files.`;
+    const controller: RunController = {
+      isDone: () => command !== null,
+      beforeMutation: async ({ input }) => (inScratch(dir, input.path) ? null : refusal),
+      onFinishAttempt: async () => {
+        if (command !== null || nudged) return null;
+        nudged = true;
+        return { feedback: "Use a tool, or call `done` with the command that runs your test." };
+      },
+    };
+    const run = await runAgent({
       agentId: "test_writer",
       stepId: "independent-test",
       role: "test_writer",
@@ -113,9 +145,9 @@ export async function writeIndependentTest(options: TestWriterOptions): Promise<
       task: writerTask(options),
       title: "Independent test (blind)",
       files: [`${SCRATCH_DIR}/**`],
-      handle: options.handle,
-      engine: options.engine,
-      memory: options.engine.memory,
+      handle,
+      engine,
+      memory: engine.memory,
       commandPolicy: "auto",
       emit,
       signal: options.signal,
@@ -126,27 +158,44 @@ export async function writeIndependentTest(options: TestWriterOptions): Promise<
       mcp: false,
       harness: {
         done: async (input) => {
-          command = rootRelative(input.command, root);
+          command = rootRelative(input.command, dir);
           return "Recorded. The harness runs it on the original and the patched code.";
         },
       },
     });
     options.onRun?.(run);
-  } finally {
-    // The writer may only add scratch files (never in a snapshot): put the accepted patch back exactly.
-    if ((await snapshot(root).catch(() => null)) !== options.acceptedTree) {
-      await restore(root, options.acceptedTree);
-      emit({ type: "agent_text", agentId: "test_writer", text: "\n[harness] The test writer changed files outside the scratch dir; the accepted patch was restored.\n" });
+    if (command === null) return null;
+    const files: IndependentDraft["files"] = [];
+    for (const [rel, mtime] of await scratchFiles(dir)) {
+      if (before.get(rel) === mtime || files.length >= MAX_DRAFT_FILES) continue;
+      const full = path.join(dir, SCRATCH_DIR, rel);
+      if ((await stat(full)).size > MAX_DRAFT_BYTES) continue;
+      files.push({ path: `${SCRATCH_DIR}/${rel}`, content: await readFile(full, "utf8") });
     }
-  }
-
-  if (command === null) {
+    return { command: command as string, files };
+  });
+  if (!draft) {
     emit({ type: "independent_test", status: "gave_up", seconds: seconds() });
-    return { status: "inconclusive", reason: run?.error ?? "The independent writer gave up without a test command." };
+    return null;
   }
-  const written: string = command;
-  emit({ type: "independent_test", status: "written", command: written, seconds: seconds() });
-  const outcome = classifyIndependent(written, await options.compare(written));
-  emit({ type: "independent_test", status: "ran", command: written, verdict: outcome.status, seconds: seconds() });
+  emit({ type: "independent_test", status: "written", command: draft.command, seconds: seconds() });
+  return { ...draft, started };
+}
+
+/** Put a drafted test into the real scratch dir and run it on the original and the patched code. */
+export async function runIndependentTest(
+  root: string,
+  draft: IndependentDraft,
+  compare: (command: string) => Promise<IndependentComparison>,
+  emit: EventSink,
+): Promise<IndependentTestOutcome> {
+  for (const file of draft.files) {
+    const target = path.join(root, file.path);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, file.content);
+  }
+  const outcome = classifyIndependent(draft.command, await compare(draft.command));
+  const seconds = Math.round((Date.now() - draft.started) / 100) / 10;
+  emit({ type: "independent_test", status: "ran", command: draft.command, verdict: outcome.status, seconds });
   return outcome;
 }

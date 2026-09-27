@@ -2,7 +2,7 @@
  * Temporary on-disk repositories for harness tests (snapshot, gate, solve).
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -48,14 +48,18 @@ export function makeTmpRepo(files: Record<string, string>, options: { git?: bool
   };
 }
 
-/** A verifier that runs commands with bash, synchronously (tests only). */
-export const shellRunner: CheckRunner = async (command, { cwd, timeoutMs }) => {
-  const started = Date.now();
-  const res = spawnSync("bash", ["-c", command], { cwd, encoding: "utf8", timeout: timeoutMs });
-  return {
-    exitCode: res.status,
-    output: `${res.stdout ?? ""}${res.stderr ?? ""}`,
-    timedOut: res.error !== undefined && /ETIMEDOUT/.test(String(res.error)),
-    durationMs: Date.now() - started,
-  };
-};
+/** A verifier that runs commands with bash (tests only). */
+export const shellRunner: CheckRunner = (command, { cwd, timeoutMs }) =>
+  // Async (not spawnSync): a blocking runner would serialize checks the gate runs concurrently.
+  new Promise((resolve) => {
+    const started = Date.now();
+    execFile("bash", ["-c", command], { cwd, encoding: "utf8", timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+      const code = error && typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : error ? 1 : 0;
+      resolve({
+        exitCode: (error as { killed?: boolean } | null)?.killed ? null : code,
+        output: `${stdout ?? ""}${stderr ?? ""}`,
+        timedOut: Boolean((error as { killed?: boolean } | null)?.killed),
+        durationMs: Date.now() - started,
+      });
+    });
+  });

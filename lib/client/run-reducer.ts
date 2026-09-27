@@ -1222,7 +1222,7 @@ export function mergePhaseMs(list: readonly PhaseTiming[], phaseMs: unknown): Ph
 }
 
 /** The solve pipeline's order; unknown phases follow in arrival order. */
-export const PHASE_ORDER = ["setup", "localize", "criteria", "loop", "gate", "testWriter", "review", "deliver"] as const;
+export const PHASE_ORDER = ["setup", "localize", "criteria", "loop", "gate", "testWriter", "independentRun", "review", "deliver"] as const;
 
 export interface PhaseStrip {
   segments: PhaseTiming[];

@@ -12,6 +12,7 @@ import { openWorkspace } from "@/lib/workspace";
 import type { AiTurnRequest } from "@/lib/ai/types";
 import { installFakeProvider, uninstallFakeProvider, type ScriptedTurn } from "./helpers/fake-provider";
 import { eventLog } from "./helpers/harness-workspace";
+import { routed } from "./helpers/routed";
 import { makeTmpRepo, shellRunner, type TmpRepo } from "./helpers/tmp-repo";
 
 const ORIGINAL_LINE = "exports.mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;";
@@ -79,19 +80,20 @@ function writer(script: string, check?: (req: AiTurnRequest) => void): ScriptedT
 describe("solveTask", () => {
   it("runs a blind issue test after the gate accepts without showing the patch", async () => {
     const script = "const assert = require('node:assert/strict');\nconst { mean } = require('../../lib');\nassert.equal(mean([]), 0);\n";
-    const fake = installFakeProvider([
-      { calls: [
-        { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
-        { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
-      ] },
-      { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
-      ...writer(script, (req) => {
+    const fake = installFakeProvider(routed({
+      solver: [
+        { calls: [
+          { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+          { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
+        ] },
+        { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+      ],
+      writer: writer(script, (req) => {
         const prompt = JSON.stringify(req.messages);
         expect(prompt).toContain("mean([]) returns NaN");
         expect(prompt).not.toContain(RIGHT_LINE);
-        expect(JSON.stringify(req.system)).toContain("independent QA engineer");
       }),
-    ]);
+    }));
     const result = await solveTask(await options({ independentTest: true }));
     expect(result.status).toBe("resolved");
     expect(result.independentTest).toMatchObject({ status: "fixes", command: BLIND });
@@ -100,30 +102,35 @@ describe("solveTask", () => {
     // The blind test lives in scratch: never part of the patch.
     expect(result.filesChanged).toEqual(["lib.js"]);
     expect(log.of("independent_test").map((e) => e.status)).toEqual(["written", "ran"]);
-    expect(Object.keys(result.metrics.phaseMs ?? {}).sort()).toEqual(["gate", "localize", "loop", "setup", "testWriter"]);
+    expect(Object.keys(result.metrics.phaseMs ?? {}).sort()).toEqual(["gate", "independentRun", "localize", "loop", "setup", "testWriter"]);
   });
 
   it("uses a failing blind test to send the solver back for a sibling case", async () => {
     const incomplete = "exports.mean = (xs) => (xs.length ? (xs.length === 2 ? 999 : xs.reduce((a, b) => a + b, 0) / xs.length) : 0);";
     const blind = "const assert = require('node:assert/strict');\nconst { mean } = require('../../lib');\nassert.equal(mean([2, 4]), 3);\n";
-    installFakeProvider([
-      { calls: [
-        { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
-        { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: incomplete, summary: "partial" } },
-      ] },
-      { calls: [{ name: "finish", input: { summary: "partial", reproduction: REPRO } }] },
-      ...writer(blind),
-      (req) => {
-        expect(JSON.stringify(req.messages)).toMatch(/independent regression test.*fails/i);
-        return { calls: [{ name: "edit_file", input: { path: "lib.js", find: incomplete, replace: RIGHT_LINE, summary: "sibling" } }] };
-      },
-      { calls: [{ name: "finish", input: { summary: "fixed sibling case", reproduction: REPRO } }] },
-    ]);
+    installFakeProvider(routed({
+      solver: [
+        { calls: [
+          { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+          { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: incomplete, summary: "partial" } },
+        ] },
+        { calls: [{ name: "finish", input: { summary: "partial", reproduction: REPRO } }] },
+        (req) => {
+          expect(JSON.stringify(req.messages)).toMatch(/independent regression test.*fails/i);
+          return { calls: [{ name: "edit_file", input: { path: "lib.js", find: incomplete, replace: RIGHT_LINE, summary: "sibling" } }] };
+        },
+        { calls: [{ name: "finish", input: { summary: "fixed sibling case", reproduction: REPRO } }] },
+      ],
+      writer: writer(blind),
+    }));
     const result = await solveTask(await options({ independentTest: true, task: `${TASK}\nmean([2, 4]) should return 3.` }));
     expect(result.status).toBe("resolved");
     expect(result.independentTest?.status).toBe("passes");
     expect(repo.read("lib.js")).toBe(`${RIGHT_LINE}\n`);
-    expect(log.of("agent_start").map((a) => a.title)).toEqual(["Solve task", "Independent test (blind)", "Address independent test failure"]);
+    // The blind writer drafts alongside attempt 1; the follow-up comes after both.
+    const titles = log.of("agent_start").map((a) => a.title);
+    expect([...titles.slice(0, 2)].sort()).toEqual(["Independent test (blind)", "Solve task"]);
+    expect(titles[2]).toBe("Address independent test failure");
   });
 
   it("predicts acceptance criteria alongside setup and frames them as a prediction for the solver", async () => {

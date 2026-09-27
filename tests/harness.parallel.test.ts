@@ -124,7 +124,9 @@ describe("parallel setup (W2)", () => {
     const first = (name: string) => spans.find((s) => s.name === name)!;
     expect(first("localize").start).toBeGreaterThanOrEqual(first("engine").end);
     expect(first("localize").start).toBeGreaterThanOrEqual(first("snapshot").end);
-    expect(setupWall).toBeLessThan(serial);
+    // Load-proof: overlapping phases finish in less wall time than their spans add up to.
+    const spanSum = spans.reduce((n, sp) => n + (sp.end - sp.start), 0);
+    expect(setupWall).toBeLessThan(spanSum);
     expect(result.metrics.phaseMs).toMatchObject({ setup: expect.any(Number), localize: expect.any(Number), criteria: expect.any(Number) });
   });
 });
@@ -163,7 +165,7 @@ describe("parallel gate (W3)", () => {
     expect(runs.filter((r) => r.side === "patched")).toHaveLength(2);
     const [o, p] = [runs.find((r) => r.side === "original")!, runs.find((r) => r.side === "patched")!];
     expect(o.start < p.end && p.start < o.end).toBe(true);
-    expect(wall).toBeLessThan(runs.length * DELAY);
+    expect(wall).toBeLessThan(runs.reduce((n, r) => n + (r.end - r.start), 0));
 
     // The blind-test comparison too.
     runs.length = 0;
