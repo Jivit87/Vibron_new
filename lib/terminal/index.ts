@@ -27,12 +27,12 @@ import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import path from "node:path";
 
-import { LineTracker, OutputBuffer, detectLocalUrl } from "./output";
-import { classifyCommand, scrubEnv } from "./safety";
+import { LineTracker, OutputBuffer, cleanTerminalOutput, detectLocalUrl, trimHeadTail } from "./output";
+import { classifyAgentCommand, classifyCommand, scrubEnv } from "./safety";
 import { condenseOutput } from "@/lib/verify/extract";
 import { repoEnvPrelude } from "@/lib/verify/env";
 
-export { classifyCommand, scrubEnv, type CommandVerdict } from "./safety";
+export { classifyAgentCommand, classifyCommand, scrubEnv, type CommandVerdict } from "./safety";
 
 export type TerminalStatus = "running" | "exited" | "killed" | "failed";
 export type TerminalOrigin = "user" | "agent";
@@ -173,6 +173,35 @@ export interface RunOptions {
   repoEnv?: boolean;
 }
 
+/**
+ * Non-interactive defaults for agent commands (Pramana `build_env`): no
+ * pagers, no editors, no credential prompts, no pip nags, unbuffered Python.
+ * Any of these waiting on a closed stdin would otherwise hang until timeout.
+ */
+const AGENT_ENV: Record<string, string> = {
+  PAGER: "cat",
+  GIT_PAGER: "cat",
+  MANPAGER: "cat",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_EDITOR: "true",
+  EDITOR: "true",
+  TERM: "dumb",
+  PIP_DISABLE_PIP_VERSION_CHECK: "1",
+  PIP_NO_INPUT: "1",
+  PYTHONUNBUFFERED: "1",
+  DEBIAN_FRONTEND: "noninteractive",
+};
+
+function childEnv(origin: TerminalOrigin, repoEnv: boolean): NodeJS.ProcessEnv {
+  const env = scrubEnv(process.env);
+  if (repoEnv) {
+    // The host's own interpreter settings must not leak into repo Python.
+    delete env.PYTHONHOME;
+    delete env.__PYVENV_LAUNCHER__;
+  }
+  return origin === "agent" ? { ...env, ...AGENT_ENV } : env;
+}
+
 function pushChunk(
   session: TerminalSession,
   stream: TerminalChunk["stream"],
@@ -239,6 +268,19 @@ export function startCommand(options: RunOptions): TerminalSession {
     return session;
   }
 
+  // Pramana denylist parity: agent commands are re-checked here so every
+  // path that starts one (tool, gate, task runner) gets the same refusal.
+  if (origin === "agent") {
+    const verdict = classifyAgentCommand(options.command);
+    if (verdict.allowed === false) {
+      session.status = "failed";
+      session.endedAt = Date.now();
+      pushChunk(session, "system", `[blocked: this command ${verdict.reason}]\n`);
+      markDone();
+      return session;
+    }
+  }
+
   // A login shell resolves the user's real PATH — without it, tools
   // installed via nvm/homebrew/asdf are invisible to spawned processes.
   const shell = IS_WINDOWS ? "cmd.exe" : "/bin/bash";
@@ -251,7 +293,7 @@ export function startCommand(options: RunOptions): TerminalSession {
     child = spawn(shell, args, {
       cwd: options.cwd,
       env: {
-        ...scrubEnv(process.env),
+        ...childEnv(origin, options.repoEnv === true),
         ...options.env,
         // Keep tool output parseable and non-interactive.
         FORCE_COLOR: "0",
@@ -374,37 +416,32 @@ export async function runCommand(
   output: string;
   truncated: boolean;
   detectedUrl: string | null;
+  /** Killed by `timeoutMs`, or still running when the wait gave up. */
+  timedOut: boolean;
 }> {
   const session = startCommand(options);
   await waitFor(session, options.timeoutMs || 120_000);
 
   const cap = options.maxOutputChars ?? 12_000;
-  const full = session.buffer.toString();
-  const truncated = full.length > cap;
-  if (options.condense) {
-    return {
-      sessionId: session.id,
-      status: session.status,
-      exitCode: session.exitCode,
-      output: condenseOutput(full, session.exitCode, cap),
-      truncated,
-      detectedUrl: session.detectedUrl,
-    };
-  }
-  // Keep the head *and* the tail: the head has the command and early
-  // errors, the tail has the summary and exit code.
-  const output = truncated
-    ? `${full.slice(0, Math.floor(cap * 0.4))}\n… [${full.length - cap} chars trimmed] …\n${full.slice(-Math.floor(cap * 0.6))}`
-    : full;
-
-  return {
+  // ANSI and progress-bar redraws never reach the model (Pramana clean_output).
+  const full = cleanTerminalOutput(session.buffer.toString());
+  const timedOut =
+    session.status === "running" ||
+    (session.status === "killed" && full.includes("[timed out after "));
+  const base = {
     sessionId: session.id,
     status: session.status,
     exitCode: session.exitCode,
-    output,
-    truncated,
+    truncated: full.length > cap,
     detectedUrl: session.detectedUrl,
+    timedOut,
   };
+  if (options.condense) {
+    return { ...base, output: condenseOutput(full, session.exitCode, cap) };
+  }
+  // Keep the head *and* the tail: the head has the command and early
+  // errors, the tail has the summary and exit code.
+  return { ...base, output: trimHeadTail(full, cap).output };
 }
 
 /* ---------------------------- registry ----------------------------------- */
