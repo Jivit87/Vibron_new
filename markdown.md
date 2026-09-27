@@ -149,3 +149,12 @@ Status: **built** = merged on main with tests green · **in progress** = an agen
     - every task ran four agents.
   - Merged the Stop fix and per-task usage (d9), the live usage panel (developer-dd), and delivery hardening (d9: rate limits/ETag, stable issue branches, locks, secret redaction). 882 tests pass; clean build is green.
 - **2026-09-27:** Merged d9 agent C plus a follow-up (79baaac): force-push-safe `--no-tags` base fetch; ephemeral issue-worktree workspaces (memory-only store entries); cached `configuredRemoteUrl`; `repoSnapshot()` (18 → 15 git processes per fix→PR, 707 → 653 ms median); backoff polling in the Deliver bar; Ctrl-C cleanup for `viberon issues --fix`. 894 tests pass; clean build is green.
+- **2026-09-27:** Merged d9 agent C (gap audit) and agent A.
+  - **Agent A:** the sharded store, which fixes the frozen server. A store get/set went from 19.3 s of blocking to 0 ms; the store from 137 MB to 0.29 MB; cancel is answered in 4 ms during indexing. The legacy store is renamed to `.bak` and never deleted, and the migration runs in a worker.
+  - **Planner:**
+    - no implicit Claude-subscription spend: `auto` and review never pick claude-cli unless `VIBERON_CLAUDE_CLI_AUTO=1`;
+    - `viberon run` checks the model before indexing;
+    - `mode:"fix"` is treated as the Fix interaction;
+    - a real `cancelled` todo status;
+    - `refreshMemory` memoised (about 181 ms saved per call).
+  - 924 tests pass; clean build is green.
