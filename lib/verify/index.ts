@@ -7,6 +7,7 @@
  *   extractFailures(output, maxChars?)    tracebacks / assertion diffs / FAIL blocks + tail
  *   condenseOutput(output, exit, max?)    passing: head+tail; failing: failures+tail
  *   relatedTestFiles(root, changed, graph)
+ *   relatedTestTargets(root, changedFiles, changedSymbols)  → smallest targeted command + time cap
  *   buildRepoEnv(root) / repoEnvPrelude   venv activation, python shim, no API keys
  *   runOnOriginalAndPatched(root, baseRef, command, opts)  → verdict fixes/regression/…
  */
@@ -18,3 +19,4 @@ export { condenseOutput, extractFailures } from "@/lib/verify/extract";
 export { relatedTestFiles } from "@/lib/verify/related";
 export { buildRepoEnv, findRepoVenv, repoEnvPrelude, repoPathPrefix, which } from "@/lib/verify/env";
 export { cleanOutput, parseTestOutput, type ParsedTests } from "@/lib/verify/parse";
+export { isTestPath, relatedTestTargets, type RelatedTestOptions, type RelatedTestTargets } from "@/lib/verify/targets";
