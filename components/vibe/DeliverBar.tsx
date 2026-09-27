@@ -57,6 +57,17 @@ export function DeliverBar({ run }: { run: RunState }) {
     >
       {d.pr ? (
         <Delivered runId={run.id} d={d} issueUrl={issueUrl} run={run} />
+      ) : d.pushed ? (
+        <div className="flex min-h-[22px] items-center gap-2 text-[12px]">
+          <span style={{ color: "var(--vb-mint)" }}>Pushed</span>
+          <span className="min-w-0 flex-1 truncate font-mono text-[11.5px]" style={{ color: "var(--vb-text)" }}>
+            {d.pushed.branch}
+            {d.pushed.commit ? ` @ ${d.pushed.commit.slice(0, 7)}` : ""}
+          </span>
+          <span className="text-[11px]" style={{ color: "var(--vb-text-dim)" }}>
+            no pull request: the remote is not on GitHub
+          </span>
+        </div>
       ) : (
         <DeliverForm runId={run.id} d={d} files={files} issueUrl={issueUrl} />
       )}
@@ -72,7 +83,8 @@ function DeliverForm({ runId, d, files, issueUrl }: { runId: string; d: DeliverD
   const busy = d.phase === "delivering";
   const branchProblem = branchError(d.branch);
   const blocked = busy || Boolean(branchProblem) || !d.title.trim();
-  const deliver = (confirm?: boolean) => void useDeliver.getState().deliver(runId, { repoKey, files, issueUrl, confirm });
+  const deliver = (confirm?: boolean, pushOnly?: boolean) =>
+    void useDeliver.getState().deliver(runId, { repoKey, files, issueUrl, confirm, pushOnly });
 
   return (
     <>
@@ -169,6 +181,17 @@ function DeliverForm({ runId, d, files, issueUrl }: { runId: string; d: DeliverD
               <span className="mr-1 text-[11px]" style={{ color: "var(--vb-rose)" }}>
                 {branchProblem}
               </span>
+            )}
+            {d.notGithub && (
+              <button
+                type="button"
+                className="vb-btn"
+                disabled={blocked}
+                title="The remote is not on GitHub: push the branch without opening a pull request"
+                onClick={() => deliver(false, true)}
+              >
+                Push branch only
+              </button>
             )}
             <button type="button" className="vb-btn vb-btn-primary" disabled={blocked} onClick={() => deliver()}>
               {busy && <Loader2 className="size-3.5 animate-spin" />}

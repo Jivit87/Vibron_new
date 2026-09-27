@@ -649,6 +649,7 @@ const OUTCOME: Record<EvidenceOutcome, { label: string; color: string }> = {
   no_patch: { label: "No patch", color: "var(--vb-text-mid)" },
   incomplete: { label: "Incomplete", color: "var(--vb-amber)" },
   failed: { label: "Failed", color: "var(--vb-rose)" },
+  stopped: { label: "Stopped", color: "var(--vb-text-mid)" },
 };
 
 /** The receipt: was the patch proven, and what did it cost. */

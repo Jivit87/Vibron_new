@@ -193,12 +193,13 @@ export function SettingsPage() {
             </Section>
 
             <Section id="agents" title="Agents">
-              {show("default interaction agent plan ask") && (
-                <Row label="Default interaction" hint="Agent edits the workspace, Plan proposes steps for approval first, Ask only answers.">
+              {show("default interaction fix agent plan ask") && (
+                <Row label="Default interaction" hint="Fix reproduces, patches and proves; Agent edits the workspace; Plan proposes steps for approval first; Ask only answers.">
                   <Segmented
                     size="md"
                     value={settings.interaction}
                     options={[
+                      { value: "fix", label: "Fix" },
                       { value: "agent", label: "Agent" },
                       { value: "plan", label: "Plan" },
                       { value: "ask", label: "Ask" },

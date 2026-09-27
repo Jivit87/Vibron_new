@@ -8,7 +8,7 @@
  * else lives in `AppShell`.
  */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { AppShell } from "@/components/vibe/AppShell";
 import { ProgressBar } from "@/components/ProgressBar";
@@ -36,6 +36,10 @@ export function Workspace({
   rootPath,
   initialQuery,
 }: WorkspaceProps) {
+  // The graph an ingest job finished building while this page was open.
+  const [ingested, setIngested] = useState<Graph | null>(null);
+  const ready = graph ?? ingested;
+
   // Load this workspace's chat history and open the most recent thread.
   // A deep-linked prompt starts fresh instead, so the incoming request is not
   // appended to whatever the user was last discussing.
@@ -80,7 +84,7 @@ export function Workspace({
 
   // An ingest job is still building the graph — show progress rather than an
   // empty IDE the user cannot do anything with yet.
-  if (!graph && jobId) {
+  if (!ready && jobId) {
     return (
       <div
         className="flex h-screen w-full items-center justify-center"
@@ -93,7 +97,7 @@ export function Workspace({
           >
             Indexing your code
           </p>
-          <ProgressBar jobId={jobId} />
+          <ProgressBar jobId={jobId} onComplete={() => setIngested(useViberon.getState().graph ?? null)} />
         </div>
       </div>
     );
@@ -105,7 +109,7 @@ export function Workspace({
       repoLabel={repoLabel ?? "Workspace"}
       repoRef={repoRef}
       rootPath={rootPath}
-      graph={graph}
+      graph={ready}
     />
   );
 }

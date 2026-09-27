@@ -8,7 +8,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { useUsageStore } from "@/store/usage";
+import { openUsagePanel, useUsageStore } from "@/store/usage";
 import { useViberon, type ChatMessage } from "@/store/viberon";
 import {
   cacheSavings,
@@ -279,9 +279,8 @@ function UsagePopoverBody({
           className="vb-btn vb-btn-ghost"
           onClick={() => {
             onClose();
-            const store = useViberon.getState();
-            store.setAppMode("ide");
-            store.setBottomPanel("ledger");
+            // While a run is live (or just ended), the panel opens on that run.
+            openUsagePanel({ scope: useViberon.getState().run ? "run" : undefined });
           }}
         >
           Open usage panel

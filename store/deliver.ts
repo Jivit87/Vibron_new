@@ -43,6 +43,10 @@ export interface DeliverDraft {
   error: string | null;
   confirmFiles: string[];
   pr: { url: string; number?: number; branch: string; commit?: string; updated: boolean } | null;
+  /** Pushed without a PR (`pushOnly`). */
+  pushed?: { branch: string; commit?: string } | null;
+  /** The last deliver said the remote is not on GitHub: offer a plain push. */
+  notGithub?: boolean;
   comment: { state: "idle" | "posting" | "done" | "error"; url?: string; error?: string };
   ci: CiStatus | null;
   ciError: string | null;
@@ -59,7 +63,7 @@ interface DeliverStore {
   ensure: (runId: string, prompt: string) => DeliverDraft;
   patch: (runId: string, patch: Partial<DeliverDraft>) => void;
   describe: (runId: string, repoKey: string) => Promise<void>;
-  deliver: (runId: string, input: { repoKey: string; files: string[]; issueUrl?: string; confirm?: boolean }) => Promise<void>;
+  deliver: (runId: string, input: { repoKey: string; files: string[]; issueUrl?: string; confirm?: boolean; pushOnly?: boolean }) => Promise<void>;
   comment: (runId: string, input: { repoKey: string; issueUrl: string; summary: string; evidence: DeliveryEvidence }) => Promise<void>;
   pollCi: (runId: string) => Promise<void>;
   setRerun: (runId: string, check: string, patch: Partial<RerunState>) => void;
@@ -126,7 +130,7 @@ export const useDeliver = create<DeliverStore>((set, get) => {
       });
     },
 
-    deliver: async (runId, { repoKey, files, issueUrl, confirm }) => {
+    deliver: async (runId, { repoKey, files, issueUrl, confirm, pushOnly }) => {
       const d = cur(runId);
       if (!d || d.phase === "delivering") return;
       patch(runId, { phase: "delivering", error: null });
@@ -139,7 +143,12 @@ export const useDeliver = create<DeliverStore>((set, get) => {
         files,
         issueUrl,
         confirm,
+        pushOnly,
       });
+      if (result.ok && result.pushedOnly) {
+        patch(runId, { phase: "done", error: null, notGithub: false, pushed: { branch: result.branch || d.branch, commit: result.commit } });
+        return;
+      }
       if (result.ok) {
         patch(runId, {
           phase: "done",
@@ -154,6 +163,7 @@ export const useDeliver = create<DeliverStore>((set, get) => {
       patch(runId, {
         phase: result.needsConfirm && !confirm ? "confirm" : "edit",
         error: result.error,
+        notGithub: Boolean(result.notGithub),
         confirmFiles: result.files ?? [],
       });
     },

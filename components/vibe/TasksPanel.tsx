@@ -8,11 +8,13 @@
  * aborted, the task's processes are killed and its worktree removed.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { ExternalLink, Loader2, RefreshCw, Square } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ExternalLink, Loader2, Network, RefreshCw, Square } from "lucide-react";
 import { toast } from "sonner";
 
-import { attachedTask, attachTaskRun } from "@/lib/client/agent-stream";
+import { attachedTask, attachTaskRun, cancelRun } from "@/lib/client/agent-stream";
+import { focusFromTask, focusIsEmpty } from "@/lib/client/graph-focus";
+import { issueForTask, issueNumber, useLinks } from "@/store/links";
 import { cancelTask, listTasks, shortRef, stopAllTasks, taskUsageLine, type TaskRow, type TaskState } from "@/lib/client/deliver";
 import { sameJson, usePolling } from "@/lib/client/use-polling";
 import { useViberon } from "@/store/viberon";
@@ -47,6 +49,21 @@ export function TasksPanel() {
   /** Tasks the user asked to stop that the server still reports active. */
   const [stopping, setStopping] = useState<Set<string>>(new Set());
   const [stoppingAll, setStoppingAll] = useState(false);
+  const issues = useLinks((s) => s.issues);
+  const reveal = useLinks((s) => s.reveal);
+  const run = useViberon((s) => s.run);
+  const runHistory = useViberon((s) => s.runHistory);
+  const hasGraph = useViberon((s) => Boolean(s.graph));
+  const focusId = useViberon((s) => (s.graphFocus?.kind === "task" ? s.graphFocus.id : null));
+  const revealed = reveal?.kind === "task" ? reveal.id : null;
+  const tableRef = useRef<HTMLTableElement>(null);
+
+  // Another view asked for a task (an issue row's task link): bring it into view.
+  useEffect(() => {
+    if (!revealed || !tasks) return;
+    const row = tableRef.current?.querySelector<HTMLElement>(`[data-task-id="${CSS.escape(revealed)}"]`);
+    row?.scrollIntoView({ block: "nearest" });
+  }, [revealed, tasks]);
 
   const refresh = useCallback(
     async (manual = false) => {
@@ -58,6 +75,12 @@ export function TasksPanel() {
       if (result.ok) {
         const next = result.tasks ?? [];
         setTasks((prev) => (prev && sameJson(prev, next) ? prev : next));
+        useLinks.getState().setTasks(next);
+        // The task the run view streams ended on the server (stopped elsewhere,
+        // failed): close the stream so the view settles instead of spinning.
+        const watching = attachedTask();
+        const ended = watching ? next.find((t) => t.id === watching && (t.state === "cancelled" || t.state === "failed")) : undefined;
+        if (ended) void cancelRun();
         setError(null);
         setMissing(false);
         // A task that finished is no longer "stopping".
@@ -84,6 +107,13 @@ export function TasksPanel() {
 
   async function stop(task: TaskRow) {
     setStopping((prev) => new Set(prev).add(task.id));
+    // The run view is streaming this task: Stop there cancels it on the server
+    // and ends the stream, so every live row in the view settles at once.
+    if (attachedTask() === task.id) {
+      await cancelRun();
+      void refresh();
+      return;
+    }
     const result = await cancelTask(task.id);
     if (!result.ok) {
       toast.error(result.error ?? "Could not stop the task.");
@@ -102,6 +132,7 @@ export function TasksPanel() {
     const ids = (tasks ?? []).filter((t) => t.state === "running" || t.state === "queued").map((t) => t.id);
     setStopping((prev) => new Set([...prev, ...ids]));
     const result = await stopAllTasks(repoKey);
+    if (attachedTask()) await cancelRun();
     setStoppingAll(false);
     if (!result.ok) toast.error(result.error ?? "Could not stop the tasks.");
     void refresh();
@@ -157,7 +188,7 @@ export function TasksPanel() {
         ) : tasks.length === 0 ? (
           <EmptyState title="No tasks" body="Fix CI from a pull request, `viberon fix --queue`, or POST /api/tasks adds one here." />
         ) : (
-          <table className="w-full table-fixed border-collapse text-[12px]" aria-label="Tasks">
+          <table ref={tableRef} className="w-full table-fixed border-collapse text-[12px]" aria-label="Tasks">
             <thead>
               <tr className="text-left text-[11px]" style={{ color: "var(--vb-text-faint)" }}>
                 <th className="w-[100px] py-0.5 pl-3 font-normal">state</th>
@@ -166,8 +197,9 @@ export function TasksPanel() {
                 <th className="w-[52px] py-0.5 font-normal">source</th>
                 <th className="w-[72px] py-0.5 font-normal">age</th>
                 <th className="w-[116px] py-0.5 font-normal">tokens</th>
+                <th className="w-[52px] py-0.5 font-normal">issue</th>
                 <th className="w-[128px] py-0.5 font-normal">pull request</th>
-                <th className="w-[32px] py-0.5" />
+                <th className="w-[56px] py-0.5" />
               </tr>
             </thead>
             <tbody>
@@ -179,12 +211,26 @@ export function TasksPanel() {
                 const isStopping = stopping.has(task.id) && isActive;
                 const isAttached = attached === task.id;
                 const detail = task.error ?? (task.state === "done" && !task.prUrl ? task.note : undefined);
+                const issue = issueForTask(task, issues);
+                const number = issue?.number ?? issueNumber(task.issueUrl);
+                const issueUrl = issue?.url ?? task.issueUrl;
+                const focus = focusFromTask(task, run ? [run, ...runHistory] : runHistory);
+                const canShow = hasGraph && !focusIsEmpty(focus);
+                const marked = isAttached || revealed === task.id || focusId === task.id;
                 return (
                   <tr
                     key={task.id}
-                    className={cx("group h-[24px] border-t align-middle", live && !isStopping && "cursor-pointer hover:bg-[var(--vb-hover)]")}
-                    style={{ borderColor: "var(--vb-line-faint)", background: isAttached ? "var(--vb-accent-soft)" : undefined }}
-                    onClick={() => live && !isStopping && !isAttached && attach(task)}
+                    data-task-id={task.id}
+                    className={cx("group h-[24px] border-t align-middle", ((live && !isStopping) || canShow) && "cursor-pointer hover:bg-[var(--vb-hover)]")}
+                    style={{ borderColor: "var(--vb-line-faint)", background: marked ? "var(--vb-accent-soft)" : undefined }}
+                    onClick={() => {
+                      if (live) {
+                        if (!isStopping && !isAttached) attach(task);
+                      } else if (canShow) {
+                        // A finished task: selecting it draws what it touched on the graph.
+                        useViberon.getState().setGraphFocus(focus);
+                      }
+                    }}
                     title={[task.task, task.error ? `Error: ${task.error}` : "", task.note ? `Note: ${task.note}` : "", live ? "Click to watch the live run" : ""].filter(Boolean).join("\n\n")}
                   >
                     <td className="pl-3">
@@ -231,6 +277,23 @@ export function TasksPanel() {
                     <td className="truncate pr-2 font-mono text-[11px]" style={{ color: "var(--vb-text-dim)" }} title={task.usage ? `${task.usage.tokens.toLocaleString()} tokens, $${task.usage.costUsd.toFixed(4)}` : undefined}>
                       {taskUsageLine(task.usage)}
                     </td>
+                    <td className="truncate pr-2 font-mono text-[11px]">
+                      {number !== null && issueUrl && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            useLinks.getState().setReveal({ kind: "issue", url: issueUrl });
+                            useViberon.getState().setBottomPanel("issues");
+                          }}
+                          className="hover:underline"
+                          style={{ color: "var(--vb-text-mid)" }}
+                          title={issue ? `#${number} ${issue.title}\nShow in Issues` : `Issue #${number}: show in Issues`}
+                        >
+                          #{number}
+                        </button>
+                      )}
+                    </td>
                     <td className="truncate pr-2">
                       {task.prUrl && (
                         <a
@@ -246,7 +309,12 @@ export function TasksPanel() {
                         </a>
                       )}
                     </td>
-                    <td onClick={(e) => e.stopPropagation()}>
+                    <td onClick={(e) => e.stopPropagation()} className="whitespace-nowrap pr-1 text-right">
+                      {canShow && (
+                        <IconButton title="Show what this task read and changed on the code graph" onClick={() => useViberon.getState().showOnGraph(focus)}>
+                          <Network className="size-3" />
+                        </IconButton>
+                      )}
                       {isActive && (
                         <IconButton title={isStopping ? "Stopping…" : "Stop this task"} tone="danger" disabled={isStopping} onClick={() => void stop(task)}>
                           <Square className="size-3" />

@@ -23,7 +23,7 @@ import { toast } from "sonner";
 
 import { ChatShell } from "@/components/vibe/ChatShell";
 import { CloneDialog } from "@/components/vibe/CloneDialog";
-import { takePendingFix } from "@/lib/client/clone";
+import { takePendingFix, takePendingGraph } from "@/lib/client/clone";
 import { CommandPalette } from "@/components/vibe/CommandPalette";
 import { IdeShell } from "@/components/vibe/IdeShell";
 import { refreshWorkspace } from "@/lib/client/agent-stream";
@@ -36,6 +36,7 @@ import { useScm } from "@/store/scm";
 import { resolveTheme, useViberon } from "@/store/viberon";
 import { cx, Dot, Kbd, MenuItem, Popover, Segmented } from "@/components/vibe/primitives";
 import { UsageChip } from "@/components/vibe/usage-ui";
+import { openUsagePanel } from "@/store/usage";
 
 export interface AppShellProps {
   repoKey: string;
@@ -76,11 +77,16 @@ export function AppShell({ repoKey, repoLabel, repoRef, rootPath, graph }: AppSh
     store.init({ repoKey, repoLabel, rootPath });
     if (graph) store.setGraph(graph);
     recordWorkspace({ repoKey, label: repoLabel, rootPath });
+    // Arrived here from a clone: open the new workspace on its code graph.
+    if (takePendingGraph(repoKey)) {
+      store.setAppMode("ide");
+      store.openGraphTab();
+    }
     // Arrived here from "Clone and fix": hand the issue to the composer.
     const pendingIssue = takePendingFix(repoKey);
     if (pendingIssue) {
-      // Stay in the current shell; in the IDE the draft goes to the agent dock.
-      if (store.appMode === "ide") store.setAgentDockOpen(true);
+      // In the IDE the draft goes to the agent dock, beside the graph.
+      if (useViberon.getState().appMode === "ide") store.setAgentDockOpen(true);
       store.setComposerDraft({ text: "", interaction: "fix", issue: pendingIssue });
     }
     const pendingBatch = takePendingIssueBatch(repoKey);
@@ -466,7 +472,7 @@ function StatusBar() {
           <span style={{ color: "var(--vb-amber)" }}>No API key</span>
         </StatusItem>
       ) : streaming ? (
-        <StatusItem title="Run in progress">
+        <StatusItem title="Run in progress: open its usage" onClick={() => openUsagePanel({ scope: "run" })}>
           <Dot color="var(--vb-accent)" live size={5} />
           {pendingApprovals > 0
             ? `${pendingApprovals} waiting for approval`

@@ -13,7 +13,7 @@ import { toast } from "sonner";
 import type { ApprovalDecision, OrchestrationEvent, RunPlan, RunStatus } from "@/lib/agents/events";
 import { RUN_ID_HEADER, type AgentRequest, type Interaction } from "@/lib/harness/contracts";
 import type { ContextAttachment, ImageAttachment } from "@/lib/composer/types";
-import { answerMockApproval, isMockMode, mockResponse, mockScript, mockTaskScript } from "@/lib/client/mock-run";
+import { answerMockApproval, isMockMode, mockCancelTask, mockResponse, mockScript, mockTaskScript } from "@/lib/client/mock-run";
 import { useUsageStore } from "@/store/usage";
 import { useViberon } from "@/store/viberon";
 
@@ -33,6 +33,9 @@ export function parseFrame(frame: string): OrchestrationEvent | null {
 }
 
 let activeController: AbortController | null = null;
+/** The stream the user asked to stop; its run ends as `cancelled`. */
+let stopRequested: AbortController | null = null;
+
 /** Server-issued run id (from `X-Run-Id` or `run_start`), for cancel. */
 let activeRunId: string | null = null;
 
@@ -45,11 +48,15 @@ let activeRunId: string | null = null;
 export async function cancelRun(): Promise<void> {
   const controller = activeController;
   if (!controller) return;
+  // However the stream then ends (abort, clean close), the run was stopped.
+  stopRequested = controller;
   const runId = activeRunId;
   // A queued task shown in the run view (Fix mode, issue fixes, reviews) runs
   // on the server's task queue, not as an /api/agent run: Stop cancels the
   // task itself. Only closing the stream would leave it running and billing.
   const taskId = attachedTaskId;
+  // `?mock=1`: the canned task list has no server; mark the task stopped there.
+  if (isMockMode() && taskId) mockCancelTask(taskId);
   const stop = isMockMode()
     ? null
     : taskId
@@ -206,14 +213,14 @@ export async function attachTaskRun(task: { id: string; task: string }): Promise
     toast.error("A run is already in progress. Stop it first.");
     return;
   }
-  store.startRun({ prompt: task.task, model: store.settings.model, mode: "single", interaction: "fix" });
+  store.startRun({ prompt: task.task, model: store.settings.model, mode: "single", interaction: "fix", taskId: task.id });
   attachedTaskId = task.id;
   try {
     await pumpRun({
       conversational: false,
       open: (signal) =>
         isMockMode()
-          ? Promise.resolve(mockResponse(mockTaskScript(), signal))
+          ? Promise.resolve(mockResponse(mockTaskScript(task), signal))
           : fetch(`/api/tasks/${encodeURIComponent(task.id)}/events`, {
               headers: { Accept: "text/event-stream" },
               signal,
@@ -376,6 +383,7 @@ async function pumpRun({
     flush();
     // A stream that ended without run_done: ask its owner how it ended
     // rather than claiming success.
+    if (!finalStatus && stopRequested === controller) finalStatus = "cancelled";
     if (!finalStatus && settle) finalStatus = await settle().catch(() => null);
     useViberon.getState().endRun(finalStatus ?? "done");
   } catch (error) {
@@ -394,6 +402,7 @@ async function pumpRun({
   } finally {
     if (flushHandle !== null) window.cancelAnimationFrame(flushHandle);
     if (activeController === controller) activeController = null;
+    if (stopRequested === controller) stopRequested = null;
     activeRunId = null;
     void refreshWorkspace();
   }

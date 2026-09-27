@@ -36,11 +36,14 @@ interface UsageState {
   graphHeat: boolean;
   /** Live usage panel in the run view is expanded. */
   liveOpen: boolean;
+  /** Usage panel narrowed to one file's context (and its symbols). */
+  fileFilter: string | null;
   /** Fold one orchestration event for the run with this client id. */
   ingest: (runId: string | undefined, event: OrchestrationEvent) => void;
   setScope: (scope: UsageScope) => void;
   setGraphHeat: (on: boolean) => void;
   setLiveOpen: (open: boolean) => void;
+  setFileFilter: (path: string | null) => void;
 }
 
 /** Pure: the per-run extra after one event. */
@@ -92,6 +95,7 @@ export const useUsageStore = create<UsageState>((set) => ({
   scope: "run",
   graphHeat: false,
   liveOpen: true,
+  fileFilter: null,
 
   ingest: (runId, event) => {
     if (!runId) return;
@@ -113,7 +117,21 @@ export const useUsageStore = create<UsageState>((set) => ({
   setScope: (scope) => set({ scope }),
   setGraphHeat: (graphHeat) => set({ graphHeat }),
   setLiveOpen: (liveOpen) => set({ liveOpen }),
+  setFileFilter: (fileFilter) => set({ fileFilter }),
 }));
+
+/**
+ * Open the usage panel: `run` shows the active (or last) run; a file
+ * narrows "Top context" to that file.
+ */
+export function openUsagePanel(target: { scope?: UsageScope; file?: string | null } = {}): void {
+  const usage = useUsageStore.getState();
+  if (target.scope) usage.setScope(target.scope);
+  usage.setFileFilter(target.file ?? null);
+  const store = useViberon.getState();
+  store.setAppMode("ide");
+  store.setBottomPanel("ledger");
+}
 
 /** Per-call usage for a run, if it ran in this session. */
 export function runUsageExtra(runId: string): RunUsageExtra | undefined {

@@ -9,6 +9,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ChevronRight, CircleAlert, Info, MessageSquarePlus, Play, TriangleAlert } from "lucide-react";
 
 import { attachProblems } from "@/lib/client/attach";
+import { installCommand, looksLikeMissingDeps, runShell } from "@/lib/client/run-shell";
 import { groupProblems, type Problem } from "@/lib/client/workspace-types";
 import { useProblems } from "@/store/problems";
 import { useViberon } from "@/store/viberon";
@@ -49,6 +50,11 @@ export function ProblemsPanel() {
   const groups = useMemo(() => groupProblems(filtered), [filtered]);
   const errors = all.filter((p) => p.severity === "error").length;
   const warnings = all.length - errors;
+
+  const fileList = useViberon((s) => s.fileList);
+  const missingDeps =
+    !running && lastRunAt !== null && looksLikeMissingDeps([error ?? undefined, ...checkers.map((c) => c.note), ...problems.slice(0, 50).map((p) => p.message)]);
+  const install = installCommand(fileList);
 
   const checkerNote = checkers
     .map((c) => `${c.checker}${c.ran === false ? " skipped" : ""}${c.durationMs ? ` ${(c.durationMs / 1000).toFixed(1)}s` : ""}`)
@@ -94,7 +100,25 @@ export function ProblemsPanel() {
           <Play className="size-3" />
           Run checks
         </button>
+        <button
+          type="button"
+          className="vb-btn vb-btn-ghost"
+          disabled={running || virtual || unavailable}
+          title="Run the test suite too; failing tests are listed with their file and line"
+          onClick={() => void useProblems.getState().runChecks(repoKey, { tests: true })}
+        >
+          Run tests
+        </button>
       </div>
+
+      {missingDeps && (
+        <div className="mx-2 mb-1 flex items-center gap-2 border-l-2 py-0.5 pl-2 text-[12px]" style={{ borderColor: "var(--vb-amber)", color: "var(--vb-text)" }}>
+          <span className="min-w-0 flex-1 truncate">Checks failed on missing dependencies. Install them first, then run checks again.</span>
+          <button type="button" className="vb-btn" onClick={() => void runShell(repoKey, install)} title={install}>
+            Install dependencies
+          </button>
+        </div>
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto pb-2">
         {unavailable ? (

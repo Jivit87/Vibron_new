@@ -102,12 +102,20 @@ export interface DeliverResult {
   /** The server wants an explicit second confirmation (e.g. workflow files changed). */
   needsConfirm?: boolean;
   files?: string[];
+  /** Success without a PR: the branch was pushed (`pushOnly`, a non-GitHub remote). */
+  pushedOnly?: boolean;
+  /** The remote is not on GitHub: no PR can be opened, but the branch can be pushed. */
+  notGithub?: boolean;
 }
 
 export function normalizeDeliver(body: unknown, status: number): DeliverResult {
   const r = rec(body) ?? {};
   const inner = rec(r.result) ?? r;
   const prUrl = str(inner.prUrl) ?? str(inner.url) ?? str(inner.html_url) ?? str(rec(inner.pr)?.url) ?? str(rec(inner.pr)?.html_url);
+  const pushedOnly = inner.pushedOnly === true || r.pushedOnly === true;
+  if (status >= 200 && status < 300 && !r.error && pushedOnly && !prUrl) {
+    return { ok: true, pushedOnly: true, branch: str(inner.branch) ?? "", commit: str(inner.commit) ?? str(inner.sha) };
+  }
   if (status >= 200 && status < 300 && prUrl && !r.error) {
     return {
       ok: true,
@@ -128,7 +136,7 @@ export function normalizeDeliver(body: unknown, status: number): DeliverResult {
     r.requiresConfirmation === true ||
     /workflow|confirm/i.test(code) ||
     (status === 409 && /workflow|\.github\//i.test(error));
-  return { ok: false, error, needsConfirm, files };
+  return { ok: false, error, needsConfirm, files, ...(code === "not_github" ? { notGithub: true } : {}) };
 }
 
 export interface DeliverInput {
@@ -141,6 +149,8 @@ export interface DeliverInput {
   issueUrl?: string;
   /** Second, explicit confirmation after the server refused (workflow files). */
   confirm?: boolean;
+  /** Push the branch without opening a pull request (non-GitHub remotes). */
+  pushOnly?: boolean;
 }
 
 export async function deliverPr(input: DeliverInput): Promise<DeliverResult> {
@@ -155,6 +165,7 @@ export async function deliverPr(input: DeliverInput): Promise<DeliverResult> {
     // unless the user confirmed them a second time.
     expectedFiles: input.files,
     ...(input.confirm ? { allowWorkflowChanges: true } : {}),
+    ...(input.pushOnly ? { pushOnly: true } : {}),
   };
   try {
     const response = await fetch("/api/deliver", {
@@ -365,6 +376,8 @@ export interface TaskRow {
   note?: string;
   /** Token use and cost: live while running, final after. */
   usage?: TaskUsageRow;
+  /** Files the task changed, when the server reports them. */
+  files?: string[];
 }
 
 export interface TaskUsageRow {
@@ -423,7 +436,18 @@ export function normalizeTask(raw: unknown): TaskRow | null {
     error: str(r.error) ?? (typeof rec(r.error)?.message === "string" ? String(rec(r.error)?.message) : undefined),
     note: str(r.note),
     usage: taskUsage(r),
+    ...taskFiles(r, result),
   };
+}
+
+/** Changed files from `files` / `changedFiles` / `result.files`, as paths or `{ path }`. */
+function taskFiles(r: Record<string, unknown>, result: Record<string, unknown> | null | undefined): { files?: string[] } {
+  const raw = [r.files, r.changedFiles, result?.files, result?.changedFiles, result?.filesChanged].find(Array.isArray) as unknown[] | undefined;
+  if (!raw) return {};
+  const files = raw
+    .map((f) => (typeof f === "string" ? f : str(rec(f)?.path)))
+    .filter((f): f is string => Boolean(f));
+  return files.length ? { files: [...new Set(files)] } : {};
 }
 
 const STATE_ORDER: Record<TaskState, number> = { running: 0, queued: 1, failed: 2, done: 3, cancelled: 4 };

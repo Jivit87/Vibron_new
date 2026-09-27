@@ -19,7 +19,9 @@ import {
   type MemoryGraph,
   type NoteOverlayNode,
 } from "@/lib/client/memory-graph";
+import { focusNodes } from "@/lib/client/graph-focus";
 import { Segmented } from "@/components/vibe/primitives";
+import { GraphNodePanel } from "@/components/ide/GraphNodePanel";
 import { SCOPE_OPTIONS, useUsage } from "@/components/vibe/usage-ui";
 import { computeHeat, heatAlpha, heatIntensity, type HeatMap } from "@/lib/client/usage-heat";
 import { formatTok, type UsageScope } from "@/lib/client/usage";
@@ -76,6 +78,7 @@ type Palette = {
   textFaint: string;
   accent: string;
   add: string;
+  amber: string;
 };
 
 const FALLBACK_PALETTE: Palette = {
@@ -88,6 +91,7 @@ const FALLBACK_PALETTE: Palette = {
   textFaint: "#5e5e62",
   accent: "#6b9eff",
   add: "#6cbf84",
+  amber: "#d4a54a",
 };
 
 function readPalette(): Palette {
@@ -105,6 +109,7 @@ function readPalette(): Palette {
     textFaint: get("--vb-text-faint", FALLBACK_PALETTE.textFaint),
     accent: get("--vb-accent", FALLBACK_PALETTE.accent),
     add: get("--vb-add", FALLBACK_PALETTE.add),
+    amber: get("--vb-amber", FALLBACK_PALETTE.amber),
   };
 }
 
@@ -187,6 +192,8 @@ export function BubbleGraph() {
   const setExpandedFolders = useViberon((s) => s.setExpandedFolders);
   const repoKey = useViberon((s) => s.repoKey);
   const rootPath = useViberon((s) => s.rootPath);
+  // A run, task or file drawn over the graph: what it read and changed.
+  const graphFocus = useViberon((s) => s.graphFocus);
   // Token heatmap: an independent layer, composable with the memory overlay.
   const heatOn = useUsageStore((s) => s.graphHeat);
   const { scope: heatScope, usage } = useUsage();
@@ -331,6 +338,67 @@ export function BubbleGraph() {
     }
     return out;
   }, [pulseIds, renderGraph]);
+
+  // Focus: raw symbol ids -> render ids (a collapsed folder lights for its files).
+  const focusSets = useMemo<{ read: Set<string>; changed: Set<string>; all: Set<string> } | null>(() => {
+    if (!graphFocus || !renderGraph || !graph) return null;
+    const raw = focusNodes(graphFocus, graph);
+    const map = (ids: Set<string>) => {
+      const out = new Set<string>();
+      for (const id of ids) {
+        const renderId = renderGraph.symbolToRenderId.get(id);
+        if (renderId) out.add(renderId);
+      }
+      return out;
+    };
+    const changed = map(raw.changed);
+    const read = map(raw.read);
+    for (const id of changed) read.delete(id);
+    return { read, changed, all: new Set([...read, ...changed]) };
+  }, [graphFocus, renderGraph, graph]);
+
+  const revealRef = useRef<string | null>(null);
+  // A symbol selected from elsewhere (palette, usage panel) may sit inside a
+  // collapsed folder: open folders until it is drawn. One level per pass.
+  useEffect(() => {
+    if (!selectedNodeId || !renderGraph) return;
+    const renderId = renderGraph.symbolToRenderId.get(selectedNodeId);
+    if (!renderId) return;
+    if (renderId === selectedNodeId) {
+      if (revealRef.current !== selectedNodeId) return;
+      // Just drawn after opening its folder: bring it into view once laid out.
+      revealRef.current = null;
+      const t = setTimeout(() => {
+        const node = (fgRef.current?.graphData?.().nodes as RFGNode[] | undefined)?.find((n) => n.id === selectedNodeId);
+        if (typeof node?.x !== "number" || typeof node.y !== "number") return;
+        try {
+          fgRef.current?.centerAt?.(node.x, node.y, 500);
+          fgRef.current?.zoom?.(2.2, 500);
+        } catch {
+          // ignore
+        }
+      }, 900);
+      return () => clearTimeout(t);
+    }
+    const folder = renderGraph.nodes.find((n) => n.id === renderId);
+    if (folder?.kind === "folder" && folder.folderPath && !expandedFolders.has(folder.folderPath)) {
+      revealRef.current = selectedNodeId;
+      toggleFolderExpansion(folder.folderPath);
+    }
+  }, [selectedNodeId, renderGraph, expandedFolders, toggleFolderExpansion]);
+
+  // Frame the focused nodes once they are laid out.
+  useEffect(() => {
+    if (!focusSets || focusSets.all.size === 0) return;
+    const t = setTimeout(() => {
+      try {
+        fgRef.current?.zoomToFit?.(500, 90, (n: RFGNode) => focusSets.all.has(n.id));
+      } catch {
+        // ignore
+      }
+    }, 450);
+    return () => clearTimeout(t);
+  }, [focusSets]);
 
   // Top folders for the legend (off the raw graph for stability across
   // expansion changes).
@@ -533,6 +601,10 @@ export function BubbleGraph() {
               return edgeDimmed;
             }
 
+            if (focusSets && !selectedNodeId) {
+              return focusSets.all.has(a) && focusSets.all.has(b) ? edgeHover : edgeDimmed;
+            }
+
             if (selectedNodeId) {
               if (a === selectedNodeId || b === selectedNodeId) {
                 return pal.accent;
@@ -608,13 +680,15 @@ export function BubbleGraph() {
             const isSelected = n.id === selectedNodeId;
             const isPulsed = pulseSet.has(n.id);
             const isHovered = hoveredId === n.id;
+            const isChanged = focusSets?.changed.has(n.id) ?? false;
+            const isRead = focusSets?.read.has(n.id) ?? false;
             const baseR = nodeRadius(n);
             // Heatmap: one hue (the accent) whose opacity carries the value; hot
             // symbols also grow a little, since expanded symbols are small.
             const nodeHeat = heat?.byRenderId.get(n.id);
             const intensity = heat ? heatIntensity(nodeHeat?.tokens ?? 0, heat.max) : 0;
             const heatScale = !isFolder && intensity > 0 ? 1 + 0.6 * intensity : 1;
-            const r = (isSelected ? baseR * 1.25 : isPulsed ? baseR * 1.1 : baseR) * heatScale;
+            const r = (isSelected ? baseR * 1.25 : isPulsed || isChanged ? baseR * 1.1 : baseR) * heatScale;
             const px = 1 / Math.max(scale, 1);
 
             const prevAlpha = ctx.globalAlpha;
@@ -628,6 +702,8 @@ export function BubbleGraph() {
               alpha = highlightedSet.has(n.id) ? 1.0 : 0.25;
             } else if (selectedNeighborsSet) {
               alpha = selectedNeighborsSet.has(n.id) ? 1.0 : 0.35;
+            } else if (focusSets) {
+              alpha = isChanged || isRead ? 1.0 : 0.22;
             } else {
               alpha = 1.0;
             }
@@ -653,9 +729,11 @@ export function BubbleGraph() {
             let outline = isFolder ? folderStroke : symbolStroke;
             if (heat && intensity > 0) outline = withAlpha(pal.accent, 0.5 + 0.5 * intensity);
             if (isHovered) outline = pal.textMid;
+            if (isRead) outline = pal.add;
+            if (isChanged) outline = pal.amber;
             if (isPulsed) outline = pal.add;
             if (isSelected) outline = pal.accent;
-            const emphasized = isSelected || isPulsed;
+            const emphasized = isSelected || isPulsed || isChanged || isRead;
 
             ctx.save();
             if (isFolder && !emphasized) ctx.setLineDash([3 * px, 2 * px]);
@@ -718,6 +796,7 @@ export function BubbleGraph() {
               isSelected ||
               isPulsed ||
               isHovered ||
+              isChanged ||
               (isFolder && scale > 0.3) ||
               (!isFolder && scale > 1.3 && r > 9);
             if (showLabel) {
@@ -776,9 +855,13 @@ export function BubbleGraph() {
               : "";
             const nameColor =
               node.id === selectedNodeId ? "var(--vb-accent)" : "var(--vb-text)";
-            const status = isRetrieved
-              ? `<span style="color: var(--vb-add); font-size: 11px;">In context</span>`
-              : "";
+            const status = focusSets?.changed.has(node.id)
+              ? `<span style="color: var(--vb-amber); font-size: 11px;">Changed</span>`
+              : focusSets?.read.has(node.id)
+                ? `<span style="color: var(--vb-add); font-size: 11px;">Read</span>`
+                : isRetrieved
+                  ? `<span style="color: var(--vb-add); font-size: 11px;">In context</span>`
+                  : "";
             if (node.kind === "folder") {
               return `
                 <div style="${TOOLTIP_BOX}">
@@ -807,6 +890,7 @@ export function BubbleGraph() {
               </div>
             `;
           }}
+          onBackgroundClick={() => useViberon.getState().selectNode(undefined)}
           onNodeHover={(raw) => {
             const id = (raw as RFGNode | null)?.id;
             setHoveredId(typeof id === "string" ? id : null);
@@ -958,6 +1042,46 @@ export function BubbleGraph() {
         </div>
       </div>
 
+      {graphFocus && focusSets && (
+        <div
+          className="pointer-events-auto absolute left-4 top-[52px] flex max-w-[calc(100%-2rem)] items-center gap-2 whitespace-nowrap rounded-[4px] px-2.5 py-1 text-[11px]"
+          style={panelStyle}
+          title={graphFocus.label}
+        >
+          <span style={{ color: "var(--vb-text-dim)" }}>{FOCUS_KIND[graphFocus.kind]}</span>
+          <span className="min-w-0 max-w-[360px] truncate" style={{ color: "var(--vb-text)" }}>
+            {graphFocus.label}
+          </span>
+          {graphFocus.changed.length > 0 && (
+            <span className="font-mono" style={{ color: "var(--vb-amber)" }}>
+              {graphFocus.changed.length} changed
+            </span>
+          )}
+          {graphFocus.read.length > 0 && (
+            <span className="font-mono" style={{ color: "var(--vb-add)" }}>
+              {graphFocus.read.length} read
+            </span>
+          )}
+          {focusSets.all.size === 0 ? (
+            <span style={{ color: "var(--vb-text-faint)" }}>not in the indexed graph</span>
+          ) : graphFocus.changed.length > 0 && focusSets.changed.size === 0 ? (
+            <span style={{ color: "var(--vb-text-faint)" }}>changed files not indexed yet</span>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => useViberon.getState().setGraphFocus(null)}
+            className="rounded-[3px] px-1 hover:bg-[var(--vb-hover)] hover:text-[var(--vb-text)]"
+            style={{ color: "var(--vb-text-dim)" }}
+            aria-label="Clear graph focus"
+            title="Clear"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {selectedNodeId && <GraphNodePanel nodeId={selectedNodeId} />}
+
       {openNote && (
         <NoteCard
           note={openNote}
@@ -1009,6 +1133,18 @@ export function BubbleGraph() {
               <span className="h-px w-6" style={{ background: "var(--vb-add)" }} />
               in chat context
             </div>
+            {focusSets && (
+              <>
+                <div className="flex items-center gap-2">
+                  <span className="size-2.5 rounded-full" style={{ border: "1.5px solid var(--vb-amber)" }} />
+                  changed by {graphFocus?.kind === "file" ? "selection" : graphFocus?.kind}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="size-2.5 rounded-full" style={{ border: "1.5px solid var(--vb-add)" }} />
+                  read by {graphFocus?.kind === "file" ? "selection" : graphFocus?.kind}
+                </div>
+              </>
+            )}
             {overlay && (
               <>
                 <div className="flex items-center gap-2">
@@ -1053,6 +1189,8 @@ export function BubbleGraph() {
     </div>
   );
 }
+
+const FOCUS_KIND: Record<"run" | "task" | "file", string> = { run: "Run", task: "Task", file: "File" };
 
 /** Heatmap key: the ramp, its range, and which scope it shows. */
 function HeatLegend({ heat, scope, accent }: { heat: HeatMap; scope: UsageScope; accent: string }) {

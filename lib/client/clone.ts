@@ -172,6 +172,27 @@ export function takePendingFix(repoKey: string): IssueRef | null {
   }
 }
 
+const PENDING_GRAPH_KEY = "viberon.pendingGraph.v1";
+
+/** A fresh clone opens on its code graph: remember that across the navigation. */
+export function stashPendingGraph(repoKey: string): void {
+  try {
+    window.sessionStorage.setItem(PENDING_GRAPH_KEY, repoKey);
+  } catch {
+    // Without storage the workspace opens on its default tabs.
+  }
+}
+
+export function takePendingGraph(repoKey: string): boolean {
+  try {
+    if (window.sessionStorage.getItem(PENDING_GRAPH_KEY) !== repoKey) return false;
+    window.sessionStorage.removeItem(PENDING_GRAPH_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /* ------------------------------ recent clones ----------------------------- */
 
 export interface RecentClone {

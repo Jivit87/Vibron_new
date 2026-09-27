@@ -54,7 +54,10 @@ interface ProblemsState {
   setAutoRun: (on: boolean) => void;
   /** Read the server's last cached result without running checkers. */
   load: (repoKey: string) => Promise<void>;
-  runChecks: (repoKey: string) => Promise<void>;
+  /** `tests`: also run the workspace's test suite; failing tests list like other problems. */
+  runChecks: (repoKey: string, options?: { tests?: boolean }) => Promise<void>;
+  /** The last run included tests. */
+  testsRan: boolean;
   /** Debounced run, used by the save hook. */
   scheduleRun: (repoKey: string, delayMs?: number) => void;
 }
@@ -66,6 +69,7 @@ export const useProblems = create<ProblemsState>((set, get) => ({
   problems: [],
   checkers: [],
   running: false,
+  testsRan: false,
   rerunQueued: false,
   virtual: false,
   lastRunAt: null,
@@ -127,7 +131,7 @@ export const useProblems = create<ProblemsState>((set, get) => ({
     }
   },
 
-  runChecks: async (repoKey) => {
+  runChecks: async (repoKey, options = {}) => {
     if (!repoKey) return;
     if (isMockMode()) {
       set({ running: true });
@@ -149,7 +153,7 @@ export const useProblems = create<ProblemsState>((set, get) => ({
       const response = await fetch("/api/problems", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoKey }),
+        body: JSON.stringify({ repoKey, ...(options.tests ? { tests: true } : {}) }),
       });
       const body = (await response.json().catch(() => ({}))) as {
         virtual?: boolean;
@@ -170,6 +174,7 @@ export const useProblems = create<ProblemsState>((set, get) => ({
         problems: body.problems ?? [],
         checkers: body.checkers ?? [],
         lastRunAt: Date.now(),
+        testsRan: Boolean(options.tests),
       });
     } catch {
       set({ error: "Network error" });

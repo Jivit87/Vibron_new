@@ -296,7 +296,7 @@ export async function fixIssues(
     ...(options.model && options.model !== "auto" ? { model: options.model } : {}),
     ...(options.prompt?.trim() ? { prompt: options.prompt.trim() } : {}),
   };
-  if (isMockMode()) return normalizeFix(mockFixIssues(numbers === "all" ? [] : numbers), 200);
+  if (isMockMode()) return normalizeFix(mockFixIssues(numbers === "all" ? [] : numbers, Boolean(options.combined)), 200);
   try {
     const response = await fetch("/api/issues/fix", {
       method: "POST",

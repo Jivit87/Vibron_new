@@ -11,7 +11,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ExternalLink, Loader2, RefreshCw, Square } from "lucide-react";
 import { toast } from "sonner";
 
-import { attachedTask, attachTaskRun } from "@/lib/client/agent-stream";
+import { attachedTask, attachTaskRun, cancelRun } from "@/lib/client/agent-stream";
+import { prForIssue, taskForIssue, useLinks } from "@/store/links";
 import { cancelTask, shortRef, taskUsageLine } from "@/lib/client/deliver";
 import { sameJson, usePolling } from "@/lib/client/use-polling";
 import {
@@ -57,6 +58,10 @@ function openIntegrations() {
 export function IssuesPanel() {
   const repoKey = useViberon((s) => s.repoKey);
   const streaming = useViberon((s) => s.streaming);
+  const tasks = useLinks((s) => s.tasks);
+  const reveal = useLinks((s) => s.reveal);
+  const revealedUrl = reveal?.kind === "issue" ? reveal.url.replace(/\/$/, "").toLowerCase() : null;
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   const [rows, setRows] = useState<IssueRow[] | null>(null);
   const [repo, setRepo] = useState<string | null>(null);
@@ -105,6 +110,7 @@ export function IssuesPanel() {
     const { data } = result;
     setError(null);
     setRows((prev) => (prev && sameJson(prev, data.issues) ? prev : data.issues));
+    useLinks.getState().setIssues(data.issues);
     setStopping((prev) => {
       if (!prev.size) return prev;
       const active = new Set(
@@ -129,6 +135,12 @@ export function IssuesPanel() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // A task row's issue link: bring the issue into view.
+  useEffect(() => {
+    if (!revealedUrl || !rows) return;
+    bodyRef.current?.querySelector<HTMLElement>(`[data-issue-url="${CSS.escape(revealedUrl)}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [revealedUrl, rows]);
   // Paused while the window is hidden; the server answers from GitHub's
   // ETag cache, so an unchanged issue list costs no rate limit.
   usePolling(refresh, interval, !stop);
@@ -137,6 +149,12 @@ export function IssuesPanel() {
     if (!row.task) return;
     const id = row.task.id;
     setStopping((prev) => new Set(prev).add(id));
+    // Streaming in the run view: stop there so the view settles with it.
+    if (attachedTask() === id) {
+      await cancelRun();
+      void refresh();
+      return;
+    }
     const result = await cancelTask(id);
     if (!result.ok) {
       toast.error(result.error ?? "Could not stop the fix.");
@@ -349,7 +367,7 @@ export function IssuesPanel() {
         </div>
       )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={bodyRef} className="min-h-0 flex-1 overflow-y-auto">
         {error && !rows ? (
           <EmptyState
             title={error.kind === "other" ? "Could not load issues" : error.message}
@@ -392,6 +410,7 @@ export function IssuesPanel() {
                   </th>
                   <th className="w-[70px] py-0.5 pl-3 font-normal">updated</th>
                   <th className="w-[132px] py-0.5 font-normal">status</th>
+                  <th className="w-[64px] py-0.5 font-normal">task</th>
                   <th className="w-[112px] py-0.5 font-normal">tokens</th>
                   <th className="w-[66px] py-0.5" />
                 </tr>
@@ -407,11 +426,17 @@ export function IssuesPanel() {
                   const isAttached = Boolean(row.task && attached === row.task.id);
                   const isActiveTask = row.task?.state === "running" || row.task?.state === "queued";
                   const isStopping = Boolean(row.task && isActiveTask && stopping.has(row.task.id));
+                  const task = taskForIssue(row, tasks);
+                  const taskId = row.task?.id ?? task?.id;
+                  const prUrl = prForIssue(row, tasks);
+                  const urlKey = row.url ? row.url.replace(/\/$/, "").toLowerCase() : "";
+                  const revealed = Boolean(urlKey && urlKey === revealedUrl);
                   return (
                     <tr
                       key={row.number}
+                      data-issue-url={urlKey}
                       className="group h-[24px] border-t align-middle hover:bg-[var(--vb-hover)]"
-                      style={{ borderColor: "var(--vb-line-faint)", background: isSelected ? "var(--vb-accent-soft)" : undefined }}
+                      style={{ borderColor: "var(--vb-line-faint)", background: isSelected || revealed ? "var(--vb-accent-soft)" : undefined }}
                     >
                       <td className="pl-2">
                         <Checkbox
@@ -448,14 +473,30 @@ export function IssuesPanel() {
                       </td>
                       <td className="truncate pr-2">
                         <StatusCell
-                          row={row}
                           kind={status.kind}
                           label={isAttached ? "watching" : status.label}
                           detail={status.detail}
                           color={color}
                           skipReason={skipReason}
                           onAttach={() => !isAttached && attach(row)}
+                          prUrl={prUrl}
                         />
+                      </td>
+                      <td className="truncate pr-2 font-mono text-[11px]">
+                        {taskId && (
+                          <button
+                            type="button"
+                            className="hover:underline"
+                            style={{ color: "var(--vb-text-mid)" }}
+                            title={`${task?.task.split("\n")[0] ?? `Task ${taskId}`}\nShow in Tasks`}
+                            onClick={() => {
+                              useLinks.getState().setReveal({ kind: "task", id: taskId });
+                              useViberon.getState().setBottomPanel("tasks");
+                            }}
+                          >
+                            {taskId}
+                          </button>
+                        )}
                       </td>
                       <td className="truncate pr-2 font-mono text-[11px]" style={{ color: "var(--vb-text-dim)" }}>
                         {taskUsageLine(row.task?.usage)}
@@ -500,15 +541,15 @@ export function IssuesPanel() {
 }
 
 function StatusCell({
-  row,
   kind,
   label,
   detail,
   color,
   skipReason,
   onAttach,
+  prUrl,
 }: {
-  row: IssueRow;
+  prUrl?: string;
   kind: IssueStatusKind;
   label: string;
   detail?: string;
@@ -538,19 +579,19 @@ function StatusCell({
       </button>
     );
   }
-  if (kind === "done" && row.task?.prUrl) {
-    const ref = shortRef(row.task.prUrl);
+  if (kind === "done" && prUrl) {
+    const ref = shortRef(prUrl);
     const short = ref.includes("#") ? `PR #${ref.split("#")[1]}` : ref;
     return (
       <span className="flex items-center gap-1.5 font-mono text-[11px]" style={{ color }}>
         {dot}
         <a
-          href={row.task.prUrl}
+          href={prUrl}
           target="_blank"
           rel="noreferrer"
           className="inline-flex items-center gap-1 hover:underline"
           style={{ color: "var(--vb-text-mid)" }}
-          title={row.task.prUrl}
+          title={prUrl}
         >
           {short}
           <ExternalLink className="size-3 shrink-0" />

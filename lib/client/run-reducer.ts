@@ -20,7 +20,11 @@ import type {
 import type { LedgerSnapshot } from "@/lib/context/ledger";
 import type { Interaction } from "@/lib/harness/contracts";
 
-export type AgentStatus = "queued" | "running" | "done" | "failed";
+/** `cancelled`: the run was stopped while this lane was queued or running. */
+export type AgentStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+
+/** A todo as the run view keeps it: `cancelled` once the run was stopped mid-item. */
+export type RunTodo = Omit<TodoItem, "status"> & { status: TodoItem["status"] | "cancelled" };
 
 export interface ToolCallRecord {
   callId?: string;
@@ -260,7 +264,7 @@ export interface RunState {
   changes: FileChangeRecord[];
   approvals: ApprovalRequest[];
   /** Latest todo list per agent id (full replace on every `todos` event). */
-  todos: Record<string, TodoItem[]>;
+  todos: Record<string, RunTodo[]>;
   retries: RetryRecord[];
   compactions: CompactionRecord[];
   rules: LoadedRule[];
@@ -291,6 +295,8 @@ export interface RunState {
   phaseTimings: PhaseTiming[];
   /** Server-reported wall time from `run_done.durationMs`. */
   wallMs?: number;
+  /** The queued task this run view streams, when it is one. */
+  taskId?: string;
 }
 
 export function createRun(input: {
@@ -300,10 +306,12 @@ export function createRun(input: {
   mode: RunState["mode"];
   now: number;
   interaction?: Interaction;
+  taskId?: string;
 }): RunState {
   return {
     id: input.id,
     interaction: input.interaction,
+    ...(input.taskId ? { taskId: input.taskId } : {}),
     checkpoints: [],
     verifications: [],
     gates: [],
@@ -886,7 +894,7 @@ export function reduceRun(
     case "run_done": {
       const status: RunStatus = event.status ?? (run.status === "failed" ? "failed" : "done");
       const done = event as typeof event & { metrics?: { phaseMs?: unknown }; phaseMs?: unknown };
-      return {
+      const next: RunState = {
         ...run,
         phaseTimings: mergePhaseMs(run.phaseTimings ?? [], done.metrics?.phaseMs ?? done.phaseMs),
         wallMs: typeof event.durationMs === "number" && event.durationMs > 0 ? event.durationMs : run.wallMs,
@@ -894,16 +902,8 @@ export function reduceRun(
         summary: event.summary,
         costUsd: event.costUsd || run.costUsd,
         endedAt: now,
-        // Nothing can still be pending once the run is over.
-        approvals: run.approvals.map((a) =>
-          a.resolution ? a : { ...a, resolution: status === "cancelled" ? "cancelled" : "timeout" },
-        ),
-        agents: run.agents.map((lane) =>
-          lane.status === "running"
-            ? { ...lane, status: status === "done" ? "done" : "failed" }
-            : lane,
-        ),
       };
+      return settleRun(next, status);
     }
 
     case "error":
@@ -916,6 +916,77 @@ export function reduceRun(
     default:
       return run;
   }
+}
+
+/**
+ * Close everything still in flight once a run is over, so no spinner
+ * outlives it: pending approvals resolve, running or queued lanes end
+ * (`cancelled` when the run was stopped), open tool calls stop, and an
+ * in-progress todo becomes `cancelled` (stopped) or stays as the agent
+ * left it. Idempotent; returns the same object when nothing changes.
+ */
+export function settleRun(run: RunState, status: RunState["status"]): RunState {
+  const stopped = status === "cancelled";
+  let changed = false;
+  const approvals = run.approvals.map((a) => {
+    if (a.resolution) return a;
+    changed = true;
+    return { ...a, resolution: (stopped ? "cancelled" : "timeout") as ApprovalResolution };
+  });
+  const agents = run.agents.map((lane) => {
+    const live = lane.status === "running" || lane.status === "queued";
+    const openTools = lane.tools.some((t) => t.running);
+    const openCommands = lane.feed.some((f) => f.kind === "command" && f.status === "running");
+    if (!live && !openTools && !openCommands) return lane;
+    changed = true;
+    const laneStatus: AgentStatus = !live
+      ? lane.status
+      : stopped
+        ? "cancelled"
+        : lane.status === "queued"
+          ? "cancelled"
+          : status === "done"
+            ? "done"
+            : "failed";
+    return {
+      ...lane,
+      status: laneStatus,
+      tools: openTools ? lane.tools.map((t) => (t.running ? { ...t, running: false } : t)) : lane.tools,
+      feed: openCommands
+        ? lane.feed.map((f) => (f.kind === "command" && f.status === "running" ? { ...f, status: stopped ? "cancelled" : "exited" } : f))
+        : lane.feed,
+    };
+  });
+  let todos = run.todos;
+  if (stopped) {
+    const next: Record<string, RunTodo[]> = {};
+    for (const [agentId, items] of Object.entries(run.todos)) {
+      next[agentId] = items.some((t) => t.status === "in_progress")
+        ? items.map((t) => (t.status === "in_progress" ? { ...t, status: "cancelled" as const } : t))
+        : items;
+      if (next[agentId] !== items) changed = true;
+    }
+    if (changed) todos = next;
+  }
+  if (!changed && run.status === status) return run;
+  return { ...run, status, approvals, agents, todos };
+}
+
+/**
+ * How a todo reads in the run view. Once the run ended cancelled or failed,
+ * nothing on the list may spin: an item still `in_progress` reads as
+ * cancelled (the server's own `cancelled` status passes through).
+ */
+export function todoView(item: RunTodo, runStatus: RunState["status"]): { status: RunTodo["status"]; content: string } {
+  if (item.status === "in_progress" && (runStatus === "cancelled" || runStatus === "failed")) {
+    return { status: "cancelled", content: item.content };
+  }
+  return { status: item.status, content: item.content };
+}
+
+/** Whether the run is still going (planning or running). */
+export function isRunActive(run: Pick<RunState, "status"> | null | undefined): boolean {
+  return run?.status === "planning" || run?.status === "running";
 }
 
 /** Index of the in-flight call an `end` closes: by callId, else newest same-name. */
@@ -941,7 +1012,7 @@ export function pendingApprovals(run: RunState): ApprovalRequest[] {
 }
 
 /** The todo list to show for a run: the most recently updated agent's. */
-export function activeTodos(run: RunState): TodoItem[] {
+export function activeTodos(run: RunState): RunTodo[] {
   const entries = Object.entries(run.todos);
   if (entries.length === 0) return [];
   if (entries.length === 1) return entries[0][1];
@@ -1042,7 +1113,7 @@ export function fixPhases(run: RunState): FixPhase[] {
   ];
 }
 
-export type EvidenceOutcome = "verified" | "unverified" | "no_patch" | "incomplete" | "failed";
+export type EvidenceOutcome = "verified" | "unverified" | "no_patch" | "incomplete" | "failed" | "stopped";
 
 export interface Evidence {
   outcome: EvidenceOutcome;
@@ -1066,8 +1137,10 @@ export function evidenceOf(run: RunState): Evidence {
   const final = [...run.verifications].reverse().find((v) => v.phase !== "baseline");
   const files = netChanged(run);
   let outcome: EvidenceOutcome;
-  if (files === 0) outcome = "no_patch";
-  else if (run.status === "failed" || run.status === "cancelled") outcome = "failed";
+  // A stopped run is neither a failure nor a missing patch: the user ended it.
+  if (run.status === "cancelled") outcome = "stopped";
+  else if (files === 0) outcome = "no_patch";
+  else if (run.status === "failed") outcome = "failed";
   else if (run.status === "incomplete" || lastGate?.decision === "give_up") outcome = "incomplete";
   else if (lastGate?.decision === "accept") outcome = "verified";
   else outcome = "unverified";

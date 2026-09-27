@@ -138,7 +138,7 @@ describe("reduceRun", () => {
     );
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.approvals[0].resolution).toBe("cancelled");
-    expect(cancelled.agents[0].status).toBe("failed");
+    expect(cancelled.agents[0].status).toBe("cancelled");
 
     const legacy = reduceRun(
       fresh(),

@@ -17,6 +17,7 @@ import {
   parseCloneInput,
   recordClone,
   stashPendingFix,
+  stashPendingGraph,
   type CloneEvent,
 } from "@/lib/client/clone";
 import { isMockMode } from "@/lib/client/mock-run";
@@ -87,14 +88,18 @@ export function CloneDialog() {
     const store = useViberon.getState();
     if (result.repoKey === store.repoKey) {
       // Same workspace (mock mode, or a re-clone): no navigation needed.
+      // Show its graph right away, as a fresh workspace would.
+      store.setAppMode("ide");
+      store.openGraphTab();
       if (result.issue) {
-        if (store.appMode === "ide") store.setAgentDockOpen(true);
+        store.setAgentDockOpen(true);
         store.setComposerDraft({ text: "", interaction: "fix", issue: result.issue });
       }
       setOpen(false);
       return;
     }
     if (result.issue) stashPendingFix(result.repoKey, result.issue);
+    stashPendingGraph(result.repoKey);
     // Client-side navigation: no full reload, and the shell (chat or IDE) stays as it is.
     router.push(`/workspace/${encodeURIComponent(result.repoKey)}${isMockMode() ? "?mock=1" : ""}`);
     setOpen(false);

@@ -13,6 +13,7 @@ import type { ReviewDecision } from "@/lib/editor/review";
 import {
   createRun,
   reduceRun,
+  settleRun,
   type ApprovalResolution,
   type RunState,
 } from "@/lib/client/run-reducer";
@@ -21,6 +22,7 @@ import { compactSummary, summarizeRun } from "@/lib/client/usage";
 import { runUsageExtra } from "@/store/usage";
 import type { LedgerSnapshot } from "@/lib/context/ledger";
 import type { ProjectMemory } from "@/lib/memory/types";
+import type { GraphFocus } from "@/lib/client/graph-focus";
 import {
   createConversationMeta,
   deleteConversation as deleteStoredConversation,
@@ -165,7 +167,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   editorFontSize: 13,
   editorWordWrap: false,
   editorMinimap: true,
-  interaction: "agent",
+  // New users (and a settings reset) start in Fix: reproduce, patch, prove.
+  interaction: "fix",
   editPolicy: "auto",
   theme: "dark",
 };
@@ -193,7 +196,7 @@ function clampSettings(settings: AppSettings): AppSettings {
     editorFontSize: Math.max(10, Math.min(22, Math.round(settings.editorFontSize))),
     interaction: ["agent", "plan", "ask", "fix"].includes(settings.interaction)
       ? settings.interaction
-      : "agent",
+      : DEFAULT_SETTINGS.interaction,
     editPolicy: settings.editPolicy === "ask" ? "ask" : "auto",
     theme: ["dark", "light", "system"].includes(settings.theme) ? settings.theme : "dark",
   };
@@ -230,6 +233,15 @@ function persistAppMode(appMode: AppMode): void {
 }
 
 /* ------------------------------- store ----------------------------------- */
+
+/**
+ * How a run ends: the server's `run_done.status` (already on the run) wins
+ * over the transport's guess; a run still marked active takes the guess.
+ */
+export function finalRunStatus(current: RunState["status"], transport: RunState["status"]): RunState["status"] {
+  if (current === "failed" || current === "cancelled" || current === "done" || current === "incomplete") return current;
+  return transport;
+}
 
 let idCounter = 0;
 function nextId(prefix: string): string {
@@ -317,6 +329,8 @@ export interface ViberonState {
 
   /* graph + files */
   graph?: Graph;
+  /** A run, task or file drawn over the graph (what it read and changed). */
+  graphFocus: GraphFocus | null;
   fileList: string[];
   selectedNodeId?: string;
   pulseIds: string[];
@@ -360,6 +374,9 @@ export interface ViberonState {
   setGraph: (graph: Graph) => void;
   setFileList: (paths: string[]) => void;
   selectNode: (id: string | undefined) => void;
+  setGraphFocus: (focus: GraphFocus | null) => void;
+  /** Draw a focus on the graph and bring the graph tab to the front (IDE mode). */
+  showOnGraph: (focus: GraphFocus) => void;
   pulse: (ids: string[]) => void;
   toggleFolder: (path: string) => void;
   setExpandedFolders: (folders: Set<string>) => void;
@@ -415,6 +432,8 @@ export interface ViberonState {
     model: string;
     mode: AgentMode;
     interaction?: Interaction;
+    /** Set when the run view streams a queued task. */
+    taskId?: string;
   }) => void;
   applyEvent: (event: OrchestrationEvent) => void;
   /** Fold a frame's worth of events in one store write (one render). */
@@ -452,6 +471,11 @@ const REVIEW_TAB: EditorTab = { path: REVIEW_TAB_PATH, label: "Review changes" }
 
 const MAX_RUN_HISTORY = 10;
 
+/** The tabs a freshly opened workspace shows: Welcome, with the graph beside it and in front. */
+export function initialTabs(): { tabs: EditorTab[]; activeTabPath: string } {
+  return { tabs: [WELCOME_TAB, GRAPH_TAB], activeTabPath: GRAPH_TAB_PATH };
+}
+
 export const useViberon = create<ViberonState>((set) => ({
   repoKey: "",
   repoLabel: "Workspace",
@@ -469,13 +493,13 @@ export const useViberon = create<ViberonState>((set) => ({
   agentDockOpen: true,
 
   graph: undefined,
+  graphFocus: null,
   fileList: [],
   selectedNodeId: undefined,
   pulseIds: [],
   expandedFolders: new Set<string>(),
 
-  tabs: [WELCOME_TAB],
-  activeTabPath: WELCOME_TAB_PATH,
+  ...initialTabs(),
 
   messages: [],
   run: null,
@@ -504,8 +528,10 @@ export const useViberon = create<ViberonState>((set) => ({
       repoKey,
       repoLabel,
       rootPath,
-      tabs: [WELCOME_TAB],
-      activeTabPath: WELCOME_TAB_PATH,
+      ...initialTabs(),
+      // A new workspace never shows the previous one's graph.
+      graph: undefined,
+      graphFocus: null,
       selectedNodeId: undefined,
       pulseIds: [],
       expandedFolders: new Set<string>(),
@@ -514,6 +540,12 @@ export const useViberon = create<ViberonState>((set) => ({
   setGraph: (graph) => set({ graph }),
   setFileList: (fileList) => set({ fileList }),
   selectNode: (selectedNodeId) => set({ selectedNodeId }),
+  setGraphFocus: (graphFocus) => set({ graphFocus }),
+  showOnGraph: (graphFocus) =>
+    set((state) => {
+      persistAppMode("ide");
+      return { ...openTabState(state, GRAPH_TAB), graphFocus, appMode: "ide" as AppMode };
+    }),
   pulse: (pulseIds) => set({ pulseIds }),
 
   toggleFolder: (path) =>
@@ -785,9 +817,11 @@ export const useViberon = create<ViberonState>((set) => ({
 
   /* ----------------------------- agents ----------------------------- */
 
-  startRun: ({ prompt, model, mode, interaction = "agent" }) =>
+  startRun: ({ prompt, model, mode, interaction = "agent", taskId }) =>
     set({
       streaming: true,
+      // A new run replaces whatever the graph was showing.
+      graphFocus: null,
       run: createRun({
         id: nextId("run"),
         prompt,
@@ -800,6 +834,7 @@ export const useViberon = create<ViberonState>((set) => ({
               : "orchestrated",
         now: Date.now(),
         interaction,
+        taskId,
       }),
     }),
 
@@ -835,17 +870,12 @@ export const useViberon = create<ViberonState>((set) => ({
   endRun: (status) =>
     set((state) => {
       if (!state.run) return { streaming: false };
-      const finished: RunState = {
-        ...state.run,
-        // The server's `run_done.status` wins over the transport's guess.
-        status:
-          state.run.status === "failed" || state.run.status === "cancelled"
-            ? state.run.status
-            : state.run.status === "done"
-              ? "done"
-              : status,
-        endedAt: state.run.endedAt ?? Date.now(),
-      };
+      // The server's `run_done.status` wins over the transport's guess, and
+      // whatever was still in flight (lanes, tool rows, todos) is closed.
+      const finished: RunState = settleRun(
+        { ...state.run, endedAt: state.run.endedAt ?? Date.now() },
+        finalRunStatus(state.run.status, status),
+      );
 
       // Tie the run to the assistant message it produced so the history and
       // changes panels can scroll straight to the reply it belongs to.
@@ -994,5 +1024,6 @@ export function resolveTheme(theme: ThemeSetting): "dark" | "light" {
 }
 
 export { nextId };
+export type { GraphFocus };
 export type { RunPlan, PlanStep, LedgerSnapshot, ProjectMemory, ReviewDecision };
 export type { ConversationMeta, StoredRun };

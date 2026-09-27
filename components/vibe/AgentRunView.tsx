@@ -20,6 +20,7 @@ import {
   Circle,
   Loader2,
   Minus,
+  Network,
   Plus,
   RotateCcw,
   Square,
@@ -29,11 +30,12 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import type { PlanStep, RunPlan, TodoItem } from "@/lib/agents/events";
+import type { PlanStep, RunPlan } from "@/lib/agents/events";
 import { answerApproval, refreshWorkspace, runPlan } from "@/lib/client/agent-stream";
 import { diffLines, withContext } from "@/lib/client/line-diff";
 import { addStep, moveStep, removeStep, updateStep } from "@/lib/client/plan-edit";
-import { activeTodos, tailWindow, type FeedItem } from "@/lib/client/run-reducer";
+import { activeTodos, tailWindow, todoView, type FeedItem, type RunTodo } from "@/lib/client/run-reducer";
+import { focusFromFile, focusFromRun } from "@/lib/client/graph-focus";
 import { contextFill, formatTok, formatUsd, runTotals, totalTokens } from "@/lib/client/usage";
 import { ContextMeter, fillTitle } from "@/components/vibe/usage-ui";
 import { LiveUsagePanel } from "@/components/vibe/LiveUsage";
@@ -51,7 +53,7 @@ import {
 } from "@/components/vibe/FixRun";
 import { canDeliver, DeliverBar } from "@/components/vibe/DeliverBar";
 import { pendingReviews } from "@/lib/editor/review";
-import { useUsageStore } from "@/store/usage";
+import { openUsagePanel, useUsageStore } from "@/store/usage";
 import {
   useViberon,
   type AgentLane,
@@ -95,7 +97,7 @@ export function AgentRunView({ run }: { run: RunState }) {
 
       {fix && <CriteriaBlock run={run} />}
 
-      {todos.length > 0 && <TodoList items={todos} />}
+      {todos.length > 0 && <TodoList items={todos} runStatus={run.status} />}
 
       {run.status === "planning" && !run.plan && (run.orchestratorText || run.orchestratorThinking) && (
         <p className="text-[12px] leading-relaxed" style={{ color: "var(--vb-text-dim)" }}>
@@ -186,7 +188,29 @@ function RunHeader({ run }: { run: RunState }) {
         </span>
       )}
       <RunUsage run={run} />
+      <ShowOnGraphButton run={run} />
     </div>
+  );
+}
+
+/** Draw what this run read and changed on the code graph. */
+function ShowOnGraphButton({ run }: { run: RunState }) {
+  const hasGraph = useViberon((s) => Boolean(s.graph));
+  const focused = useViberon((s) => s.graphFocus?.kind === "run" && s.graphFocus.id === run.id);
+  const touched = Boolean(run.ledger?.files?.length || run.ledger?.nodes?.length || run.changes.length);
+  if (!hasGraph || !touched) return null;
+  return (
+    <button
+      type="button"
+      title="Show what this run read and changed on the code graph"
+      aria-pressed={focused}
+      onClick={() => useViberon.getState().showOnGraph(focusFromRun(run))}
+      className={cx("flex h-5 items-center gap-1 rounded-[3px] px-1 hover:bg-[var(--vb-hover)]", focused && "bg-[var(--vb-active)]")}
+      style={{ color: focused ? "var(--vb-text-hi)" : "var(--vb-text-dim)" }}
+    >
+      <Network className="size-3" />
+      graph
+    </button>
   );
 }
 
@@ -211,12 +235,7 @@ function RunUsage({ run }: { run: RunState }) {
     <button
       type="button"
       title={`${detail}\nOpen the usage panel`}
-      onClick={() => {
-        const store = useViberon.getState();
-        useUsageStore.getState().setScope("run");
-        store.setAppMode("ide");
-        store.setBottomPanel("ledger");
-      }}
+      onClick={() => openUsagePanel({ scope: "run" })}
       className="flex h-5 items-center gap-2 rounded-[3px] px-1 tabular-nums hover:bg-[var(--vb-hover)]"
       style={{ color: "var(--vb-text-dim)" }}
     >
@@ -246,8 +265,10 @@ function RunStatusIcon({ status }: { status: RunState["status"] }) {
 
 /* ------------------------------- todos ----------------------------------- */
 
-function TodoList({ items }: { items: TodoItem[] }) {
+function TodoList({ items: raw, runStatus }: { items: RunTodo[]; runStatus: RunState["status"] }) {
+  const items = raw.map((item) => ({ ...item, ...todoView(item, runStatus) }));
   const done = items.filter((t) => t.status === "completed").length;
+  const stopped = items.some((t) => t.status === "cancelled");
   return (
     <div className="flex flex-col border-y py-1" style={{ borderColor: "var(--vb-line)" }}>
       <div className="flex h-5 items-center gap-2 text-[11px]" style={{ color: "var(--vb-text-dim)" }}>
@@ -255,6 +276,7 @@ function TodoList({ items }: { items: TodoItem[] }) {
         <span className="font-mono">
           {done}/{items.length}
         </span>
+        {stopped && <span>stopped</span>}
       </div>
       {items.slice(0, LIST_CAP).map((item) => (
         <div key={item.id} className="flex min-h-[22px] items-center gap-2 text-[12.5px]">
@@ -301,6 +323,8 @@ function StepStatus({ status }: { status: AgentLane["status"] }) {
       return <Check className="size-3.5 shrink-0" style={{ color: "var(--vb-mint)" }} />;
     case "failed":
       return <X className="size-3.5 shrink-0" style={{ color: "var(--vb-rose)" }} />;
+    case "cancelled":
+      return <Square className="size-3 shrink-0" style={{ color: "var(--vb-text-dim)" }} aria-label="stopped" />;
     default:
       return <Circle className="size-3 shrink-0" style={{ color: "var(--vb-text-faint)" }} />;
   }
@@ -761,14 +785,14 @@ function FeedRow({
           <span
             style={{
               color:
-                item.status === "running"
+                item.status === "running" || item.status === "cancelled"
                   ? "var(--vb-text-dim)"
                   : item.exitCode === 0
                     ? "var(--vb-text-dim)"
                     : "var(--vb-rose)",
             }}
           >
-            {item.status === "running" ? "running" : `exit ${item.exitCode ?? "?"}`}
+            {item.status === "running" ? "running" : item.status === "cancelled" ? "stopped" : `exit ${item.exitCode ?? "?"}`}
           </span>
         </button>
       );
@@ -1071,29 +1095,40 @@ function ChangeList({ run }: { run: RunState }) {
       {(showAll ? rows : rows.slice(0, LIST_CAP)).map((row) => {
         const { name, dir } = splitPath(row.path);
         return (
-          <button
-            key={row.path}
-            type="button"
-            onClick={() => {
-              const store = useViberon.getState();
-              store.setAppMode("ide");
-              store.openTab(row.path, undefined, { preview: true });
-            }}
-            className={cx(
-              "flex h-[22px] items-center gap-2 rounded-[3px] px-1 text-left hover:bg-[var(--vb-hover)]",
-              row.reverted && "opacity-50",
-            )}
-            title={row.summary || row.path}
-          >
-            <KindLetter kind={row.kind} />
-            <span className="truncate text-[12.5px]" style={{ color: "var(--vb-text)" }}>
-              {name}
-            </span>
-            <span className="min-w-0 flex-1 truncate text-[11.5px]" style={{ color: "var(--vb-text-faint)" }}>
-              {dir}
-            </span>
-            <DiffCounts adds={row.adds} removes={row.removes} />
-          </button>
+          <div key={row.path} className="group flex h-[22px] items-center rounded-[3px] hover:bg-[var(--vb-hover)]">
+            <button
+              type="button"
+              onClick={() => {
+                const store = useViberon.getState();
+                store.setAppMode("ide");
+                store.openTab(row.path, undefined, { preview: true });
+              }}
+              className={cx(
+                "flex h-full min-w-0 flex-1 items-center gap-2 px-1 text-left",
+                row.reverted && "opacity-50",
+              )}
+              title={row.summary || row.path}
+            >
+              <KindLetter kind={row.kind} />
+              <span className="truncate text-[12.5px]" style={{ color: "var(--vb-text)" }}>
+                {name}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-[11.5px]" style={{ color: "var(--vb-text-faint)" }}>
+                {dir}
+              </span>
+              <DiffCounts adds={row.adds} removes={row.removes} />
+            </button>
+            <button
+              type="button"
+              title={`Show ${name} on the code graph`}
+              aria-label={`Show ${name} on the code graph`}
+              onClick={() => useViberon.getState().showOnGraph(focusFromFile(row.path))}
+              className="mr-0.5 hidden size-5 shrink-0 items-center justify-center rounded-[3px] hover:bg-[var(--vb-active)] group-hover:inline-flex"
+              style={{ color: "var(--vb-text-dim)" }}
+            >
+              <Network className="size-3" />
+            </button>
+          </div>
         );
       })}
       {rows.length > LIST_CAP && (

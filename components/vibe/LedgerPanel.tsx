@@ -383,10 +383,15 @@ function Saving({ title, value, ratio, note }: { title: string; value: string; r
 function TopContext({ usage }: { usage: UsageSummary }) {
   const [kind, setKind] = useState<"files" | "symbols">("files");
   const graph = useViberon((s) => s.graph);
+  const fileFilter = useUsageStore((s) => s.fileFilter);
   const nodeById = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n] as const)), [graph]);
 
   const rows = kind === "files" ? usage.files : usage.nodes;
-  const shown = rows.filter((r) => r.sentTokens > 0 || r.dedupedTokens > 0).slice(0, 12);
+  // A file filter (from the graph's node panel or the palette) keeps that
+  // file's row and its symbols' rows.
+  const matches = (key: string) =>
+    !fileFilter || (kind === "files" ? key === fileFilter : nodeById.get(key)?.file === fileFilter);
+  const shown = rows.filter((r) => (r.sentTokens > 0 || r.dedupedTokens > 0) && matches(r.key)).slice(0, 12);
   const max = Math.max(1, ...shown.map((r) => r.sentTokens));
 
   const open = (stat: ContextStat) => {
@@ -402,6 +407,21 @@ function TopContext({ usage }: { usage: UsageSummary }) {
     <Section
       title="Top context"
       aside={
+        <span className="flex items-center gap-2">
+        {fileFilter && (
+          <span className="flex min-w-0 items-center gap-1 font-mono text-[11px]" style={{ color: "var(--vb-text-mid)" }} title={fileFilter}>
+            <span className="max-w-[240px] truncate">{fileFilter}</span>
+            <button
+              type="button"
+              onClick={() => useUsageStore.getState().setFileFilter(null)}
+              className="rounded-[3px] px-1 hover:bg-[var(--vb-hover)]"
+              style={{ color: "var(--vb-text-dim)" }}
+              aria-label="Clear file filter"
+            >
+              ×
+            </button>
+          </span>
+        )}
         <Segmented<"files" | "symbols">
           value={kind}
           options={[
@@ -410,11 +430,13 @@ function TopContext({ usage }: { usage: UsageSummary }) {
           ]}
           onChange={setKind}
         />
+        </span>
       }
     >
       {shown.length === 0 ? (
         <Muted>
-          {kind === "files" ? "No file reads attributed" : "No symbols attributed"} in this scope.
+          {kind === "files" ? "No file reads attributed" : "No symbols attributed"}
+          {fileFilter ? ` to ${fileFilter.split("/").pop()}` : ""} in this scope.
         </Muted>
       ) : (
         <div className="flex flex-col">

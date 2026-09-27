@@ -15,12 +15,14 @@ import {
   FileCode2,
   GitCompare,
   History,
+  Network,
   RotateCcw,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 
 import { refreshWorkspace } from "@/lib/client/agent-stream";
+import { focusFromFile, focusFromReceipt, focusFromRun } from "@/lib/client/graph-focus";
 import { useViberon } from "@/store/viberon";
 import {
   cx,
@@ -43,6 +45,7 @@ export function ChangesPanel() {
   const repoKey = useViberon((s) => s.repoKey);
   const run = useViberon((s) => s.run);
   const conversationRuns = useViberon((s) => s.conversationRuns);
+  const hasGraph = useViberon((s) => Boolean(s.graph));
   const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>([]);
   const [busy, setBusy] = useState(false);
 
@@ -173,18 +176,25 @@ export function ChangesPanel() {
                   >
                     This run
                   </span>
-                  <DiffCounts
-                    adds={rows.reduce((s, r) => s + r.adds, 0)}
-                    removes={rows.reduce((s, r) => s + r.removes, 0)}
-                  />
+                  <span className="flex items-center gap-1">
+                    <DiffCounts
+                      adds={rows.reduce((s, r) => s + r.adds, 0)}
+                      removes={rows.reduce((s, r) => s + r.removes, 0)}
+                    />
+                    {run && hasGraph && (
+                      <IconButton title="Show this run on the code graph" onClick={() => useViberon.getState().showOnGraph(focusFromRun(run))}>
+                        <Network className="size-3.5" />
+                      </IconButton>
+                    )}
+                  </span>
                 </div>
                 {rows.map((row) => (
+                  <div key={row.path} className="group flex items-center rounded transition-colors hover:bg-[var(--vb-hover)]">
                   <button
-                    key={row.path}
                     type="button"
                     onClick={() => useViberon.getState().openTab(row.path)}
                     className={cx(
-                      "flex items-center gap-2 rounded px-1.5 py-1 text-left transition-colors hover:bg-[var(--vb-hover)]",
+                      "flex min-w-0 flex-1 items-center gap-2 px-1.5 py-1 text-left",
                       row.reverted && "opacity-45",
                     )}
                   >
@@ -214,6 +224,19 @@ export function ChangesPanel() {
                     </span>
                     <DiffCounts adds={row.adds} removes={row.removes} />
                   </button>
+                  {hasGraph && (
+                    <button
+                      type="button"
+                      title="Show on the code graph"
+                      aria-label={`Show ${row.path} on the code graph`}
+                      onClick={() => useViberon.getState().showOnGraph(focusFromFile(row.path))}
+                      className="mr-0.5 hidden size-5 shrink-0 items-center justify-center rounded-[3px] hover:bg-[var(--vb-active)] group-hover:inline-flex"
+                      style={{ color: "var(--vb-text-dim)" }}
+                    >
+                      <Network className="size-3" />
+                    </button>
+                  )}
+                  </div>
                 ))}
               </section>
             )}
@@ -281,8 +304,8 @@ export function ChangesPanel() {
                   This conversation
                 </span>
                 {[...conversationRuns].reverse().map((entry) => (
+                  <div key={entry.id} className="group flex items-start rounded transition-colors hover:bg-[var(--vb-hover)]">
                   <button
-                    key={entry.id}
                     type="button"
                     onClick={() => {
                       // Jump to the reply this run produced. Chat mode is
@@ -299,7 +322,7 @@ export function ChangesPanel() {
                       }
                     }}
                     title={entry.prompt}
-                    className="flex items-start gap-2 rounded px-1.5 py-1 text-left transition-colors hover:bg-[var(--vb-hover)]"
+                    className="flex min-w-0 flex-1 items-start gap-2 px-1.5 py-1 text-left"
                   >
                     {entry.status === "done" ? (
                       <Check
@@ -332,6 +355,23 @@ export function ChangesPanel() {
                       </span>
                     </span>
                   </button>
+                  {hasGraph && (entry.filesChanged.length > 0 || (entry.usage?.files.length ?? 0) > 0) && (
+                    <button
+                      type="button"
+                      title="Show what this run read and changed on the code graph"
+                      aria-label="Show run on the code graph"
+                      onClick={() => {
+                        const store = useViberon.getState();
+                        const live = store.runHistory.find((r) => r.id === entry.id);
+                        store.showOnGraph(live ? focusFromRun(live) : focusFromReceipt(entry));
+                      }}
+                      className="mr-0.5 mt-1 hidden size-5 shrink-0 items-center justify-center rounded-[3px] hover:bg-[var(--vb-active)] group-hover:inline-flex"
+                      style={{ color: "var(--vb-text-dim)" }}
+                    >
+                      <Network className="size-3" />
+                    </button>
+                  )}
+                  </div>
                 ))}
               </section>
             )}

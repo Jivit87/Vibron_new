@@ -1392,9 +1392,56 @@ export function mockCancelTask(id: string): void {
   if (task) Object.assign(task, { state: "cancelled", finishedAt: Date.now() });
 }
 
-/** The live events of a running fix task: the fix replay. */
-export function mockTaskScript(): ScriptStep[] {
-  return fixScript();
+/**
+ * The live events of a running fix task: the fix replay. A combined "fix
+ * every issue in one PR" task works through a per-issue todo list first, so
+ * stopping it mid-way can be checked (no todo may keep spinning).
+ */
+export function mockTaskScript(task?: { task: string }): ScriptStep[] {
+  const steps = fixScript();
+  if (!task || !/one pull request|in one PR/i.test(task.task)) return steps;
+  const start = steps.findIndex((s) => s.event.type === "agent_start");
+  const agentId = start >= 0 && steps[start].event.type === "agent_start" ? steps[start].event.agentId : "solver";
+  const todos = (active: number): ScriptStep => ({
+    delay: 40,
+    event: {
+      type: "todos",
+      agentId,
+      items: MOCK_BATCH.map((item, i) => ({
+        id: String(i + 1),
+        content: item,
+        status: i < active ? "completed" : i === active ? "in_progress" : "pending",
+      })),
+    },
+  });
+  const out = [...steps];
+  out.splice(start + 1, 0, todos(0));
+  // Halfway through, the first issue is done and the second in progress.
+  out.splice(Math.floor(out.length / 2), 0, todos(1));
+  return out;
+}
+
+const MOCK_BATCH = [
+  "#2499 slugify() drops accented letters",
+  "#2503 Config loader fails on CRLF line endings",
+  "#2511 wrap() splits surrogate pairs",
+  "#2517 CLI ignores --encoding on stdin",
+];
+
+/** A combined task for "fix every open issue in one pull request". */
+function mockCombinedTask(): Record<string, unknown> {
+  const task = {
+    id: `t_${Math.random().toString(16).slice(2, 6)}`,
+    kind: "fix",
+    repoKey: "mock",
+    task: `Fix ${MOCK_BATCH.length} open issues in one pull request\n\n${MOCK_BATCH.join("\n")}`,
+    source: "issue",
+    state: "running",
+    createdAt: Date.now(),
+    startedAt: Date.now(),
+  };
+  mockTaskList.unshift(task);
+  return task;
 }
 
 /* ------------------------------ issues → PR ------------------------------- */
@@ -1460,7 +1507,8 @@ export function mockIssues(label: string): unknown {
   };
 }
 
-export function mockFixIssues(numbers: number[]): unknown {
+export function mockFixIssues(numbers: number[], combined = false): unknown {
+  if (combined) return { tasks: [mockCombinedTask()], skipped: [] };
   const tasks: unknown[] = [];
   const skipped: { number: number; reason: string }[] = [];
   for (const n of numbers) {

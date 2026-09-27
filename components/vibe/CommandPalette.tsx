@@ -33,13 +33,107 @@ import { toast } from "sonner";
 
 import { loadFile } from "@/lib/file-loader";
 import { refreshWorkspace } from "@/lib/client/agent-stream";
+import { runShell } from "@/lib/client/run-shell";
 import { isPrUrl } from "@/lib/client/review";
+import { listTasks, shortRef } from "@/lib/client/deliver";
+import { focusFromReceipt, focusFromRun } from "@/lib/client/graph-focus";
+import { prForIssue, taskForIssue, useLinks } from "@/store/links";
+import { openUsagePanel } from "@/store/usage";
 import { useReview } from "@/store/review";
 import { useUsageStore } from "@/store/usage";
-import { useViberon, type TerminalSessionView } from "@/store/viberon";
+import { useViberon } from "@/store/viberon";
 import { cx, Kbd, truncatePath } from "@/components/vibe/primitives";
 
 const PR_REVIEW_ID = "review.pr";
+
+/**
+ * Commands that follow the links between things: a run and the graph, an
+ * issue and its task or pull request, a file and the tokens spent on it.
+ */
+function relationCommands(): Command[] {
+  const store = useViberon.getState();
+  const { issues, tasks } = useLinks.getState();
+  const out: Command[] = [];
+
+  const run = store.run ?? store.runHistory[0];
+  const receipt = store.conversationRuns.at(-1);
+  if (store.graph && (run || receipt)) {
+    const focus = run ? focusFromRun(run) : focusFromReceipt(receipt!);
+    out.push({
+      id: "graph.showRun",
+      label: "Show run on graph",
+      hint: focus.label,
+      icon: <Network className="size-3.5" />,
+      run: () => store.showOnGraph(focus),
+    });
+  }
+  if (store.graphFocus) {
+    out.push({
+      id: "graph.clearFocus",
+      label: "Clear graph focus",
+      hint: store.graphFocus.label,
+      icon: <Network className="size-3.5" />,
+      run: () => store.setGraphFocus(null),
+    });
+  }
+
+  const tab = store.activeTabPath && !store.activeTabPath.startsWith("__") ? store.activeTabPath : null;
+  const nodeFile = store.selectedNodeId ? store.graph?.nodes.find((n) => n.id === store.selectedNodeId)?.file : undefined;
+  const file = tab ?? nodeFile;
+  out.push({
+    id: "usage.file",
+    label: "Show tokens for file",
+    hint: file ?? "Open a file or select a graph node first",
+    icon: <Zap className="size-3.5" />,
+    run: () => {
+      if (!file) {
+        toast.info("Open a file or select a node on the graph first.");
+        return;
+      }
+      openUsagePanel({ scope: "session", file });
+    },
+  });
+
+  for (const issue of issues) {
+    const task = taskForIssue(issue, tasks);
+    const taskId = issue.task?.id ?? task?.id;
+    if (taskId) {
+      out.push({
+        id: `issue.task.${issue.number}`,
+        label: `Open task for issue #${issue.number}`,
+        hint: issue.title,
+        icon: <ListTodo className="size-3.5" />,
+        run: () => {
+          store.setAppMode("ide");
+          useLinks.getState().setReveal({ kind: "task", id: taskId });
+          store.setBottomPanel("tasks");
+        },
+      });
+    }
+    const pr = prForIssue(issue, tasks);
+    if (pr) {
+      out.push({
+        id: `issue.pr.${issue.number}`,
+        label: `Open PR ${shortRef(pr)} for #${issue.number}`,
+        hint: issue.title,
+        icon: <GitPullRequest className="size-3.5" />,
+        run: () => void window.open(pr, "_blank", "noopener"),
+      });
+    }
+  }
+  const listed = new Set(issues.map((i) => prForIssue(i, tasks)).filter(Boolean));
+  for (const task of tasks) {
+    if (!task.prUrl || listed.has(task.prUrl)) continue;
+    out.push({
+      id: `task.pr.${task.id}`,
+      label: `Open PR ${shortRef(task.prUrl)}`,
+      hint: task.task.split("\n")[0],
+      icon: <GitPullRequest className="size-3.5" />,
+      run: () => void window.open(task.prUrl, "_blank", "noopener"),
+    });
+  }
+  return out;
+}
 
 interface Command {
   id: string;
@@ -66,6 +160,14 @@ export function CommandPalette() {
 
   const [askPr, setAskPr] = useState(false);
   const [prInvalid, setPrInvalid] = useState(false);
+
+  // Tasks feed the issue / PR commands; load them if no panel has yet.
+  useEffect(() => {
+    if (!open || !repoKey || useLinks.getState().tasks.length > 0) return;
+    void listTasks(repoKey).then((r) => {
+      if (r.ok && r.tasks) useLinks.getState().setTasks(r.tasks);
+    });
+  }, [open, repoKey]);
 
   useEffect(() => {
     if (open) {
@@ -291,6 +393,7 @@ export function CommandPalette() {
           toast.success("Re-indexing…");
         },
       },
+      ...relationCommands(),
       ...(rootPath
         ? [
             {
@@ -324,7 +427,9 @@ export function CommandPalette() {
           ]
         : []),
     ];
-  }, [repoKey, rootPath]);
+    // Recomputed on open: the relation commands read the current run, issues and tasks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoKey, rootPath, open]);
 
   const trimmed = query.trim();
   const namespace = trimmed.startsWith(">")
@@ -647,29 +752,6 @@ export function CommandPalette() {
       </div>
     </div>
   );
-}
-
-async function runShell(repoKey: string, command: string): Promise<void> {
-  const store = useViberon.getState();
-  if (!store.rootPath) {
-    toast.error("Open a local folder to run commands.");
-    return;
-  }
-  store.setAppMode("ide");
-  store.setBottomPanel("terminal");
-
-  const response = await fetch("/api/terminal", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ repoKey, command }),
-  });
-  if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: string } | null;
-    toast.error(body?.error ?? "Could not run that command.");
-    return;
-  }
-  const session = (await response.json()) as TerminalSessionView;
-  useViberon.getState().upsertTerminal(session);
 }
 
 export default CommandPalette;
