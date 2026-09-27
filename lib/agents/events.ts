@@ -31,7 +31,8 @@ export interface RunPlan {
 export interface TodoItem {
   id: string;
   content: string;
-  status: "pending" | "in_progress" | "completed";
+  /** "cancelled": stopped before it finished (its spinner ends; it is not done). */
+  status: "pending" | "in_progress" | "completed" | "cancelled";
 }
 
 export type ApprovalKind = "command" | "edit" | "mcp";

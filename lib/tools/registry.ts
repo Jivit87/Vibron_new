@@ -1178,7 +1178,8 @@ const todoWriteTool: ToolImpl = {
       const item = raw as Record<string, unknown>;
       const content = str(item.content).trim().slice(0, 300);
       if (!content) continue;
-      const status = TODO_STATUSES.includes(item.status as TodoItem["status"])
+      // Agents plan with three states; "cancelled" is the harness's (a Stop).
+      const status = (TODO_STATUSES as readonly string[]).includes(String(item.status))
         ? (item.status as TodoItem["status"])
         : "pending";
       items.push({ id: str(item.id).trim() || String(index + 1), content, status });

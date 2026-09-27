@@ -190,17 +190,22 @@ async function fixIssueBatch(
     ],
     waves: [issueSteps.map((step) => step.id), ["deliver"]],
   };
-  // A cancelled item is not in progress (its spinner ends) and not done:
-  // TodoItem has no "cancelled" status, so it is "pending" marked "⊘ … (cancelled)".
-  const mark = (i: BatchItem) => (i.state === "resolved" ? "✓" : i.state === "failed" ? "✗" : i.state === "cancelled" ? "⊘" : "");
+  const mark = (i: BatchItem) => (i.state === "resolved" ? "✓" : i.state === "failed" ? "✗" : "");
   const checklist = () =>
     ctx.emit({
       type: "todos",
       agentId: "issues",
       items: items.map((i) => ({
         id: String(i.number),
-        content: `${mark(i)} #${i.number} ${i.title}${i.detail ? ` (${i.detail})` : ""}`.trim(),
-        status: i.state === "resolved" ? "completed" : i.state === "running" ? "in_progress" : "pending",
+        content: `${mark(i)} #${i.number} ${i.title}${i.detail && i.state !== "cancelled" ? ` (${i.detail})` : ""}`.trim(),
+        status:
+          i.state === "resolved"
+            ? "completed"
+            : i.state === "running"
+              ? "in_progress"
+              : i.state === "cancelled"
+                ? "cancelled"
+                : "pending",
       })),
     });
   // Stop: every issue not yet fixed is cancelled at once (running solves

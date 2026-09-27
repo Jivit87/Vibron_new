@@ -12,6 +12,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  Ban,
   ArrowDown,
   ArrowUp,
   Check,
@@ -261,6 +262,8 @@ function TodoList({ items }: { items: TodoItem[] }) {
             <SquareCheck className="size-3.5 shrink-0" style={{ color: "var(--vb-text-dim)" }} />
           ) : item.status === "in_progress" ? (
             <Loader2 className="size-3.5 shrink-0 animate-spin" style={{ color: "var(--vb-accent)" }} />
+          ) : item.status === "cancelled" ? (
+            <Ban className="size-3.5 shrink-0" style={{ color: "var(--vb-text-faint)" }} />
           ) : (
             <Square className="size-3.5 shrink-0" style={{ color: "var(--vb-text-faint)" }} />
           )}
@@ -268,7 +271,7 @@ function TodoList({ items }: { items: TodoItem[] }) {
             className={cx(item.status === "completed" && "line-through")}
             style={{
               color:
-                item.status === "completed"
+                item.status === "completed" || item.status === "cancelled"
                   ? "var(--vb-text-dim)"
                   : item.status === "in_progress"
                     ? "var(--vb-text-hi)"
@@ -276,6 +279,11 @@ function TodoList({ items }: { items: TodoItem[] }) {
             }}
           >
             {item.content}
+            {item.status === "cancelled" && (
+              <span className="ml-1.5 text-[11px]" style={{ color: "var(--vb-text-faint)" }}>
+                cancelled
+              </span>
+            )}
           </span>
         </div>
       ))}

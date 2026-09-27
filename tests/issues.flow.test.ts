@@ -427,8 +427,9 @@ describe("Stop", () => {
     expect(solved).toHaveLength(3);
     expect(await queue.get(tasks[0]!.id)).toMatchObject({ state: "cancelled" });
     const last = events.filter((e) => e.type === "todos").at(-1);
+    // A real "cancelled" status: no spinner, not done, no marker text needed.
     expect(last?.type === "todos" && last.items.map((item) => [item.status, item.content.startsWith("⊘")])).toEqual(
-      Array.from({ length: 4 }, () => ["pending", true]),
+      Array.from({ length: 4 }, () => ["cancelled", false]),
     );
     expect(events.at(-1)).toMatchObject({ type: "run_done", status: "cancelled" });
     expect((await queue.get(tasks[0]!.id))?.issueResults?.map((r) => r.detail)).toEqual(["cancelled", "cancelled", "cancelled", "cancelled"]);
