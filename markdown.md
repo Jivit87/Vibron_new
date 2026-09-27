@@ -116,3 +116,9 @@ Status: **built** = merged on main with tests green · **in progress** = an agen
   - the clean build caught `instrumentation.ts` dragging Firestore into the edge bundle, fixed with Next's documented Node-only import.
   715 tests pass; tsc and eslint are clean; clean-checkout next build is green.
 - **2026-09-27:** Merged `gemini-thought-signatures` (b3611c5, other session). It fixes the user's Gemini 400 "missing thought_signature": Gemini 3 tool calls carry a signature that must be echoed back, and the OpenAI-compatible adapter now sends it, only to Gemini. A free-tier `limit: 0` 429 now counts as unavailable, so auto falls to Flash at once. Planner checked that the Anthropic adapter maps tool_use field by field (no leak). 717 tests pass; clean build is green.
+- **2026-09-27:** Round 5 started (`docs/PLAN-ROUND5.md`).
+  - Gap audit against Pramana, in code: already ported are the gate, editor, guards, checkpoint, localization, snippets, two attempts, text protocol, reasoning pass-back, perturbing retries, and stub/test-edit rejection.
+  - Missing, now being built:
+    - acceptance criteria, the blind independent test writer, and the Pramana reviewer framing (A);
+    - the Claude CLI provider, so real runs work without an API key; DeepSeek; a SWE-bench Verified runner; issue intake formats (B).
+  - Weak points being fixed: parallel setup and gate, per-phase timing, prompt-cache prefix stability (A); cached check detection (B); the UI for criteria, the independent test and a phase timing strip (FE).
