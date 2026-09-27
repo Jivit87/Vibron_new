@@ -25,6 +25,7 @@ import {
 
 export * from "@/lib/memory/types";
 export * from "@/lib/memory/graph";
+export * from "@/lib/memory/lessons";
 export { VAULT_DIR, vaultPath, type VaultGraph } from "@/lib/memory/vault";
 
 const MEMORY_KEY = (repoKey: string) => `memory:${repoKey}`;

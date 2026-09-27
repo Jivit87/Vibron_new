@@ -33,10 +33,14 @@ import { loadGraphIndexSync, type GraphIndexDoc } from "@/lib/workspace/graph-in
 
 export const MEMORY_GRAPH_VERSION = 1;
 
-/** `fix`: what a solve run changed and why; `note`: written by hand in the vault; `run`: legacy fix records. */
-export type AnchoredKind = MemoryEntryKind | "fix" | "note" | "run" | "summary";
+/**
+ * `fix`: what a solve run changed and why; `lesson`: why an attempt was NOT
+ * accepted (lib/memory/lessons.ts); `note`: written by hand in the vault;
+ * `run`: legacy fix records.
+ */
+export type AnchoredKind = MemoryEntryKind | "fix" | "lesson" | "note" | "run" | "summary";
 
-const VAULT_KINDS = new Set<string>(["decision", "fact", "suggestion", "convention", "fix", "note"]);
+const VAULT_KINDS = new Set<string>(["decision", "fact", "suggestion", "convention", "fix", "lesson", "note"]);
 
 export interface MemoryAnchor {
   /** What the caller passed: a graph node id or a repo-relative path. */
@@ -126,7 +130,20 @@ function load(root: string): MemoryGraph {
   return graph;
 }
 
+/** Bumped on every write, so derived views (lessons notes) can memoize cheaply. */
+const revisions = new Map<string, number>();
+
+function rootKey(root: string): string {
+  return isDiskRoot(root) ? path.resolve(root) : root;
+}
+
+/** Monotonic per-root write counter (in-process). */
+export function memoryRevision(root: string): number {
+  return revisions.get(rootKey(root)) ?? 0;
+}
+
 function save(root: string, graph: MemoryGraph): void {
+  revisions.set(rootKey(root), memoryRevision(root) + 1);
   if (!isDiskRoot(root)) return;
   try {
     const file = memoryFile(root);
@@ -450,6 +467,41 @@ export function relevantLessons(root: string, input: { files: string[]; task: st
     .map(({ entry }) => `${entry.text}${isStale(root, entry.anchors, doc) ? " (may be outdated)" : ""}`);
 }
 
+/**
+ * `fix` / `run` / `lesson` entries scored against a task (anchor match on
+ * the candidate files > same directory, plus shared task words), with
+ * staleness recomputed. Used by lib/memory/lessons.ts.
+ */
+export function scoredLessonEntries(
+  root: string,
+  input: { files: string[]; task: string },
+): { entry: AnchoredEntry; score: number }[] {
+  const graph = load(root);
+  if (syncFromVault(root, graph)) save(root, graph);
+  const pool = graph.entries.filter((e) => e.kind === "fix" || e.kind === "run" || e.kind === "lesson");
+  if (!pool.length) return [];
+  const doc = indexFor(root);
+  const files = new Set(input.files.map(normalizeRef));
+  const dirs = new Set([...files].map((f) => path.posix.dirname(f)));
+  const words = (text: string) => new Set(text.toLowerCase().match(/[a-z_][a-z0-9_]{3,}/g) ?? []);
+  const taskWords = words(input.task);
+  const out: { entry: AnchoredEntry; score: number }[] = [];
+  for (const entry of pool) {
+    let score = 0;
+    for (const a of entry.anchors) {
+      if (files.has(a.path)) score = Math.max(score, 3);
+      else if (a.path && dirs.has(path.posix.dirname(a.path))) score = Math.max(score, 1);
+    }
+    let overlap = 0;
+    for (const w of words(entry.text)) if (taskWords.has(w)) overlap += 1;
+    score += Math.min(overlap, 6) * 0.5;
+    if (score < 1.5) continue;
+    entry.stale = isStale(root, entry.anchors, doc);
+    out.push({ entry, score });
+  }
+  return out.sort((a, b) => b.score - a.score || updatedOf(b.entry) - updatedOf(a.entry));
+}
+
 /** The vault as a graph for the UI: note nodes linked to code nodes. */
 export function vaultGraph(root: string): VaultGraph {
   return vaultGraphOf(getMemoryGraph(root).entries);
@@ -488,4 +540,5 @@ export function importLegacyEntries(root: string, memory: ProjectMemory): number
 /** Drop the in-process cache (tests). */
 export function clearMemoryGraphCache(): void {
   cache.clear();
+  // `revisions` stays monotonic on purpose: a reset to 0 could match an old memo key.
 }
