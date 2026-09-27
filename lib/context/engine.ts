@@ -20,7 +20,7 @@
 
 import type { Graph, GraphNode, StoredFileInfo } from "@/lib/graph";
 import type { ProjectMemory } from "@/lib/memory/types";
-import { selectContext } from "@/lib/retrieval";
+import { selectContext, tokenize as retrievalTokenize } from "@/lib/retrieval";
 import { countTokens } from "@/lib/tokens";
 import { ContextLedger } from "@/lib/context/ledger";
 
@@ -210,7 +210,7 @@ export interface GraphSliceResult {
 export function buildGraphSlice(
   input: EngineInput,
   query: string,
-  options: { depth?: number; maxNodes?: number } = {},
+  options: GraphSliceOptions = {},
 ): GraphSliceResult {
   const empty: GraphSliceResult = {
     text: "No indexed symbols matched. The workspace may be empty, or the code may be in a language the parser does not index (it handles TS/JS/TSX/JSX). Use `list_files` or `grep` instead.",
@@ -229,9 +229,13 @@ export function buildGraphSlice(
   if (selection.nodeIds.length === 0) return empty;
 
   const nodeById = new Map(input.graph.nodes.map((n) => [n.id, n] as const));
+  const rendered = renderSlice(input, query, selection.nodeIds, nodeById, {
+    maxTokens: options.maxTokens ?? DEFAULT_SLICE_TOKENS,
+    maxBodies: options.maxBodies ?? DEFAULT_SLICE_BODIES,
+  });
   const files: string[] = [];
   const seen = new Set<string>();
-  for (const id of selection.nodeIds) {
+  for (const id of rendered.nodeIds) {
     const file = nodeById.get(id)?.file;
     if (file && !seen.has(file)) {
       seen.add(file);
@@ -252,18 +256,225 @@ export function buildGraphSlice(
   const offered = input.ledger.offer(
     "graph_slice",
     `graph slice for "${query}"`,
-    selection.contextString,
-    { paths: files, nodeIds: selection.nodeIds },
+    rendered.text,
+    { paths: files, nodeIds: rendered.nodeIds },
   );
+  if (!offered.deduped) {
+    const shown = bodiesShown(input.ledger);
+    for (const id of rendered.bodyIds) shown.add(id);
+  }
 
   return {
     text: offered.text,
-    nodeIds: selection.nodeIds,
+    nodeIds: rendered.nodeIds,
     files,
     tokens: offered.tokens,
     baselineTokens: Math.max(baselineTokens, selection.baselineTokens),
     deduped: offered.deduped,
   };
+}
+
+export interface GraphSliceOptions {
+  depth?: number;
+  maxNodes?: number;
+  /** Token ceiling for one slice. Default 2000. */
+  maxTokens?: number;
+  /** Most symbols shown with a body; the rest get signatures. Default 5. */
+  maxBodies?: number;
+}
+
+export const DEFAULT_SLICE_TOKENS = 2000;
+export const DEFAULT_SLICE_BODIES = 5;
+const SLICE_BODY_CHARS = 1200;
+const SLICE_EDGE_LINES = 20;
+const SLICE_FRONTIER_LINES = 6;
+/** Words too common in prose to pick a symbol body on their own. */
+const SLICE_WEAK_WORDS = new Set(
+  "has have get set run use make with when then this that from into file files data value item list test tests error issue fix bug code line text type name path".split(" "),
+);
+
+/** Per agent ledger: node ids whose bodies this agent has already been shown. */
+const shownBodies = new WeakMap<ContextLedger, Set<string>>();
+function bodiesShown(ledger: ContextLedger): Set<string> {
+  let set = shownBodies.get(ledger);
+  if (!set) {
+    set = new Set();
+    shownBodies.set(ledger, set);
+  }
+  return set;
+}
+
+function nameWords(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 1);
+}
+
+/**
+ * Render a selection compactly under a token budget: the symbols the query
+ * actually names get a body (they are what the agent came for), graph
+ * neighbours get one signature line each, grouped by file. Symbols nested in
+ * a shown body, duplicates, and bodies this agent already saw collapse.
+ */
+function renderSlice(
+  input: EngineInput,
+  query: string,
+  ids: string[],
+  nodeById: Map<string, GraphNode>,
+  opts: { maxTokens: number; maxBodies: number },
+): { text: string; nodeIds: string[]; bodyIds: string[] } {
+  const queryWords = new Set(retrievalTokenize(query).flatMap((t) => [t, ...t.split("_")]));
+  const seenBefore = bodiesShown(input.ledger);
+  const nodes: GraphNode[] = [];
+  const dup = new Set<string>();
+  for (const id of ids) {
+    const node = nodeById.get(id);
+    if (!node) continue;
+    const key = `${node.file}\0${node.name}\0${node.startLine}`;
+    if (dup.has(key)) continue;
+    dup.add(key);
+    nodes.push(node);
+  }
+  // `ids` arrive best-first. Bodies go to query matches; if nothing matches by
+  // name, the top-ranked symbol still gets one.
+  // Short words ("has", "get") only count when they are the whole name, and
+  // inline arrows (`(x) => …`) only when named exactly.
+  const matches = (n: GraphNode) => {
+    const leaf = n.name.split(".").pop()!.toLowerCase();
+    if (queryWords.has(leaf)) return !SLICE_WEAK_WORDS.has(leaf);
+    if (n.signature.trimStart().startsWith("(")) return false;
+    return nameWords(n.name).some((w) => w.length > 3 && queryWords.has(w) && !SLICE_WEAK_WORDS.has(w));
+  };
+  let bodyCands = nodes.filter(matches);
+  if (!bodyCands.length) bodyCands = nodes.slice(0, 1);
+
+  const budget = Math.max(200, opts.maxTokens);
+  const bodyBudget = Math.round(budget * 0.75);
+  const bodies: GraphNode[] = [];
+  const repeat: GraphNode[] = [];
+  let used = 0;
+  for (const node of bodyCands) {
+    if (bodies.length >= opts.maxBodies) break;
+    // A method whose class body is already shown adds nothing.
+    if (bodies.some((b) => b.file === node.file && b.startLine <= node.startLine && b.endLine >= node.endLine)) continue;
+    if (seenBefore.has(node.id)) {
+      repeat.push(node);
+      continue;
+    }
+    const cost = countTokens(formatBody(node));
+    if (bodies.length && used + cost > bodyBudget) continue;
+    bodies.push(node);
+    used += cost;
+  }
+  // Drop bodies later found to be nested in a (larger) shown body.
+  const bodySet = new Set(bodies.map((b) => b.id));
+  const inside = (n: GraphNode) =>
+    bodies.some((b) => b.id !== n.id && b.file === n.file && b.startLine <= n.startLine && b.endLine >= n.endLine);
+  const finalBodies = bodies.filter((b) => !inside(b));
+
+  const blocks: string[] = [];
+  const nodeIds: string[] = [];
+  for (const b of finalBodies) {
+    blocks.push(formatBody(b));
+    nodeIds.push(b.id);
+  }
+  for (const n of nodes) if (bodySet.has(n.id) && !finalBodies.includes(n)) nodeIds.push(n.id);
+
+  // Neighbours: one signature line each, grouped by file, deduped by signature.
+  const rest: GraphNode[] = [];
+  for (const n of nodes) {
+    if (bodySet.has(n.id)) continue;
+    if (inside(n)) nodeIds.push(n.id); // delivered inside a shown body
+    else rest.push(n);
+  }
+  const byFile = new Map<string, GraphNode[]>();
+  for (const n of rest) byFile.set(n.file, [...(byFile.get(n.file) ?? []), n]);
+  const sigLines: string[] = [];
+  let omitted = 0;
+  let sigUsed = 0;
+  const sigBudget = budget - used - 150;
+  for (const [file, list] of byFile) {
+    const seenSig = new Set<string>();
+    const rows: string[] = [];
+    let chunkCost = countTokens(file) + 1;
+    for (const n of list.sort((a, b) => a.startLine - b.startLine)) {
+      const sig = oneLine(n.signature);
+      if (seenSig.has(sig)) {
+        nodeIds.push(n.id); // identical signature already listed
+        continue;
+      }
+      const note = seenBefore.has(n.id) ? "  (body shown earlier)" : "";
+      const leaf = n.name.split(".").pop()!;
+      const row = `  ${n.startLine}-${n.endLine} ${sig.includes(leaf) ? sig : `${n.name}: ${sig}`}${note}`;
+      const cost = countTokens(row) + 1;
+      if (sigUsed + chunkCost + cost > sigBudget) {
+        omitted += 1;
+        continue;
+      }
+      seenSig.add(sig);
+      rows.push(row);
+      chunkCost += cost;
+      nodeIds.push(n.id);
+    }
+    if (!rows.length) continue;
+    sigLines.push(`${file}\n${rows.join("\n")}`);
+    sigUsed += chunkCost;
+  }
+  for (const n of repeat) if (!nodeIds.includes(n.id)) nodeIds.push(n.id);
+  if (sigLines.length) {
+    blocks.push(`### neighbours (signatures; read_file a line range for a body)\n${sigLines.join("\n")}`);
+  }
+
+  // Relationships among what was shown, then a few edges leaving the slice.
+  const graph = input.graph!;
+  const shownSet = new Set(nodeIds);
+  const label = (n: GraphNode) => `${n.name} (${n.file.split("/").pop()})`;
+  // Only edges touching a shown body: neighbour-to-neighbour edges are noise.
+  const edgeLines = new Set<string>();
+  const frontier = new Set<string>();
+  let edgeBudget = budget - used - sigUsed - 60;
+  for (const e of graph.edges) {
+    if (!bodySet.has(e.source) && !bodySet.has(e.target)) continue;
+    const s = nodeById.get(e.source);
+    const t = nodeById.get(e.target);
+    if (!s || !t || s.id === t.id) continue;
+    const verb = e.kind === "call" ? "calls" : "imports";
+    const inside2 = shownSet.has(e.source) && shownSet.has(e.target);
+    const line = inside2 ? `- ${label(s)} ${verb} ${label(t)}` : `- ${s.name} (${s.file}) ${verb} ${t.name} (${t.file})`;
+    const target = inside2 ? edgeLines : frontier;
+    if (target.has(line) || target.size >= (inside2 ? SLICE_EDGE_LINES : SLICE_FRONTIER_LINES)) continue;
+    const cost = countTokens(line) + 1;
+    if (cost > edgeBudget) break;
+    edgeBudget -= cost;
+    target.add(line);
+  }
+  if (edgeLines.size) blocks.push(`### relationships\n${[...edgeLines].join("\n")}`);
+  if (frontier.size) blocks.push(`### edges leaving the slice\n${[...frontier].join("\n")}`);
+
+  const fileCount = new Set(nodeIds.map((id) => nodeById.get(id)?.file)).size;
+  const header =
+    `### graph slice for "${query.length > 120 ? `${query.slice(0, 117)}…` : query}" — ${nodeIds.length} symbols in ${fileCount} files, ${finalBodies.length} with bodies` +
+    (repeat.length ? `; ${repeat.length} bodies already shown earlier (scroll up)` : "") +
+    (omitted ? `; ${omitted} more symbols omitted for size (narrow the query)` : "");
+  return { text: [header, ...blocks].join("\n\n"), nodeIds, bodyIds: finalBodies.map((b) => b.id) };
+}
+
+function oneLine(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > 160 ? `${flat.slice(0, 157)}…` : flat;
+}
+
+function formatBody(node: GraphNode): string {
+  const truncated = node.snippet.length > SLICE_BODY_CHARS;
+  const body = node.snippet.slice(0, SLICE_BODY_CHARS);
+  return [
+    `### ${node.kind} ${node.name}  (${node.file}:${node.startLine}-${node.endLine})`,
+    "```",
+    truncated ? `${body}\n… (${node.snippet.length - SLICE_BODY_CHARS} more chars; read_file ${node.file} for the rest)` : body,
+    "```",
+  ].join("\n");
 }
 
 /* ------------------------------- L3 ------------------------------------- */

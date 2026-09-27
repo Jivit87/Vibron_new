@@ -16,13 +16,18 @@
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
+import { isSourceFilePath, type RepoFile } from "@/lib/github";
 import type { Graph, GraphNode } from "@/lib/graph";
+import { loadPathAliases } from "@/lib/lang/tsconfig";
+import { bm25Files, bm25Symbols, contentSignature, fileTerms } from "@/lib/localize/lexical";
 import { runSnippets } from "@/lib/localize/snippets";
 import { relevantLessons } from "@/lib/memory/graph";
-import { parseRepo } from "@/lib/parser";
+import { extractFile, goModuleOf, linkGraphAsync, type FileExtract } from "@/lib/parser";
 import { listRepoPaths, relatedTestFiles, type ShellRunner } from "@/lib/verify";
+import { timeSlicer } from "@/lib/workers/yield";
 
 export { extractSnippets, runSnippets, type Snippet, type SnippetRun } from "@/lib/localize/snippets";
+export { clearLexicalCache } from "@/lib/localize/lexical";
 
 export interface LocalizedFile {
   path: string;
@@ -155,44 +160,22 @@ interface Candidate {
   path: string;
   score: number;
   why: string[];
-  symbols: string[];
+  /** symbol label → weight, so the short list is ranked, not insertion-ordered. */
+  symbols: Map<string, number>;
 }
 
-function bm25(queryTokens: string[], docs: Map<string, string>): Map<string, number> {
-  const q = new Map<string, number>();
-  for (const t of queryTokens) q.set(t, (q.get(t) ?? 0) + 1);
-  const scores = new Map<string, number>();
-  if (!q.size) return scores;
-  const tfs = new Map<string, Map<string, number>>();
-  const lens = new Map<string, number>();
-  const df = new Map<string, number>();
-  let total = 0;
-  for (const [rel, text] of docs) {
-    const toks = tokenize(`${rel.replace(/\//g, " ")} ${text}`);
-    const tf = new Map<string, number>();
-    for (const t of toks) if (q.has(t)) tf.set(t, (tf.get(t) ?? 0) + 1);
-    for (const t of tf.keys()) df.set(t, (df.get(t) ?? 0) + 1);
-    tfs.set(rel, tf);
-    lens.set(rel, toks.length);
-    total += toks.length;
+/** `name (path:start-end)`: a line range the agent can read directly. */
+function symbolLabel(node: GraphNode): string {
+  return `${node.name} (${node.file}:${node.startLine}-${node.endLine})`;
+}
+
+/** The innermost symbol whose range contains `line`. */
+function enclosing(nodes: GraphNode[] | undefined, line: number): GraphNode | undefined {
+  let best: GraphNode | undefined;
+  for (const n of nodes ?? []) {
+    if (n.startLine <= line && n.endLine >= line && (!best || n.endLine - n.startLine < best.endLine - best.startLine)) best = n;
   }
-  const n = docs.size || 1;
-  const avg = total / n || 1;
-  const k1 = 1.2;
-  const b = 0.75;
-  for (const [rel, tf] of tfs) {
-    const dl = lens.get(rel) || 1;
-    let s = 0;
-    for (const [t, qf] of q) {
-      const f = tf.get(t);
-      if (!f) continue;
-      const d = df.get(t) ?? 0;
-      const idf = Math.log(1 + (n - d + 0.5) / (d + 0.5));
-      s += ((idf * (f * (k1 + 1))) / (f + k1 * (1 - b + (b * dl) / avg))) * (1 + Math.log(qf));
-    }
-    if (s > 0) scores.set(rel, s);
-  }
-  return scores;
+  return best;
 }
 
 /** Repo source files a test imports (Python absolute imports, JS/TS relative imports). */
@@ -227,20 +210,52 @@ function importedSources(testRel: string, text: string, fileSet: Set<string>): s
   return [...new Set(out)].slice(0, 12);
 }
 
-async function readDocs(root: string, files: string[], max = 12_000): Promise<Map<string, string>> {
-  const docs = new Map<string, string>();
-  await Promise.all(
-    files.slice(0, max).map(async (rel) => {
-      try {
-        const abs = path.join(root, rel);
-        if ((await stat(abs)).size > 400_000) return;
-        docs.set(rel, await readFile(abs, "utf8"));
-      } catch {
-        // Unreadable: skip.
-      }
-    }),
+async function readText(root: string, rel: string): Promise<string> {
+  try {
+    const abs = path.join(root, rel);
+    if ((await stat(abs)).size > 400_000) return "";
+    return await readFile(abs, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/** Fallback graph when the caller has none: parsed off the hot path, cached by content. */
+const fallbackGraphs = new Map<string, { sig: string; graph: Graph }>();
+
+async function fallbackGraph(root: string, files: string[], signal?: AbortSignal): Promise<Graph> {
+  const sig = contentSignature(root, files);
+  const hit = fallbackGraphs.get(root);
+  if (hit && hit.sig === sig) return hit.graph;
+  const tick = timeSlicer();
+  const repoFiles: RepoFile[] = [];
+  for (let i = 0; i < files.length; i += 128) {
+    const batch = files.slice(i, i + 128);
+    const texts = await Promise.all(batch.map((rel) => readText(root, rel)));
+    batch.forEach((rel, j) => {
+      if (texts[j]) repoFiles.push({ path: rel, source: texts[j] });
+    });
+  }
+  const sourceFiles = repoFiles.filter((f) => isSourceFilePath(f.path));
+  const extracts: FileExtract[] = [];
+  for (const file of sourceFiles) {
+    await tick(signal);
+    extracts.push(extractFile(file));
+  }
+  const graph = await linkGraphAsync(
+    extracts,
+    {
+      repoRef: "unknown/repo@local",
+      knownFiles: new Set(sourceFiles.map((f) => f.path)),
+      aliases: loadPathAliases(repoFiles),
+      goModule: goModuleOf(repoFiles),
+    },
+    tick,
+    signal,
   );
-  return docs;
+  fallbackGraphs.set(root, { sig, graph });
+  while (fallbackGraphs.size > 4) fallbackGraphs.delete(fallbackGraphs.keys().next().value!);
+  return graph;
 }
 
 /** Rank the files most likely to need the change for `task`. */
@@ -251,12 +266,15 @@ export async function localize(
   opts: LocalizeOptions = {},
 ): Promise<LocalizeResult> {
   const topK = opts.topK ?? 8;
-  const files = listRepoPaths(root).filter((f) => CODE_EXTS.test(f) && !VENDOR_RE.test(f));
+  const tick = timeSlicer();
+  const files = listRepoPaths(root).filter((f) => CODE_EXTS.test(f) && !VENDOR_RE.test(f)).slice(0, 12_000);
   const fileSet = new Set(files);
   const suffixIndex = new Map<string, string[]>();
   for (const f of files) {
     const base = f.split("/").pop()!;
-    suffixIndex.set(base, [...(suffixIndex.get(base) ?? []), f]);
+    const list = suffixIndex.get(base);
+    if (list) list.push(f);
+    else suffixIndex.set(base, [f]);
   }
 
   let snippetRun: LocalizeResult["snippetRun"];
@@ -275,36 +293,53 @@ export async function localize(
     }
   }
 
-  const docs = await readDocs(root, files);
-  const symbolGraph = graph?.nodes.length ? graph : parseRepo([...docs].map(([p, source]) => ({ path: p, source }))).graph;
+  // Cached by content and time-sliced: no multi-hundred-ms stall on big repos.
+  const docs = await fileTerms(root, files, tokenize, opts.signal);
+  const symbolGraph = graph?.nodes.length ? graph : await fallbackGraph(root, files, opts.signal);
   const byName = new Map<string, GraphNode[]>();
+  const nodesByFile = new Map<string, GraphNode[]>();
   for (const node of symbolGraph.nodes) {
+    await tick(opts.signal);
     if (VENDOR_RE.test(node.file)) continue;
     const leaf = node.name.split(".").pop()!;
-    for (const key of new Set([node.name, leaf])) byName.set(key, [...(byName.get(key) ?? []), node]);
+    for (const key of new Set([node.name, leaf])) {
+      const list = byName.get(key);
+      if (list) list.push(node);
+      else byName.set(key, [node]);
+    }
+    const inFile = nodesByFile.get(node.file);
+    if (inFile) inFile.push(node);
+    else nodesByFile.set(node.file, [node]);
   }
 
   const cands = new Map<string, Candidate>();
   const bump = (p: string, score: number, reason: string, sym?: string) => {
-    const c = cands.get(p) ?? { path: p, score: 0, why: [], symbols: [] };
+    const c = cands.get(p) ?? { path: p, score: 0, why: [], symbols: new Map<string, number>() };
     cands.set(p, c);
     c.score += score;
     if (reason && !c.why.includes(reason) && c.why.length < 4) c.why.push(reason);
-    if (sym && !c.symbols.includes(sym) && c.symbols.length < 6) c.symbols.push(sym);
+    if (sym && (c.symbols.has(sym) || c.symbols.size < 6)) c.symbols.set(sym, (c.symbols.get(sym) ?? 0) + score);
   };
 
   const { strong, dotted, frames, paths } = extractSignals(text);
   frames.forEach((frame, i) => {
+    const last = i === frames.length - 1;
     for (const rel of matchPath(frame.file, suffixIndex)) {
-      bump(rel, 6 + (i === frames.length - 1 ? 3 : 0), "in traceback", `${frame.func || "frame"} (${rel}:${frame.line})`);
+      // The frame's line names the function to fix, with its range.
+      const node = enclosing(nodesByFile.get(rel), frame.line);
+      const sym = node ? symbolLabel(node) : `${frame.func || "frame"} (${rel}:${frame.line})`;
+      bump(rel, 6 + (last ? 3 : 0) + (node ? 1 : 0), "in traceback", sym);
     }
   });
   for (const ref of paths) for (const rel of matchPath(ref, suffixIndex)) bump(rel, 5, "path mentioned in issue");
   for (const name of dotted) {
+    await tick(opts.signal);
     const parts = name.split(".");
     for (let cut = parts.length; cut > 0; cut -= 1) {
       const mod = parts.slice(0, cut).join("/");
-      const hits = files.filter((f) => f.endsWith(`${mod}.py`) || f.endsWith(`${mod}/__init__.py`));
+      const hits = [...(suffixIndex.get(`${parts[cut - 1]}.py`) ?? []), ...(suffixIndex.get("__init__.py") ?? [])].filter(
+        (f) => f.endsWith(`${mod}.py`) || f.endsWith(`${mod}/__init__.py`),
+      );
       if (hits.length && hits.length <= 3) {
         for (const h of hits) bump(h, 3, `module \`${parts.slice(0, cut).join(".")}\``);
         break;
@@ -313,23 +348,35 @@ export async function localize(
     const leaf = parts[parts.length - 1];
     const qual = parts.slice(-2).join(".");
     for (const node of (byName.get(qual) ?? byName.get(leaf) ?? []).slice(0, 6)) {
-      bump(node.file, 3.5 * Math.max(specificity(leaf), 0.5), `defines \`${node.name}\``, `${node.name} (${node.file}:${node.startLine})`);
+      bump(node.file, 3.5 * Math.max(specificity(leaf), 0.5), `defines \`${node.name}\``, symbolLabel(node));
     }
   }
   for (const name of strong) {
     const defs = (byName.get(name) ?? []).filter((n) => n.name === name || n.name.endsWith(`.${name}`));
     if (!defs.length || defs.length > 25) continue;
     const w = (4 * specificity(name)) / Math.sqrt(defs.length);
-    for (const node of defs.slice(0, 10)) bump(node.file, w, `defines \`${node.name}\``, `${node.name} (${node.file}:${node.startLine})`);
+    for (const node of defs.slice(0, 10)) bump(node.file, w, `defines \`${node.name}\``, symbolLabel(node));
   }
 
-  const lex = bm25(tokenize(text), docs);
+  const queryTokens = tokenize(text);
+  const lex = await bm25Files(queryTokens, docs, tokenize, opts.signal);
   if (lex.size) {
-    const max = Math.max(...lex.values());
+    let max = 0;
+    for (const s of lex.values()) if (s > max) max = s;
     for (const [rel, s] of [...lex].sort((a, b) => b[1] - a[1]).slice(0, 40)) {
       bump(rel, (4 * s) / max, "");
       const c = cands.get(rel)!;
       if (!c.why.length) c.why.push("text similarity");
+    }
+  }
+
+  // Symbol names + docstrings: finds `def total_price` for "the total price is wrong".
+  const symHits = await bm25Symbols(symbolGraph, queryTokens, tokenize, VENDOR_RE, 12, opts.signal);
+  if (symHits.length) {
+    const max = symHits[0].score;
+    for (const { node, score } of symHits) {
+      if (score < max * 0.35) break;
+      bump(node.file, (2.5 * score) / max, `matches \`${node.name}\``, symbolLabel(node));
     }
   }
 
@@ -340,7 +387,7 @@ export async function localize(
   for (const tc of testCands) {
     const testDirs = new Set(path.posix.dirname(tc.path).split("/").filter((d) => !["tests", "test", "testing", "src", "."].includes(d)));
     const stem = path.posix.basename(tc.path).replace(/\.[^.]+$/, "").replace(/^test_|_test$|\.(test|spec)$/g, "");
-    for (const mod of importedSources(tc.path, docs.get(tc.path) ?? "", fileSet)) {
+    for (const mod of importedSources(tc.path, await readText(root, tc.path), fileSet)) {
       if (isTestPath(mod) || mod.endsWith("__init__.py")) continue;
       let affinity = 1;
       if (path.posix.dirname(mod).split("/").some((d) => testDirs.has(d))) affinity += 0.6;
@@ -363,9 +410,15 @@ export async function localize(
     // Memory is advisory.
   }
 
+  // Ranked short list: best file first, its strongest symbols first.
+  const symbols: string[] = [];
+  for (const c of src) {
+    for (const [sym] of [...c.symbols].sort((a, b) => b[1] - a[1])) if (!symbols.includes(sym)) symbols.push(sym);
+  }
+
   return {
     files: src.map((c) => ({ path: c.path, score: Math.round(c.score * 100) / 100, why: c.why.length ? c.why : ["text similarity"] })),
-    symbols: [...new Set(src.flatMap((c) => c.symbols))].slice(0, 16),
+    symbols: symbols.slice(0, 12),
     snippetRun,
     testFiles,
     lessons,

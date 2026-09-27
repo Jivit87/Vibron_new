@@ -104,3 +104,47 @@ describe("localize", () => {
     expect(renderLocalization(res)).toContain("Past fixes nearby");
   });
 });
+
+describe("localize seeds and index cache", () => {
+  const MORE = {
+    ...FILES,
+    "textkit/money.py":
+      'def round_half(value):\n    """Round a currency amount to cents using banker rounding."""\n    return round(value, 2)\n\n\ndef add(a, b):\n    return a + b\n',
+  };
+
+  it("names the symbol around a traceback frame, with its line range", async () => {
+    const root = repo(MORE);
+    const res = await localize(
+      root,
+      'Crash:\nTraceback (most recent call last):\n  File "textkit/money.py", line 3, in round_half\nTypeError: bad',
+      null,
+      { runSnippets: false },
+    );
+    expect(res.files[0]!.path).toBe("textkit/money.py");
+    expect(res.symbols[0]).toBe("round_half (textkit/money.py:1-3)");
+  });
+
+  it("matches symbol docstrings when the issue never names the function", async () => {
+    const root = repo(MORE);
+    const res = await localize(root, "Currency amounts are rounded wrong: banker rounding to cents is off.", null, { runSnippets: false });
+    expect(res.files[0]!.path).toBe("textkit/money.py");
+    expect(res.files[0]!.why.join(" ")).toContain("round_half");
+  });
+
+  it("reuses its index across calls and sees edited files", async () => {
+    const root = repo(MORE);
+    const first = await localize(root, "`slugify` collapses separators", null, { runSnippets: false });
+    const again = await localize(root, "`slugify` collapses separators", null, { runSnippets: false });
+    expect(again).toEqual(first);
+    writeFileSync(path.join(root, "textkit/wrap.py"), "def wrap(text, width=70):\n    # zebra zebra zebra\n    return text\n");
+    const edited = await localize(root, "zebra zebra", null, { runSnippets: false });
+    expect(edited.files[0]!.path).toBe("textkit/wrap.py");
+  });
+
+  it("stops on abort", async () => {
+    const root = repo(MORE);
+    const ctl = new AbortController();
+    ctl.abort();
+    await expect(localize(root, "slugify", null, { runSnippets: false, signal: ctl.signal })).rejects.toThrow();
+  });
+});
