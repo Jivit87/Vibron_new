@@ -35,6 +35,7 @@ import { addStep, moveStep, removeStep, updateStep } from "@/lib/client/plan-edi
 import { activeTodos, tailWindow, type FeedItem } from "@/lib/client/run-reducer";
 import { contextFill, formatTok, formatUsd, runTotals, totalTokens } from "@/lib/client/usage";
 import { ContextMeter, fillTitle } from "@/components/vibe/usage-ui";
+import { LiveUsagePanel } from "@/components/vibe/LiveUsage";
 import {
   AttemptSeparator,
   CriteriaBlock,
@@ -82,6 +83,8 @@ export function AgentRunView({ run }: { run: RunState }) {
   return (
     <div className="flex flex-col gap-2">
       <RunHeader run={run} />
+
+      <LiveUsagePanel run={run} />
 
       {fix && <FixPhases run={run} />}
 
