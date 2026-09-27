@@ -6,7 +6,7 @@
  *   viberon run --repo <path> (--task <spec> | --issue <spec> | --task-file <file>)
  *               [--worktree] [--keep-worktree] [--out <dir>] [--test-cmd <cmd>]
  *               [--no-gate] [--max-turns <n>] [--timeout <sec>] [--model <id>]
- *               [--task-id <id>] [--json] [--no-review] [--review-model <id>]
+ *               [--task-id <id>] [--json] [--thorough] [--no-review] [--review-model <id>]
  *               [--deliver [--issue-url <url>]]
  *   viberon review [--repo <path>] [--base <ref> | --pr <url>] [--model <id>] [--json]
  *   viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--no-deliver] [--model <id>] [--json]
@@ -29,8 +29,9 @@ export const USAGE = `Usage:
       --model <id>        model id (default $VIBERON_MODEL, else the best configured model)
       --task-id <id>      id used for the bundle directory
       --json              print result.json to stdout
-      --no-review         skip the reviewer (on by default: a cheap model reviews an accepted fix for
-                          missed sibling cases; a high finding sends it back once)
+      --thorough          criteria, blind test writer and reviewer from the start (default: one fast
+                          agent; they switch on automatically when an attempt ends without proof)
+      --no-review         never run the reviewer
       --review-model <id> model for the reviewer (default: the cheapest agentic model)
       --independent-test  generate and execute a blind issue test with local runner permissions
       --deliver           on a verified fix: branch viberon/<slug>, commit, push, open a draft PR
@@ -71,6 +72,7 @@ export interface RunArgs {
   deliver?: boolean;
   issueUrl?: string;
   review?: boolean;
+  thorough?: boolean;
   reviewModel?: string;
   independentTest?: boolean;
 }
@@ -134,7 +136,7 @@ export type CliArgs = RunArgs | ReviewArgs | IssuesArgs | CloneArgs | EvalArgs |
 
 export class CliError extends Error {}
 
-const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-review", "no-deliver", "independent-test", "gold"]);
+const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-review", "thorough", "no-deliver", "independent-test", "gold"]);
 
 function splitFlags(argv: string[]): { flags: Map<string, string | true>; positionals: string[] } {
   const flags = new Map<string, string | true>();
@@ -180,7 +182,7 @@ const KNOWN: Record<string, Set<string>> = {
   run: new Set([
     "repo", "task", "issue", "task-file", "task-id", "worktree", "keep-worktree", "out", "test-cmd",
     "no-gate", "max-turns", "timeout", "model", "json", "help", "deliver", "issue-url",
-    "review", "no-review", "review-model", "independent-test",
+    "review", "no-review", "thorough", "review-model", "independent-test",
   ]),
   review: new Set(["repo", "base", "pr", "model", "json", "help"]),
   issues: new Set(["repo", "label", "fix", "no-deliver", "model", "json", "help"]),
@@ -236,8 +238,8 @@ export function parseCliArgs(argv: string[]): CliArgs {
       json: flags.has("json"),
       ...(flags.has("deliver") ? { deliver: true } : {}),
       ...(issueUrl ? { issueUrl } : {}),
-      // The reviewer is on by default: it is the layer that catches incomplete fixes.
-      review: !flags.has("no-review"),
+      ...(flags.has("no-review") ? { review: false } : {}),
+      ...(flags.has("thorough") ? { thorough: true } : {}),
       ...(reviewModel ? { reviewModel } : {}),
       ...(flags.has("independent-test") ? { independentTest: true } : {}),
     };
@@ -364,6 +366,7 @@ export async function main(argv: string[]): Promise<number> {
       deliver: args.deliver,
       issueUrl: args.issueUrl,
       review: args.review,
+      thorough: args.thorough,
       reviewModel: args.reviewModel,
       independentTest: args.independentTest,
     });

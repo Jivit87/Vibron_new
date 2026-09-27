@@ -573,12 +573,13 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
     // Setup runs concurrently where the data allows. Localize waits for the
     // snapshot because its snippet runs execute in the tree.
     const setupStarted = Date.now();
-    const criteriaP =
-      options.criteria === false
-        ? Promise.resolve<string[]>([])
-        : timed("criteria", () =>
-            predictCriteria({ task: options.task, model: options.reviewModel, signal: options.signal, onTurn: account }),
-          ).catch((): string[] => []);
+    const thorough = options.mode === "thorough";
+    let criteriaP: Promise<string[]> | null = null;
+    const startCriteria = (): Promise<string[]> =>
+      (criteriaP ??= timed("criteria", () =>
+        predictCriteria({ task: options.task, model: options.reviewModel, signal: options.signal, onTurn: account }),
+      ).catch((): string[] => []));
+    if (options.criteria ?? thorough) startCriteria();
     const baseRefP = ensureScratch(workRoot).then(() => snapshot(workRoot));
     const engineP = prepareEngine(options);
     const services = verifyServices(options.verifyServices);
@@ -624,21 +625,24 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
     // must not hold the loop. Wait a short grace; if they arrive later they are
     // appended to the agent's next turn (append-only, so the prompt cache holds).
     let criteria: string[] = [];
-    let criteriaLate = false;
-    const early = await Promise.race([
-      criteriaP.then((items) => ({ items })),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), CRITERIA_GRACE_MS)),
-    ]);
-    if (early) criteria = early.items;
-    else criteriaLate = true;
-    const criteriaReady = criteriaP.then((items) => {
-      criteria = items;
-      result.criteria = items;
-      if (items.length) emit({ type: "criteria", items });
-      if (criteriaLate && items.length) activeController?.addNote(`[harness] ${renderCriteria(items)}`);
-      return items;
-    });
-    if (!criteriaLate) await criteriaReady;
+    let criteriaReady: Promise<string[]> = Promise.resolve([]);
+    /** Wait a short grace for the criteria; later ones are appended to the active attempt. */
+    const settleCriteria = async (pending: Promise<string[]>): Promise<void> => {
+      let late = false;
+      criteriaReady = pending.then((items) => {
+        criteria = items;
+        result.criteria = items;
+        if (items.length) emit({ type: "criteria", items });
+        if (late && items.length) activeController?.addNote(`[harness] ${renderCriteria(items)}`);
+        return items;
+      });
+      const early = await Promise.race([
+        criteriaReady.then(() => true),
+        new Promise<false>((resolve) => setTimeout(() => resolve(false), CRITERIA_GRACE_MS)),
+      ]);
+      late = !early;
+    };
+    if (criteriaP) await settleCriteria(criteriaP);
     endPhase("setup", setupStarted);
     const test = gate.testCommand;
     const overview = [
@@ -674,15 +678,15 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         return null;
       }
     };
-    const writerOn = options.independentTest ?? options.verify.enabled;
+    let writerOn = options.independentTest ?? (thorough && options.verify.enabled);
     /**
      * The blind test writer is blind, so it does not wait for a patch: it
      * drafts its test now, in a throwaway checkout of the original code,
      * while the solver works. It never fails the solve.
      */
-    const draftP: Promise<IndependentDraft | null> = !writerOn
-      ? Promise.resolve(null)
-      : Promise.race([criteriaReady, new Promise((resolve) => setTimeout(resolve, CRITERIA_GRACE_MS))])
+    let draftP: Promise<IndependentDraft | null> | null = null;
+    const startDraft = (): Promise<IndependentDraft | null> =>
+      (draftP ??= Promise.race([criteriaReady, new Promise((resolve) => setTimeout(resolve, CRITERIA_GRACE_MS))])
           .then(() =>
             timed("testWriter", () =>
               draftIndependentTest({
@@ -711,10 +715,13 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
               }),
             ),
           )
-          .catch(() => null);
+          .catch(() => null));
+    if (writerOn) startDraft();
+    let reviewOn = options.review ?? thorough;
+    let escalated = thorough;
     /** Run the drafted blind test on the accepted change (original ∥ patched). */
     const independentAttempt = async (): Promise<IndependentTestOutcome> => {
-      const draft = await draftP;
+      const draft = await startDraft();
       if (!draft) return { status: "inconclusive", reason: "The independent writer gave up without a test command." };
       try {
         return await runIndependentTest(workRoot, draft, (command) => gate.compareIndependent(command), emit);
@@ -871,7 +878,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
       // After a strong accept, once: the blind test writer and the reviewer run
       // concurrently, and together they can send the agent back once.
       if (
-        (writerOn || options.review) &&
+        (writerOn || reviewOn) &&
         !postChecked &&
         !reviewPass &&
         verification?.strength === "strong" &&
@@ -884,7 +891,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
           const accepted = verification;
           const [blind, finding] = await Promise.all([
             writerOn ? timed("independentRun", () => independentAttempt()) : null,
-            options.review ? timed("review", () => reviewAttempt(record, accepted)) : null,
+            reviewOn ? timed("review", () => reviewAttempt(record, accepted)) : null,
           ]);
           if (blind) result.independentTest = blind;
           const failing = blind?.status === "still_failing" || blind?.status === "regression" ? blind : null;
@@ -916,6 +923,16 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
       }
       if (reviewPass || !options.verify.enabled || verification?.strength === "strong" || run.error === "cancelled") break;
       lessons = lessonsFrom(record);
+      // Fast path missed: switch on the evidence layers for the retry.
+      if (!escalated && n < maxAttempts) {
+        escalated = true;
+        if (options.criteria !== false && !criteriaP) await settleCriteria(startCriteria());
+        if (options.independentTest !== false) {
+          writerOn = true;
+          startDraft();
+        }
+        if (options.review !== false) reviewOn = true;
+      }
       retryReason = `Attempt ${n} ended without proof (${verification ? `gate: ${verification.decision}` : record.stopReason}); retrying from a fresh context with its diff as a rejected alternative.`;
     }
 

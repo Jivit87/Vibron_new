@@ -44,7 +44,6 @@ describe("parseCliArgs", () => {
       timeoutSec: 300,
       model: "openai:gpt-x",
       json: true,
-      review: true,
     });
   });
 

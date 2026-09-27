@@ -187,7 +187,6 @@ export async function POST(request: Request) {
             budget: { maxTurns: 40 },
             verify: { enabled: true, commands, timeoutMs: 300_000, baseline: true },
             useRepoRules: true,
-            review: true,
             // Run memory: the next task on the same area sees what was fixed and why.
             onSolved: (solved) => {
               if (!solved.filesChanged.length) return;

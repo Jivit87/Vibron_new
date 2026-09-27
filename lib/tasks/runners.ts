@@ -80,7 +80,6 @@ async function fixIn(
     budget: { maxTurns: 40 },
     verify: { enabled: true, commands, timeoutMs: 300_000, baseline: true },
     useRepoRules: true,
-    review: true,
     onSolved: (solved) => {
       if (!solved.filesChanged.length) return;
       recordFixNote(memoryRoot, {

@@ -8,7 +8,7 @@ import { resetMemoryStoreForTests } from "@/lib/store";
 import { openWorkspace } from "@/lib/workspace";
 import { installFakeProvider, uninstallFakeProvider, type ScriptedTurn } from "./helpers/fake-provider";
 import { eventLog } from "./helpers/harness-workspace";
-import { routed } from "./helpers/routed";
+import { routed, whoAsked } from "./helpers/routed";
 import { makeTmpRepo, shellRunner, type TmpRepo } from "./helpers/tmp-repo";
 
 const ORIGINAL = "exports.mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;";
@@ -268,5 +268,49 @@ describe("solve-loop reviewer", () => {
     expect(started.solver!).toBeLessThan(started.criteria! + 2_500);
     expect(result.metrics.phaseMs?.setup ?? Infinity).toBeLessThan(result.metrics.phaseMs?.criteria ?? 0);
     expect(fake.remaining).toBe(0);
+  });
+
+  it("fast by default: a clear fix proven on the first try makes no side calls", async () => {
+    const fake = installFakeProvider(routed({
+      solver: [
+        // One turn: reproduction, fix and finish together.
+        { calls: [
+          { name: "create_file", input: { path: REPRO_PATH, content: "require('assert').strictEqual(require('../../lib').mean([]), 0);\n" } },
+          { name: "edit_file", input: { path: "lib.js", find: ORIGINAL, replace: FIXED, summary: "fix" } },
+          { name: "finish", input: { summary: "fixed", reproduction: REPRO } },
+        ] },
+      ],
+    }));
+    const result = await solveTask(await options({ criteria: undefined, independentTest: undefined }));
+    expect(result.status).toBe("resolved");
+    expect(fake.requests.map(whoAsked)).toEqual(["solver"]);
+    expect(result.metrics.modelCalls).toBe(1);
+    expect(log.of("criteria")).toHaveLength(0);
+    expect(log.of("independent_test")).toHaveLength(0);
+  });
+
+  it("escalates when an attempt ends without proof: the retry gets criteria, the blind writer and the reviewer", async () => {
+    const fake = installFakeProvider(routed({
+      solver: [
+        // Attempt 1 never finishes (no proof).
+        { text: "I think it is fine." },
+        { text: "Done." },
+        // Attempt 2, fresh context.
+        { calls: [
+          { name: "create_file", input: { path: REPRO_PATH, content: "require('assert').strictEqual(require('../../lib').mean([]), 0);\n" } },
+          { name: "edit_file", input: { path: "lib.js", find: ORIGINAL, replace: FIXED, summary: "fix" } },
+          { name: "finish", input: { summary: "fixed", reproduction: REPRO } },
+        ] },
+      ],
+      criteria: [{ text: "1. mean([]) -> 0" }],
+      writer: writer("require('node:assert/strict').equal(require('../../lib').mean([]), 0);\n"),
+      reviewer: [review("low")],
+    }));
+    const result = await solveTask(await options({ criteria: undefined, independentTest: undefined, reviewModel: "claude-haiku-4-5" }));
+    expect(result.status).toBe("resolved");
+    const asked = new Set(fake.requests.map(whoAsked));
+    expect([...asked].sort()).toEqual(["criteria", "reviewer", "solver", "writer"]);
+    expect(result.criteria).toEqual(["mean([]) -> 0"]);
+    expect(result.independentTest?.status).toBe("fixes");
   });
 });

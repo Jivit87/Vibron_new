@@ -27,14 +27,15 @@ describe("parseCliArgs: deliver and review", () => {
     expect(() => parseCliArgs(["review", "--base", "main", "--pr", "x"])).toThrow(CliError);
   });
 
-  it("reviews by default; --no-review turns it off; --review-model picks the reviewer", () => {
-    expect(parseCliArgs(["run", "--repo", "/r", "--task", "t"])).toMatchObject({ review: true });
-    expect(parseCliArgs(["run", "--repo", "/r", "--task", "t", "--review-model", "m"])).toMatchObject({
-      review: true,
-      reviewModel: "m",
-    });
-    expect(parseCliArgs(["run", "--repo", "/r", "--task", "t", "--no-review"])).toMatchObject({ review: false });
-    expect(() => parseCliArgs(["run", "--repo", "/r", "--task", "t", "--no-review", "--review-model", "m"])).toThrow(CliError);
+  it("fast by default; --thorough and --no-review are explicit choices", () => {
+    const base = ["run", "--repo", "/r", "--task", "t"];
+    const plain = parseCliArgs(base);
+    expect(plain).not.toHaveProperty("review");
+    expect(plain).not.toHaveProperty("thorough");
+    expect(parseCliArgs([...base, "--thorough"])).toMatchObject({ thorough: true });
+    expect(parseCliArgs([...base, "--no-review"])).toMatchObject({ review: false });
+    expect(parseCliArgs([...base, "--review-model", "m"])).toMatchObject({ reviewModel: "m" });
+    expect(() => parseCliArgs([...base, "--no-review", "--review-model", "m"])).toThrow(CliError);
   });
 
   it("review: exit 0 with nothing to review, 2 on a bad base ref", async () => {

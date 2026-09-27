@@ -89,11 +89,21 @@ export function claudeCliReady(): Promise<boolean> {
   return loginProbe.ready;
 }
 
-function childEnv(): NodeJS.ProcessEnv {
+function childEnv(request?: Pick<AiTurnRequest, "effort" | "maxTokens">): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   // A nested Claude Code session must not think it runs inside its parent.
   delete env.CLAUDECODE;
+  if (request) {
+    // Claude Code thinks by default and ignores the API's max_tokens. Measured
+    // on Haiku: default 766 output tokens / 9.9 s vs 306 / 5.7 s without
+    // thinking. Think only when the caller asks for high effort.
+    const deep = request.effort === "high" || request.effort === "xhigh" || request.effort === "max";
+    if (!deep && env.MAX_THINKING_TOKENS === undefined) env.MAX_THINKING_TOKENS = "0";
+    if (request.maxTokens && env.CLAUDE_CODE_MAX_OUTPUT_TOKENS === undefined) {
+      env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(request.maxTokens);
+    }
+  }
   return env;
 }
 
@@ -125,9 +135,15 @@ interface CliOutcome {
   stderr: string;
 }
 
-function runCli(bin: string, args: string[], input: string, signal?: AbortSignal): Promise<CliOutcome> {
+function runCli(
+  bin: string,
+  args: string[],
+  input: string,
+  signal?: AbortSignal,
+  env: NodeJS.ProcessEnv = childEnv(),
+): Promise<CliOutcome> {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, { cwd: os.tmpdir(), env: childEnv(), stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(bin, args, { cwd: os.tmpdir(), env, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const timeoutMs = Number(process.env.VIBERON_CLAUDE_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
@@ -226,6 +242,7 @@ export const claudeCliProvider: AiProvider = {
         ],
         prompt,
         request.signal,
+        childEnv(request),
       );
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") throw error;

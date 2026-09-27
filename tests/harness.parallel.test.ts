@@ -93,6 +93,7 @@ describe("parallel setup (W2)", () => {
       handle: await openWorkspace(meta.repoKey),
       task: "mean([]) returns NaN instead of 0.",
       model: "claude-opus-5",
+      criteria: true,
       emit: (event) => {
         at.push({ type: event.type, t: Date.now() });
         log.emit(event);
