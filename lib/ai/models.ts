@@ -49,6 +49,23 @@ export interface ModelSpec {
 
 export const MODELS: ModelSpec[] = [
   {
+    // Thinking is always on (it cannot be disabled) and effort defaults to
+    // "medium" on the API; frontier-tier `defaultEffort` sends "high".
+    id: "claude-opus-5-5",
+    provider: "anthropic",
+    label: "Claude Opus 5.5",
+    blurb: "Newest Opus: strongest agentic coding at a lower price than Opus 5. Runs at high effort.",
+    tier: "frontier",
+    contextWindow: 1_000_000,
+    maxOutput: 128_000,
+    defaultMaxOutput: 64_000,
+    pricing: { input: 4, output: 20 },
+    supportsEffort: true,
+    supportsThinking: true,
+    supportsCaching: true,
+    agentic: true,
+  },
+  {
     id: "claude-opus-5",
     provider: "anthropic",
     label: "Claude Opus 5",

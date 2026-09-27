@@ -495,7 +495,7 @@ function StatusBar() {
         <span className="font-mono">{fileList.length} files</span>
       </StatusItem>
       <StatusItem title="Model" onClick={() => useViberon.getState().openSettingsTab()}>
-        {settings.model === "auto" ? "Auto model" : settings.model}
+        {settings.model === "auto" ? "Auto model" : settings.model.replace(/^(gemini|nvidia|openai):/, "")}
       </StatusItem>
     </footer>
   );
