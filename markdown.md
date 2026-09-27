@@ -170,3 +170,4 @@ Status: **built** = merged on main with tests green · **in progress** = an agen
     - target related tests down to the changed symbols, with a time cap;
     - keep a persistent CLI session so turns send only new content;
     - make large-repo exploration cheaper.
+- **2026-09-27:** Merged "Parallel specialists" up to 10 (`lib/limits.ts`; a test proves 10 are in flight at once) and explicit re-fix. Clicking Fix re-runs even when the issue already has a PR: it updates the open PR on the stable branch; if that PR was merged it opens a new PR from a fresh base without force-pushing; a queued or running fix blocks a duplicate; the watcher still skips issues already fixed. 958 tests pass; clean build is green.
