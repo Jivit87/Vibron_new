@@ -5,7 +5,7 @@
  */
 
 import { DeliverError } from "@/lib/deliver/errors";
-import { parseGitHubIssueUrl } from "@/lib/github";
+import { parseGitHubIssueRef } from "@/lib/github";
 import { createIssueComment, parsePrUrl, type ApiOptions } from "@/lib/github-api";
 import type { SolveResult } from "@/lib/harness/solve-types";
 import { STATUS_TEXT } from "@/lib/headless/report";
@@ -105,7 +105,7 @@ export function titleFromTask(task: string): string {
 
 /** `Fixes owner/repo#N`: the form GitHub documents for closing an issue on merge. */
 function closingLine(issueUrl: string): string {
-  const issue = parseGitHubIssueUrl(issueUrl);
+  const issue = parseGitHubIssueRef(issueUrl);
   return issue ? `Fixes ${issue.owner}/${issue.repo}#${issue.number}` : `Fixes ${issueUrl}`;
 }
 
@@ -127,8 +127,8 @@ export async function reportOnIssue(
   input: { issueUrl: string; prUrl: string; summary: string; evidence: DeliveryEvidence },
   opts?: ApiOptions,
 ): Promise<{ commentUrl: string }> {
-  const issue = parseGitHubIssueUrl(input.issueUrl);
-  if (!issue) throw new DeliverError("issueUrl must be a GitHub issue URL.", "invalid_input", 400);
+  const issue = parseGitHubIssueRef(input.issueUrl);
+  if (!issue) throw new DeliverError("issueUrl must be a GitHub issue URL or owner/repo#N.", "invalid_input", 400);
   if (!parsePrUrl(input.prUrl)) throw new DeliverError("prUrl must be a GitHub pull request URL.", "invalid_input", 400);
   const body = [
     `Viberon opened a pull request for this issue: ${input.prUrl}`,

@@ -52,6 +52,28 @@ export function parseGitHubIssueUrl(
   return { owner: match[1]!, repo: match[2]!.replace(/\.git$/, ""), number: Number(match[3]) };
 }
 
+const SHORT_ISSUE_RE = /^([\w.-]+)\/([\w.-]+)#(\d+)$/;
+
+/**
+ * An issue named either way people write it: its URL, or `owner/repo#N`
+ * (Pramana `repo/issue.py`). Null for anything else.
+ */
+export function parseGitHubIssueRef(
+  value: string,
+): { owner: string; repo: string; number: number } | null {
+  const url = parseGitHubIssueUrl(value);
+  if (url) return url;
+  const short = SHORT_ISSUE_RE.exec(value.trim());
+  if (!short || short[1]!.startsWith(".")) return null;
+  return { owner: short[1]!, repo: short[2]!.replace(/\.git$/, ""), number: Number(short[3]) };
+}
+
+/** The canonical issue URL for a URL or `owner/repo#N`; null when neither. */
+export function issueUrlFromRef(value: string): string | null {
+  const ref = parseGitHubIssueRef(value);
+  return ref ? `https://github.com/${ref.owner}/${ref.repo}/issues/${ref.number}` : null;
+}
+
 /**
  * Fetch an issue (or PR) through the REST API. `token` (default
  * `GITHUB_TOKEN`) is optional: it raises the rate limit and reaches private
