@@ -372,7 +372,23 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
    */
   let compact = false;
 
+  /**
+   * Built once per mode and then frozen. The repo map and memory render
+   * from live state (an edit adds symbols to the graph), and a system block
+   * that changed mid-run would invalidate the whole cached prefix on the
+   * next turn. The agent sees its own edits in its tool results.
+   */
+  const systemByMode = new Map<boolean, AiSystemBlock[]>();
   function buildSystem(): AiSystemBlock[] {
+    let blocks = systemByMode.get(compact);
+    if (!blocks) {
+      blocks = renderSystem();
+      systemByMode.set(compact, blocks);
+    }
+    return blocks;
+  }
+
+  function renderSystem(): AiSystemBlock[] {
     const blocks: AiSystemBlock[] = compact
       ? [
           { text: compactSystemPrompt(role) },

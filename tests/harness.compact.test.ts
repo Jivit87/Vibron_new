@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { AiMessage } from "@/lib/ai/types";
-import { elideOldToolResults, summarizeHistory, summaryModel } from "@/lib/harness/compact";
+import { elideOldToolResults, pruneTranscript, summarizeHistory, summaryModel, withoutStaleThinking } from "@/lib/harness/compact";
 import { installFakeProvider, uninstallFakeProvider } from "./helpers/fake-provider";
 
 afterEach(() => uninstallFakeProvider());
@@ -57,5 +57,54 @@ describe("summarizeHistory", () => {
     }
     expect(pairsIntact(messages)).toBe(true);
     expect(messages).toHaveLength(1 + 6 * 2);
+  });
+});
+
+describe("preserved thinking", () => {
+  const hasThinking = (m: AiMessage) => m.content.some((b) => b.type === "thinking" || b.type === "redacted_thinking");
+
+  it("drops thinking at or before the last pruned message but keeps the latest assistant turn's", () => {
+    const payload = "x".repeat(5_000);
+    const messages: AiMessage[] = [{ role: "user", content: [{ type: "text", text: "the task" }] }];
+    for (let i = 0; i < 4; i += 1) {
+      messages.push({
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: `plan ${i}`, signature: `sig${i}` },
+          { type: "tool_use", id: `w${i}`, name: "write_file", input: { path: `f${i}.ts`, content: payload } },
+        ],
+      });
+      messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: `w${i}`, content: "ok" }] });
+    }
+    const pruned = pruneTranscript(messages);
+    // Turns 0 and 1 (indices 1 and 3) are older than the last two: their payloads become stubs.
+    expect(pruned.stubbed).toBe(2);
+    const lastEdited = pruned.messages.map((m, i) => m !== messages[i]).lastIndexOf(true);
+    expect(lastEdited).toBe(3);
+    pruned.messages.forEach((m, i) => {
+      if (m.role === "assistant" && i <= lastEdited) expect(hasThinking(m)).toBe(false);
+    });
+    expect(hasThinking(pruned.messages[5])).toBe(true);
+    expect(hasThinking(pruned.messages[7])).toBe(true);
+    expect(pairsIntact(pruned.messages)).toBe(true);
+  });
+
+  it("keeps the latest assistant turn's thinking even inside the edited region", () => {
+    const edited: AiMessage[] = [
+      { role: "user", content: [{ type: "text", text: "rewritten task" }] },
+      { role: "assistant", content: [{ type: "redacted_thinking", data: "opaque" }, { type: "text", text: "a" }] },
+    ];
+    const before: AiMessage[] = [{ role: "user", content: [{ type: "text", text: "the task" }] }, edited[1]];
+    expect(withoutStaleThinking(before, edited)[1]).toBe(edited[1]);
+  });
+
+  it("leaves thinking alone when nothing was edited", () => {
+    const messages: AiMessage[] = [
+      { role: "user", content: [{ type: "text", text: "the task" }] },
+      { role: "assistant", content: [{ type: "redacted_thinking", data: "opaque" }, { type: "text", text: "hi" }] },
+      { role: "user", content: [{ type: "text", text: "more" }] },
+    ];
+    expect(pruneTranscript(messages).messages).toEqual(messages);
+    expect(hasThinking(elideOldToolResults(messages).messages[1])).toBe(true);
   });
 });

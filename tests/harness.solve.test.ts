@@ -9,7 +9,8 @@ import { registerLocalWorkspace } from "@/lib/local-disk-workspace";
 import { resetMemoryStoreForTests } from "@/lib/store";
 import type { VerifyCommand } from "@/lib/verify/types";
 import { openWorkspace } from "@/lib/workspace";
-import { installFakeProvider, uninstallFakeProvider } from "./helpers/fake-provider";
+import type { AiTurnRequest } from "@/lib/ai/types";
+import { installFakeProvider, uninstallFakeProvider, type ScriptedTurn } from "./helpers/fake-provider";
 import { eventLog } from "./helpers/harness-workspace";
 import { makeTmpRepo, shellRunner, type TmpRepo } from "./helpers/tmp-repo";
 
@@ -55,8 +56,24 @@ async function options(overrides: Partial<SolveOptions> = {}): Promise<SolveOpti
     verify: { enabled: true, commands: SUITE, timeoutMs: 30_000, baseline: true },
     runCheck: shellRunner,
     verifyServices: { relatedTestFiles: async () => ["test/lib.test.js"] },
+    // Opt-in per test: both add model calls ahead of or after the scripted solver turns.
+    criteria: false,
+    independentTest: false,
     ...overrides,
   };
+}
+
+const BLIND_PATH = ".viberon/scratch/test_independent.js";
+const BLIND = `node ${BLIND_PATH}`;
+/** The blind writer's two turns: write the test in scratch, then `done`. */
+function writer(script: string, check?: (req: AiTurnRequest) => void): ScriptedTurn[] {
+  return [
+    (req) => {
+      check?.(req);
+      return { calls: [{ name: "create_file", input: { path: BLIND_PATH, content: script } }] };
+    },
+    { calls: [{ name: "done", input: { command: BLIND } }] },
+  ];
 }
 
 describe("solveTask", () => {
@@ -68,18 +85,22 @@ describe("solveTask", () => {
         { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
       ] },
       { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
-      (req) => {
+      ...writer(script, (req) => {
         const prompt = JSON.stringify(req.messages);
-        expect(prompt).toContain(ORIGINAL_LINE);
+        expect(prompt).toContain("mean([]) returns NaN");
         expect(prompt).not.toContain(RIGHT_LINE);
-        return { text: JSON.stringify({ language: "javascript", test: script }) };
-      },
+        expect(JSON.stringify(req.system)).toContain("independent QA engineer");
+      }),
     ]);
     const result = await solveTask(await options({ independentTest: true }));
     expect(result.status).toBe("resolved");
-    expect(result.independentTest).toMatchObject({ status: "fixes" });
-    expect(result.metrics.modelCalls).toBe(3);
-    expect(fake.requests).toHaveLength(3);
+    expect(result.independentTest).toMatchObject({ status: "fixes", command: BLIND });
+    expect(result.metrics.modelCalls).toBe(4);
+    expect(fake.requests).toHaveLength(4);
+    // The blind test lives in scratch: never part of the patch.
+    expect(result.filesChanged).toEqual(["lib.js"]);
+    expect(log.of("independent_test").map((e) => e.status)).toEqual(["written", "ran"]);
+    expect(Object.keys(result.metrics.phaseMs ?? {}).sort()).toEqual(["gate", "localize", "loop", "setup", "testWriter"]);
   });
 
   it("uses a failing blind test to send the solver back for a sibling case", async () => {
@@ -91,7 +112,7 @@ describe("solveTask", () => {
         { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: incomplete, summary: "partial" } },
       ] },
       { calls: [{ name: "finish", input: { summary: "partial", reproduction: REPRO } }] },
-      { text: JSON.stringify({ language: "javascript", test: blind }) },
+      ...writer(blind),
       (req) => {
         expect(JSON.stringify(req.messages)).toMatch(/independent regression test.*fails/i);
         return { calls: [{ name: "edit_file", input: { path: "lib.js", find: incomplete, replace: RIGHT_LINE, summary: "sibling" } }] };
@@ -102,6 +123,53 @@ describe("solveTask", () => {
     expect(result.status).toBe("resolved");
     expect(result.independentTest?.status).toBe("passes");
     expect(repo.read("lib.js")).toBe(`${RIGHT_LINE}\n`);
+    expect(log.of("agent_start").map((a) => a.title)).toEqual(["Solve task", "Independent test (blind)", "Address independent test failure"]);
+  });
+
+  it("predicts acceptance criteria alongside setup and frames them as a prediction for the solver", async () => {
+    const fake = installFakeProvider([
+      (req) => {
+        expect(req.model).toBe("claude-haiku-4-5");
+        expect(req.tools ?? []).toEqual([]);
+        return { text: "Checklist:\n1. mean([]) -> 0\n2) mean([1, 2, 3]) -> 2 (unchanged)\nnot a criterion" };
+      },
+      (req) => {
+        const first = JSON.stringify(req.messages[0]);
+        expect(first).toContain("<predicted_acceptance_criteria>");
+        expect(first).toContain("MAY BE WRONG");
+        expect(first).toContain("1. mean([]) -> 0");
+        return { calls: [
+          { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+          { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
+        ] };
+      },
+      { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+    ]);
+    const result = await solveTask(await options({ criteria: true }));
+    expect(result.status).toBe("resolved");
+    expect(result.criteria).toEqual(["mean([]) -> 0", "mean([1, 2, 3]) -> 2 (unchanged)"]);
+    expect(log.of("criteria")).toEqual([{ type: "criteria", items: result.criteria }]);
+    expect(result.metrics.modelCalls).toBe(3);
+    expect(fake.remaining).toBe(0);
+    const phases = log.of("phase").map((p) => p.name);
+    expect(phases).toEqual(expect.arrayContaining(["criteria", "localize", "setup", "loop", "gate"]));
+    expect(phases.indexOf("setup")).toBeLessThan(phases.indexOf("loop"));
+    for (const name of ["criteria", "setup", "loop", "gate"]) expect(result.metrics.phaseMs?.[name]).toBeGreaterThanOrEqual(0);
+  });
+
+  it("skips the criteria call on error and still solves", async () => {
+    installFakeProvider([
+      { error: new Error("criteria model down") },
+      { calls: [
+        { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+        { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
+      ] },
+      { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+    ]);
+    const result = await solveTask(await options({ criteria: true }));
+    expect(result.status).toBe("resolved");
+    expect(result.criteria).toEqual([]);
+    expect(log.of("criteria")).toEqual([]);
   });
 
   it("reports a missing model credential as a setup error before any attempt", async () => {

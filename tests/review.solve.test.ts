@@ -50,9 +50,31 @@ async function options(overrides: Partial<SolveOptions> = {}): Promise<SolveOpti
     },
     runCheck: shellRunner,
     verifyServices: { relatedTestFiles: async () => ["test/lib.test.js"] },
+    criteria: false,
+    independentTest: false,
     ...overrides,
   };
 }
+
+type Who = "solver" | "writer" | "reviewer" | "criteria";
+const whoAsked = (req: AiTurnRequest): Who => {
+  const system = JSON.stringify(req.system);
+  if (system.includes("independent QA engineer")) return "writer";
+  if (system.includes("reviewing a code change")) return "reviewer";
+  if (system.includes("meticulous senior maintainer")) return "criteria";
+  return "solver";
+};
+/** The writer and the reviewer run concurrently: route each request to its own script. */
+function routed(queues: Partial<Record<Who, ScriptedTurn[]>>): ScriptedTurn[] {
+  const total = Object.values(queues).reduce((n, q) => n + q.length, 0);
+  return Array.from({ length: total }, () => (req: AiTurnRequest) => queues[whoAsked(req)]?.shift() ?? { text: "Done." });
+}
+
+const BLIND = "node .viberon/scratch/test_independent.js";
+const writer = (script: string): ScriptedTurn[] => [
+  { calls: [{ name: "create_file", input: { path: ".viberon/scratch/test_independent.js", content: script } }] },
+  { calls: [{ name: "done", input: { command: BLIND } }] },
+];
 
 const solve: ScriptedTurn[] = [
   {
@@ -83,17 +105,80 @@ describe("solve-loop reviewer", () => {
   it("keeps the earlier verified patch if review edits break the blind test", async () => {
     const broken = "exports.mean = (xs) => (xs.length ? (xs.length === 2 ? 999 : xs.reduce((a, b) => a + b, 0) / xs.length) : 0);";
     const blind = "const assert = require('node:assert/strict');\nconst { mean } = require('../../lib');\nassert.equal(mean([2, 4]), 3);\n";
-    installFakeProvider([
-      ...solve,
-      { text: JSON.stringify({ language: "javascript", test: blind }) },
-      review("high"),
-      { calls: [{ name: "edit_file", input: { path: "lib.js", find: FIXED, replace: broken, summary: "review edit" } }] },
-      { calls: [{ name: "finish", input: { summary: "reviewed", reproduction: REPRO } }] },
-    ]);
+    installFakeProvider(routed({
+      solver: [
+        ...solve,
+        { calls: [{ name: "edit_file", input: { path: "lib.js", find: FIXED, replace: broken, summary: "review edit" } }] },
+        { calls: [{ name: "finish", input: { summary: "reviewed", reproduction: REPRO } }] },
+      ],
+      writer: writer(blind),
+      reviewer: [review("high")],
+    }));
     const result = await solveTask(await options({ independentTest: true, review: true }));
     expect(result.status).toBe("resolved");
     expect(repo.read("lib.js")).toBe(`${FIXED}\n`);
     expect(result.independentTest?.status).toBe("passes");
+  });
+
+  it("runs the blind writer and the reviewer concurrently and merges them into one send-back", async () => {
+    const partial = "exports.mean = (xs) => (xs.length ? (xs.length === 2 ? 999 : xs.reduce((a, b) => a + b, 0) / xs.length) : 0);";
+    const blind = "const assert = require('node:assert/strict');\nconst { mean } = require('../../lib');\nassert.equal(mean([2, 4]), 3);\n";
+    const filler = Array.from({ length: 14 }, (_, i) => `// line ${i + 2}`).join("\n");
+    repo.write("lib.js", `${ORIGINAL}\n${filler}\nexports.median = (xs) => xs[Math.floor(xs.length / 2)];\n`);
+    const at = new Map<string, number>();
+    const emit = (event: Parameters<typeof log.emit>[0]) => {
+      if (event.type === "phase") at.set(event.name, Date.now());
+      log.emit(event);
+    };
+    const fake = installFakeProvider(routed({
+      solver: [
+        {
+          calls: [
+            { name: "create_file", input: { path: REPRO_PATH, content: "require('assert').strictEqual(require('../../lib').mean([]), 0);\n" } },
+            { name: "edit_file", input: { path: "lib.js", find: ORIGINAL, replace: partial, summary: "fix" } },
+          ],
+        },
+        solve[1],
+        (req) => {
+          const first = JSON.stringify(req.messages[0]);
+          expect(first).toContain("<independent_test>");
+          expect(first).toContain("<review>");
+          expect(first).toContain("Ternary hides intent");
+          return { calls: [{ name: "edit_file", input: { path: "lib.js", find: partial, replace: FIXED, summary: "sibling" } }] };
+        },
+        { calls: [{ name: "finish", input: { summary: "Both cases.", reproduction: REPRO } }] },
+      ],
+      writer: writer(blind),
+      reviewer: [
+        (req) => {
+          const user = JSON.stringify(req.messages[0]);
+          // Wide context (25 lines): unchanged sibling code 15 lines below the change is visible.
+          expect(user).toContain("exports.median");
+          expect(user).toContain("<evidence>");
+          expect(user).toContain("PROVES FIX");
+          expect(user).toContain("<predicted_acceptance_criteria>");
+          expect(JSON.stringify(req.system)).toContain("Predict the regression test the maintainers would add");
+          return review("high")(req);
+        },
+      ],
+      criteria: [{ text: "1. mean([]) -> 0\n2. mean([2, 4]) -> 3" }],
+    }));
+    const result = await solveTask(await options({ independentTest: true, review: true, criteria: true, emit, maxAttempts: 1 }));
+    expect(result.status).toBe("resolved");
+    expect(repo.read("lib.js")).toContain(FIXED);
+    expect(result.independentTest?.status).toBe("passes");
+    expect(fake.remaining).toBe(0);
+    // One follow-up in total, carrying both.
+    expect(log.of("agent_start").filter((a) => a.role === "solver").map((a) => a.title)).toEqual(["Solve task", "Address review finding"]);
+    expect(log.of("recovery").map((r) => r.failureClass).filter((c) => c !== "no_progress")).toEqual(["test_failure", "review"]);
+    // Overlap: each phase started before the other ended.
+    const phase = (name: string) => {
+      const ms = result.metrics.phaseMs?.[name] ?? 0;
+      return { end: at.get(name)!, start: at.get(name)! - ms };
+    };
+    const [w, r] = [phase("testWriter"), phase("review")];
+    expect(w.start).toBeLessThanOrEqual(r.end);
+    expect(r.start).toBeLessThanOrEqual(w.end);
   });
 
   it("sends an accepted change back once on a high finding and keeps the revised change", async () => {

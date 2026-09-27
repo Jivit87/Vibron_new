@@ -97,6 +97,8 @@ interface GitContext {
   env: NodeJS.ProcessEnv;
   /** Private index used for snapshots. */
   index: string;
+  /** Tail of the queue of operations on the private index (see `exclusive`). */
+  queue: Promise<unknown>;
 }
 
 const contexts = new Map<string, Promise<GitContext>>();
@@ -132,7 +134,7 @@ async function openContext(root: string): Promise<GitContext> {
       if (init.code !== 0) throw new GitError(`git init failed: ${init.stderr.slice(0, 500)}`);
     }
   }
-  const ctx: GitContext = { root, env, index };
+  const ctx: GitContext = { root, env, index, queue: Promise.resolve() };
   await ensureExclude(ctx, ownRepo);
   if (ownRepo && !existsSync(index)) {
     // Seed from the repo's own index: its stat cache spares re-hashing every file.
@@ -165,13 +167,26 @@ async function stage(ctx: GitContext): Promise<void> {
   await git(ctx, ["add", "-A", "--", ".", ...EXCLUDES], { GIT_INDEX_FILE: ctx.index });
 }
 
+/**
+ * Run `fn` alone on the private index. The harness runs phases concurrently
+ * (setup, the test writer beside the reviewer), and two `git add` calls on
+ * one index file collide on its lock.
+ */
+function exclusive<T>(ctx: GitContext, fn: () => Promise<T>): Promise<T> {
+  const next = ctx.queue.then(fn, fn);
+  ctx.queue = next.catch(() => undefined);
+  return next;
+}
+
 /* -------------------------------- API ------------------------------------ */
 
 /** A tree object of the current work tree (untracked files included, junk and `.viberon/` excluded). */
 export async function snapshot(root: string): Promise<string> {
   const ctx = await context(root);
-  await stage(ctx);
-  return (await git(ctx, ["write-tree"], { GIT_INDEX_FILE: ctx.index })).trim();
+  return exclusive(ctx, async () => {
+    await stage(ctx);
+    return (await git(ctx, ["write-tree"], { GIT_INDEX_FILE: ctx.index })).trim();
+  });
 }
 
 /** Unified diff from `fromRef` to `toRef` (default: the current work tree). */
@@ -184,8 +199,10 @@ export async function diff(
   const flags = ["--binary", "--no-color", "--no-ext-diff", "--no-renames", `-U${Math.max(0, options.context ?? 3)}`];
   const tail = options.paths?.length ? ["--", ...options.paths] : [];
   if (options.toRef) return git(ctx, ["diff", ...flags, fromRef, options.toRef, ...tail]);
-  await stage(ctx);
-  return git(ctx, ["diff", "--cached", ...flags, fromRef, ...tail], { GIT_INDEX_FILE: ctx.index });
+  return exclusive(ctx, async () => {
+    await stage(ctx);
+    return git(ctx, ["diff", "--cached", ...flags, fromRef, ...tail], { GIT_INDEX_FILE: ctx.index });
+  });
 }
 
 /** Files that differ between `fromRef` and `toRef` (default: the work tree), with A/M/D status. */
@@ -194,9 +211,9 @@ export async function changedFiles(root: string, fromRef: string, toRef?: string
   let out: string;
   if (toRef) out = await git(ctx, ["diff", "--name-status", "-z", "--no-renames", fromRef, toRef]);
   else {
-    await stage(ctx);
-    out = await git(ctx, ["diff", "--cached", "--name-status", "-z", "--no-renames", fromRef], {
-      GIT_INDEX_FILE: ctx.index,
+    out = await exclusive(ctx, async () => {
+      await stage(ctx);
+      return git(ctx, ["diff", "--cached", "--name-status", "-z", "--no-renames", fromRef], { GIT_INDEX_FILE: ctx.index });
     });
   }
   const parts = out.split("\0").filter(Boolean);
