@@ -3,7 +3,7 @@
  *
  * Streams SSE:
  *   {type:"progress", text}
- *   {type:"done", repoKey, rootPath, label, issue?: {title, body, url}, setupNotes?}
+ *   {type:"done", repoKey, rootPath, label, issue?: {title, body, url}, setupNotes?, probe?: RepoProbe}
  *   {type:"error", message}
  *
  * Clones into VIBERON_REPOS_DIR (default ~/Viberon/repos/<owner>__<name>),
@@ -61,6 +61,7 @@ export async function POST(request: Request) {
           label: result.label,
           ...(result.issue ? { issue: result.issue } : {}),
           ...(result.setupNotes ? { setupNotes: result.setupNotes } : {}),
+          ...(result.probe ? { probe: result.probe } : {}),
         });
       } catch (error) {
         send({ type: "error", message: error instanceof Error ? error.message : String(error) });

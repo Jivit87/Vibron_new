@@ -111,6 +111,24 @@ describe("clone to workspace", () => {
     expect(again.repoKey).toBe(repoKey);
   });
 
+  it("includes the environment probe in the SSE done event", async () => {
+    const bare = await bareRepo();
+    const events = await readSse(
+      await clonePost(
+        new Request("http://localhost/api/clone", {
+          method: "POST",
+          body: JSON.stringify({ url: bare, setup: false }),
+        }),
+      ),
+    );
+    const done = events.find((e) => e.type === "done")!;
+    expect(done.probe).toMatchObject({
+      primaryLanguage: "Python",
+      testFramework: "pytest",
+      testCommand: "python -m pytest -q",
+    });
+  });
+
   it("reports errors as SSE and fetches the issue for issue URLs", async () => {
     const bad = await readSse(
       await clonePost(
