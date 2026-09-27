@@ -175,3 +175,8 @@ Status: **built** = merged on main with tests green · **in progress** = an agen
 - **2026-09-27:** Merged E (one-call fast path, zero-token triage, give-up rules, targeted gate tests: related pytest narrowed to the changed defs, 120 s per side) and B (100k task token budget, fair per-issue share in batches, shared rate limiter, live `issue_progress`). Budgets now count input and output (not cache reads).
   - **Real result on config-merge** (claude-cli:sonnet, 2 runs): **11.7 s, 1 model call, about 3.4k tokens, 6/6 hidden, both runs**. Before the speed rounds: 117 s, 17 calls, about 80k tokens.
   - 978 tests pass; clean build is green.
+- **2026-09-27:** Merged the token diet T1–T5 and the ai-harness port P1–P10 (d9), with no conflicts.
+  - T1: CLI session reuse, stdin 50.8 KB → 7.8 KB per run. T2: tool defs −25%. T3: context slices −40%/−86%, localize stall 470 → 15 ms. T4: prompts −13–19%, `condenseIssueText`. T5: token bench plus budgets, re-baselined by the planner: never-edits 63 calls / 290k → 12 / 38k.
+  - P1–P10: evidence bundle, bench suites/sharding, related-test targets, compact search, shallow clone and probe, terminal output cleaning, idempotent PRs, capped lessons, run-history routes, port docs.
+  - Planner: CLI sessions are closed only after the last in-process solve (a batch runs concurrently). 1096 tests pass.
+  - 8 parallel agents are wiring the remaining P/T hooks.
