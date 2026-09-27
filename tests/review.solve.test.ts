@@ -53,6 +53,7 @@ async function options(overrides: Partial<SolveOptions> = {}): Promise<SolveOpti
     verifyServices: { relatedTestFiles: async () => ["test/lib.test.js"] },
     criteria: false,
     independentTest: false,
+    review: false,
     ...overrides,
   };
 }
@@ -270,7 +271,7 @@ describe("solve-loop reviewer", () => {
     expect(fake.remaining).toBe(0);
   });
 
-  it("fast by default: a clear fix proven on the first try makes no side calls", async () => {
+  it("fast by default: a clear fix proven on the first try costs one solver turn and one cheap review", async () => {
     const fake = installFakeProvider(routed({
       solver: [
         // One turn: reproduction, fix and finish together.
@@ -280,11 +281,12 @@ describe("solve-loop reviewer", () => {
           { name: "finish", input: { summary: "fixed", reproduction: REPRO } },
         ] },
       ],
+      reviewer: [review("low")],
     }));
-    const result = await solveTask(await options({ criteria: undefined, independentTest: undefined }));
+    const result = await solveTask(await options({ criteria: undefined, independentTest: undefined, review: undefined, reviewModel: "claude-haiku-4-5" }));
     expect(result.status).toBe("resolved");
-    expect(fake.requests.map(whoAsked)).toEqual(["solver"]);
-    expect(result.metrics.modelCalls).toBe(1);
+    expect(fake.requests.map(whoAsked)).toEqual(["solver", "reviewer"]);
+    expect(result.metrics.modelCalls).toBe(2);
     expect(log.of("criteria")).toHaveLength(0);
     expect(log.of("independent_test")).toHaveLength(0);
   });
@@ -306,7 +308,7 @@ describe("solve-loop reviewer", () => {
       writer: writer("require('node:assert/strict').equal(require('../../lib').mean([]), 0);\n"),
       reviewer: [review("low")],
     }));
-    const result = await solveTask(await options({ criteria: undefined, independentTest: undefined, reviewModel: "claude-haiku-4-5" }));
+    const result = await solveTask(await options({ criteria: undefined, independentTest: undefined, review: undefined, reviewModel: "claude-haiku-4-5" }));
     expect(result.status).toBe("resolved");
     const asked = new Set(fake.requests.map(whoAsked));
     expect([...asked].sort()).toEqual(["criteria", "reviewer", "solver", "writer"]);

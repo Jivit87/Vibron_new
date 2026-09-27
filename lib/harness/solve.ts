@@ -721,7 +721,10 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
           )
           .catch(() => null));
     if (writerOn) startDraft();
-    let reviewOn = options.review ?? thorough;
+    // The one cheap layer the fast path keeps: a reviewer call (~5 s on Haiku)
+    // after an accept. Evidence: the eval's only miss was an incomplete fix
+    // (sibling case) that the solver's own proof accepted.
+    let reviewOn = options.review ?? true;
     let escalated = thorough;
     /** Run the drafted blind test on the accepted change (original ∥ patched). */
     const independentAttempt = async (): Promise<IndependentTestOutcome> => {

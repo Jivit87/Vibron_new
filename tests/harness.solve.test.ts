@@ -57,9 +57,10 @@ async function options(overrides: Partial<SolveOptions> = {}): Promise<SolveOpti
     verify: { enabled: true, commands: SUITE, timeoutMs: 30_000, baseline: true },
     runCheck: shellRunner,
     verifyServices: { relatedTestFiles: async () => ["test/lib.test.js"] },
-    // Opt-in per test: both add model calls ahead of or after the scripted solver turns.
+    // Opt-in per test: each adds model calls ahead of or after the scripted solver turns.
     criteria: false,
     independentTest: false,
+    review: false,
     ...overrides,
   };
 }

@@ -51,9 +51,9 @@ export interface SolveOptions {
    * memory note is written here). Errors are swallowed; the run's result stands.
    */
   /**
-   * "fast" (default): one agent, no criteria / blind writer / reviewer up
-   * front; they switch on automatically when an attempt ends without strong
-   * proof. "thorough": all of them from the start (judged or high-stakes runs).
+   * "fast" (default): one agent plus one cheap reviewer call after an accept;
+   * criteria and the blind writer switch on automatically when an attempt
+   * ends without strong proof. "thorough": all of them from the start (judged or high-stakes runs).
    * Explicit `criteria` / `independentTest` / `review` values override both.
    */
   mode?: "fast" | "thorough";
