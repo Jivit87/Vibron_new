@@ -4,21 +4,23 @@
  * result. The real CLI (and the model) is never called.
  */
 
-import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { availableModels, classifyProviderError, ensureModelReady, resolveModel, runTurn } from "@/lib/ai";
-import { claudeCliProvider, claudeCliTesting } from "@/lib/ai/claude-cli";
+import { claudeCliProvider, claudeCliTesting, closeClaudeCliSessions } from "@/lib/ai/claude-cli";
 import { invalidateCredentialCache } from "@/lib/ai/credentials";
-import type { AiToolDef, AiTurnRequest } from "@/lib/ai/types";
+import type { AiToolDef, AiTurnRequest, AiTurnResult } from "@/lib/ai/types";
+import { countTokens } from "@/lib/tokens";
 
 const ENV_KEYS = [
   "AI_API_KEY", "AI_BASE_URL", "AI_MODEL", "AI_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
   "GROQ_API_KEY", "NVIDIA_API_KEY", "GEMINI_API_KEY", "DEEPSEEK_API_KEY", "VIBERON_MODEL",
   "VIBERON_STORE", "VIBERON_CLAUDE_BIN", "VIBERON_CLAUDE_CLI", "FAKE_CLAUDE_LOG", "FAKE_CLAUDE_OUT", "FAKE_CLAUDE_LOGGED_IN",
+  "CLAUDE_CONFIG_DIR", "FAKE_CLAUDE_CALLS", "VIBERON_CLAUDE_CLI_SESSIONS",
 ];
 const saved: Record<string, string | undefined> = {};
 
@@ -33,11 +35,33 @@ let stdin = "";
 process.stdin.on("data", (c) => (stdin += c));
 process.stdin.on("end", () => {
   const sysFile = args[args.indexOf("--system-prompt-file") + 1];
-  fs.writeFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
+  const entry = {
     args, stdin, cwd: process.cwd(), sysFile, system: fs.readFileSync(sysFile, "utf8"),
     anthropicKey: process.env.ANTHROPIC_API_KEY ?? null,
-  }));
-  process.stdout.write("warning: something first\\n" + process.env.FAKE_CLAUDE_OUT + "\\n");
+  };
+  fs.writeFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify(entry));
+  if (process.env.FAKE_CLAUDE_CALLS) fs.appendFileSync(process.env.FAKE_CLAUDE_CALLS, JSON.stringify(entry) + "\\n");
+  // Session files, like the real CLI: <config>/projects/<cwd slug>/<id>.jsonl.
+  const projects = require("node:path").join(process.env.CLAUDE_CONFIG_DIR, "projects", process.cwd().replace(/[^a-zA-Z0-9]/g, "-"));
+  const created = args.indexOf("--session-id");
+  const resumed = args.indexOf("--resume");
+  let sid = null;
+  if (created >= 0) {
+    sid = args[created + 1];
+    fs.mkdirSync(projects, { recursive: true });
+    fs.writeFileSync(projects + "/" + sid + ".jsonl", stdin);
+  } else if (resumed >= 0) {
+    sid = args[resumed + 1];
+    const file = projects + "/" + sid + ".jsonl";
+    if (!fs.existsSync(file)) {
+      process.stdout.write(JSON.stringify({ is_error: true, result: "No conversation found with session ID: " + sid }) + "\\n");
+      return;
+    }
+    fs.appendFileSync(file, stdin);
+  }
+  const out = JSON.parse(process.env.FAKE_CLAUDE_OUT);
+  if (sid && out.session_id === undefined) out.session_id = sid;
+  process.stdout.write("warning: something first\\n" + JSON.stringify(out) + "\\n");
 });
 `;
 
@@ -93,6 +117,7 @@ beforeEach(async () => {
   logFile = path.join(dir, "log.json");
   process.env.VIBERON_CLAUDE_BIN = bin;
   process.env.FAKE_CLAUDE_LOG = logFile;
+  process.env.CLAUDE_CONFIG_DIR = path.join(dir, "config");
   claudeCliTesting.reset();
   invalidateCredentialCache();
 });
@@ -114,11 +139,11 @@ describe("Claude CLI provider", () => {
     const seen = await recorded();
     expect(seen.args).toEqual([
       "-p", "--model", "sonnet", "--output-format", "json", "--tools", "", "--strict-mcp-config",
-      "--setting-sources", "", "--no-session-persistence", "--system-prompt-file", seen.sysFile,
+      "--setting-sources", "", "--session-id", claudeCliTesting.sessionIds()[0], "--system-prompt-file", seen.sysFile,
     ]);
     expect(seen.anthropicKey).toBeNull();
     expect(await import("node:fs/promises").then((fs) => fs.realpath(seen.cwd))).toBe(
-      await import("node:fs/promises").then((fs) => fs.realpath(os.tmpdir())),
+      await import("node:fs/promises").then((fs) => fs.realpath(path.join(os.tmpdir(), "viberon-claude-cli"))),
     );
     // The tool contract rides in the system prompt; the file is removed afterwards.
     expect(seen.system).toContain("You fix bugs.");
@@ -204,5 +229,165 @@ describe("Claude CLI provider", () => {
       configured: true,
     });
     expect(body.providers.map((p) => p.provider)).toContain("deepseek");
+  });
+});
+
+describe("Claude CLI session reuse", () => {
+  type Call = { args: string[]; stdin: string };
+  let callsFile = "";
+
+  beforeEach(() => {
+    callsFile = path.join(dir, "calls.jsonl");
+    process.env.FAKE_CLAUDE_CALLS = callsFile;
+  });
+
+  afterEach(async () => {
+    await closeClaudeCliSessions();
+  });
+
+  async function calls(): Promise<Call[]> {
+    if (!existsSync(callsFile)) return [];
+    return (await readFile(callsFile, "utf8")).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as Call);
+  }
+
+  const flag = (c: Call, name: string) => (c.args.includes(name) ? c.args[c.args.indexOf(name) + 1] : undefined);
+  const sessionFile = (id: string) => path.join(claudeCliTesting.projectDir(), `${id}.jsonl`);
+
+  /** Append the model's reply and a tool result for each of its calls, like the agent loop does. */
+  function extend(req: AiTurnRequest, result: AiTurnResult, output: string): AiTurnRequest {
+    return {
+      ...req,
+      messages: [
+        ...req.messages,
+        { role: "assistant", content: result.content },
+        { role: "user", content: result.toolCalls.map((c) => ({ type: "tool_result" as const, tool_use_id: c.id, content: output })) },
+      ],
+    };
+  }
+
+  const READ_REPLY = { result: 'Reading.\n<tool name="read_file">\n<path>b.py</path>\n</tool>', usage: { input_tokens: 1, output_tokens: 1 } };
+
+  it("turn 2 resumes the session and receives only the delta; files are deleted on close", async () => {
+    answer(READ_REPLY);
+    const r1 = request();
+    const t1 = await claudeCliProvider.runTurn(r1);
+    const r2 = extend(r1, t1, "def b(): return 2");
+    await claudeCliProvider.runTurn(r2);
+    const [c1, c2] = await calls();
+    const id = flag(c1!, "--session-id")!;
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(c1!.args).not.toContain("--no-session-persistence");
+    expect(c1!.stdin).toContain("Fix the parser.");
+    // Turn 2: same session, only the new tool result.
+    expect(flag(c2!, "--resume")).toBe(id);
+    expect(c2!.args).not.toContain("--session-id");
+    expect(c2!.stdin).toBe('=== USER ===\n<tool_result name="read_file">\ndef b(): return 2\n</tool_result>\n\n=== ASSISTANT ===\n');
+    expect(c2!.stdin).not.toContain("Fix the parser.");
+    // Isolation flags are kept on resumed turns.
+    for (const f of ["--tools", "--strict-mcp-config", "--setting-sources", "--system-prompt-file"]) expect(c2!.args).toContain(f);
+    expect(existsSync(sessionFile(id))).toBe(true);
+    await closeClaudeCliSessions();
+    expect(existsSync(sessionFile(id))).toBe(false);
+    expect(claudeCliTesting.sessionIds()).toEqual([]);
+  });
+
+  it("any history edit starts a NEW session with the full transcript and deletes the old one", async () => {
+    answer(READ_REPLY);
+    const r1 = request();
+    const t1 = await claudeCliProvider.runTurn(r1);
+    const r2 = extend(r1, t1, "def b(): return 2");
+    // Pruning: an earlier tool result is rewritten.
+    const pruned: AiTurnRequest = {
+      ...r2,
+      messages: r2.messages.map((m, i) =>
+        i === 2 ? { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "[pruned]" }] } : m,
+      ),
+    };
+    await claudeCliProvider.runTurn(pruned);
+    const [c1, c2] = await calls();
+    const first = flag(c1!, "--session-id")!;
+    const second = flag(c2!, "--session-id");
+    expect(second).toBeDefined();
+    expect(second).not.toBe(first);
+    expect(c2!.args).not.toContain("--resume");
+    expect(c2!.stdin).toContain("Fix the parser.");
+    expect(c2!.stdin).toContain("[pruned]");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(existsSync(sessionFile(first))).toBe(false);
+    expect(claudeCliTesting.sessionIds()).toEqual([second]);
+    // A different system prompt (e.g. escalation) never resumes either.
+    const t2 = await claudeCliProvider.runTurn({ ...extend(r1, t1, "x"), system: [{ text: "Other." }] });
+    expect(t2.text).toBe("Reading.");
+    expect((await calls())[2]!.args).toContain("--session-id");
+  });
+
+  it("a lost session falls back to a full re-send in the same turn", async () => {
+    answer(READ_REPLY);
+    const r1 = request();
+    const t1 = await claudeCliProvider.runTurn(r1);
+    const id = claudeCliTesting.sessionIds()[0]!;
+    await unlink(sessionFile(id));
+    const t2 = await claudeCliProvider.runTurn(extend(r1, t1, "out"));
+    expect(t2.toolCalls).toHaveLength(1);
+    const [, resumed, fresh] = await calls();
+    expect(flag(resumed!, "--resume")).toBe(id);
+    expect(flag(fresh!, "--session-id")).not.toBe(id);
+    expect(fresh!.stdin).toContain("Fix the parser.");
+  });
+
+  it("a failed or trimmed turn is never resumed; side calls (no tools) persist nothing", async () => {
+    // Hallucinated tool result trimmed from the reply: the CLI's copy differs, so drop it.
+    answer({ result: `${READ_REPLY.result}\n<tool_result>imagined</tool_result>` });
+    const r1 = request();
+    const t1 = await claudeCliProvider.runTurn(r1);
+    const id = flag((await calls())[0]!, "--session-id")!;
+    expect(claudeCliTesting.sessionIds()).toEqual([]);
+    expect(existsSync(sessionFile(id))).toBe(false);
+    answer(READ_REPLY);
+    const t2 = await claudeCliProvider.runTurn(extend(r1, t1, "out"));
+    expect((await calls())[1]!.args).toContain("--session-id");
+    // A failed resumed turn drops (and deletes) its session.
+    const live = claudeCliTesting.sessionIds()[0]!;
+    answer({ is_error: true, result: "API Error: 529 overloaded" });
+    await expect(claudeCliProvider.runTurn(extend(extend(r1, t1, "out"), t2, "more"))).rejects.toThrow(/Claude CLI/);
+    expect(flag((await calls())[2]!, "--resume")).toBe(live);
+    expect(claudeCliTesting.sessionIds()).toEqual([]);
+    expect(existsSync(sessionFile(live))).toBe(false);
+    // Side call without tools: no session at all.
+    answer({ result: "Summary." });
+    await claudeCliProvider.runTurn({ ...request("claude-cli:haiku"), tools: [] });
+    const side = (await calls()).at(-1)!;
+    expect(side.args).toContain("--no-session-persistence");
+    expect(side.args).not.toContain("--session-id");
+    expect(claudeCliTesting.sessionIds()).toEqual([]);
+  });
+
+  it("10-turn scripted run: bytes and tokens on stdin, full re-send vs session reuse", async () => {
+    const FILE = Array.from({ length: 60 }, (_, i) => `def f${i}(x):\n    return x + ${i}`).join("\n");
+    async function run(): Promise<string[]> {
+      await writeFile(callsFile, "");
+      let req = request();
+      for (let turn = 0; turn < 10; turn += 1) {
+        answer({ result: `Step ${turn}.\n<tool name="read_file">\n<path>f${turn}.py</path>\n</tool>` });
+        const res = await claudeCliProvider.runTurn(req);
+        req = extend(req, res, `${FILE}\n# file ${turn}`);
+      }
+      return (await calls()).map((c) => c.stdin);
+    }
+    process.env.VIBERON_CLAUDE_CLI_SESSIONS = "0";
+    const beforeIn = await run();
+    delete process.env.VIBERON_CLAUDE_CLI_SESSIONS;
+    const afterIn = await run();
+    const bytes = (xs: string[]) => xs.map((x) => Buffer.byteLength(x));
+    const sum = (xs: number[]) => xs.reduce((a, b) => a + b, 0);
+    const before = bytes(beforeIn);
+    const after = bytes(afterIn);
+    console.log(
+      `[claude-cli 10-turn] bytes/turn before=${before.join(",")} total=${sum(before)} tokens=${sum(beforeIn.map(countTokens))}\n` +
+        `[claude-cli 10-turn] bytes/turn after=${after.join(",")} total=${sum(after)} tokens=${sum(afterIn.map(countTokens))}`,
+    );
+    expect(after[0]).toBe(before[0]);
+    for (let i = 1; i < 10; i += 1) expect(after[i]).toBeLessThan(before[1]!);
+    expect(sum(after)).toBeLessThan(sum(before) / 3);
   });
 });
