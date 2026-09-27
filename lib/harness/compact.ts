@@ -20,6 +20,15 @@
  * rewrites the cached prefix, so on its own it only runs when it frees
  * enough to pay for that.
  *
+ * Cache rule: the prefix sent to the provider (system blocks, tools, every
+ * earlier message) changes ONLY at these boundaries: a compaction past the
+ * threshold, or a prune that frees at least PRUNE_MIN_SAVINGS once the
+ * transcript passes PRUNE_TRIGGER_TOKENS. Between them the transcript only
+ * grows; harness notes are appended to the newest tool result, and the
+ * runner freezes its system blocks for the run. `tests/harness.cache.test.ts`
+ * holds this. An edit also drops the thinking blocks in front of it
+ * (`withoutStaleThinking`), which models with preserved thinking require.
+ *
  * Never elided: the latest `finish` result (the gate's verdict and
  * feedback), the latest harness checkpoint, and `finish` inputs.
  */
@@ -114,6 +123,31 @@ function protectedResults(messages: AiMessage[]): Set<string> {
   return new Set([finish, checkpoint].filter((id): id is string => Boolean(id)));
 }
 
+const THINKING = new Set(["thinking", "redacted_thinking"]);
+
+/**
+ * Preserved thinking: models that validate replayed reasoning (Claude Opus
+ * 5.5, Fable 5.1) reject a request whose thinking blocks sit in front of an
+ * edited history. So once any earlier message is rewritten, thinking blocks
+ * are dropped from every assistant message at or before the last edited
+ * one, except the latest assistant turn, whose tool_use is still being
+ * answered. Returns `next` unchanged when nothing was edited.
+ */
+export function withoutStaleThinking(before: AiMessage[], next: AiMessage[]): AiMessage[] {
+  let lastEdited = -1;
+  next.forEach((m, i) => {
+    if (m !== before[i]) lastEdited = i;
+  });
+  if (lastEdited < 0) return next;
+  const latestAssistant = next.findLastIndex((m) => m.role === "assistant");
+  return next.map((message, index) => {
+    if (index > lastEdited || index === latestAssistant || message.role !== "assistant") return message;
+    const content = message.content.filter((block) => !THINKING.has(block.type));
+    if (content.length === message.content.length) return message;
+    return { ...message, content: content.length ? content : [{ type: "text", text: "(reasoning omitted)" }] };
+  });
+}
+
 /**
  * Stage 1. Returns a new transcript with old tool results replaced, and
  * how many tokens that removed (0 when there was nothing to elide).
@@ -147,7 +181,7 @@ export function elideOldToolResults(
     });
     return changed ? { ...message, content } : message;
   });
-  return { messages: next, removed };
+  return { messages: withoutStaleThinking(messages, next), removed };
 }
 
 function stubFor(name: string, path: string, text: string): string {
@@ -239,7 +273,7 @@ export function pruneTranscript(
     });
     return changed ? { ...message, content } : message;
   });
-  return { messages: next, removed, stubbed, staleViews };
+  return { messages: withoutStaleThinking(messages, next), removed, stubbed, staleViews };
 }
 
 /** The fastest model on the same provider, for summarizing. */

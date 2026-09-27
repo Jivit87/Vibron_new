@@ -143,22 +143,43 @@ function conventionBlock(root: string, files: string[]): string {
     : "";
 }
 
+/**
+ * The solve-loop framing (Pramana's reviewer): the change already passed the
+ * gate, so the reviewer hunts an INCOMPLETE fix. It predicts the
+ * maintainer's regression test and reads the unchanged code around each
+ * change (the caller passes a wide-context diff) for sibling cases the
+ * patch left untouched.
+ */
+const VERIFIED_STEPS = `The change already passed the harness's checks (see <evidence>); your job is to catch an INCOMPLETE fix. The diff has wide context, so you can see the unchanged code around each change. Before deciding:
+1. Predict the regression test the maintainers would add for this task: 3-6 concrete assertions covering every case in the task, the obvious sibling cases (related functions, classes, modes or arguments on the same code path) and behaviour that must stay unchanged. Predicted acceptance criteria, when given, are a starting point that may be wrong.
+2. Trace each assertion through the patched code.
+3. Check the fix is at the root cause, not a workaround in a caller or a special case of the example.
+4. Read the unchanged code around each change: a parallel construct that needed the same treatment and did not get it (a sibling setting, the other branch of the same if/else, another entry in the same table, the same pattern for a related type) is a defect; name it.
+Use severity "high" only for a concrete defect you can name (a failing assertion from step 1, a root-cause miss, a broken sibling case).`;
+
 export async function reviewDiff(
   input: ToolInput & {
     /** Workspace root: its `convention` memory notes for the changed files join the prompt. */
     root?: string;
     maxFindings?: number;
+    /** The change passed the solve gate: review it for completeness, given this evidence (a check table). */
+    verified?: { evidence: string; criteria?: string[] };
   },
 ): Promise<Review> {
   const maxFindings = input.maxFindings ?? 3;
   const { compressed, call, prefix } = await prepare(input);
   const conventions = input.root ? conventionBlock(input.root, compressed.included) : "";
+  const verified = input.verified;
+  const criteria = verified?.criteria?.length
+    ? `\n\n<predicted_acceptance_criteria>\n${verified.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}\n</predicted_acceptance_criteria>`
+    : "";
+  const evidence = verified ? `\n\n<evidence>\n${verified.evidence.slice(0, 4000)}\n</evidence>${criteria}` : "";
   const system = `You are a senior engineer reviewing a code change. ${DIFF_FORMAT}
-Review only the added and changed code. Report at most ${maxFindings} findings, and only real problems: bugs, wrong logic, unhandled errors or edge cases that matter, security issues, broken contracts. No style nits, no praise, no restating the change. An empty list is a fine answer.
+${verified ? VERIFIED_STEPS : "Review only the added and changed code."} Report at most ${maxFindings} findings, and only real problems: bugs, wrong logic, unhandled errors or edge cases that matter, security issues, broken contracts. No style nits, no praise, no restating the change. An empty list is a fine answer.
 severity "high" = breaks behaviour or security in normal use; "medium" = a likely bug in an edge case; "low" = a minor risk.
 Reply with ONLY this JSON object:
 {"summary": "<one or two sentences on what the change does>", "effort": <1-5, how hard to review>, "findings": [{"file": "<path>", "line": <new line number>, "severity": "high|medium|low", "title": "<short>", "detail": "<what is wrong and how to fix it>"}], "security": "<a concrete security concern, or null>", "tests": "adequate|missing|n/a"}`;
-  return structuredCall({ ...call, system, user: `${prefix}${conventions}` }, validateReview(maxFindings));
+  return structuredCall({ ...call, system, user: `${prefix}${evidence}${conventions}` }, validateReview(maxFindings));
 }
 
 /* ------------------------------- describe -------------------------------- */

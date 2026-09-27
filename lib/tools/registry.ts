@@ -106,6 +106,8 @@ export interface ToolContext {
   harness?: {
     compare?: (command: string, timeoutMs: number) => Promise<string>;
     finish?: (input: FinishInput) => Promise<string>;
+    /** The blind test writer's way out: the command that runs its test. */
+    done?: (input: { command: string; notes?: string }) => Promise<string>;
   };
   /** Identifiers from recent searches; `view` expands the sections that mention them. */
   recentTerms?: string[];
@@ -739,6 +741,27 @@ const finishTool: ToolImpl = {
   },
 };
 
+const doneTool: ToolImpl = {
+  def: {
+    name: "done",
+    description: "Finish: give the shell command, run from the repository root, that runs your independent test.",
+    input_schema: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "e.g. 'python -m pytest -q .viberon/scratch/test_independent.py'." },
+        notes: { type: "string", description: "One line: what the test checks." },
+      },
+      required: ["command"],
+    },
+  },
+  async run(args, ctx) {
+    const command = str(args.command).trim();
+    if (!command) return "Error: `command` is required.";
+    if (!ctx.harness?.done) return "Error: done is not available in this run.";
+    return ctx.harness.done({ command, notes: str(args.notes) });
+  },
+};
+
 const deleteFileTool: ToolImpl = {
   def: {
     name: "delete_file",
@@ -1194,6 +1217,7 @@ export const ALL_TOOLS: Record<string, ToolImpl> = {
   create_file: createFileTool,
   compare: compareTool,
   finish: finishTool,
+  done: doneTool,
 };
 
 /**
@@ -1210,6 +1234,12 @@ export const SOLVER_TOOLS = [
   "compare",
   "finish",
 ];
+
+/**
+ * The blind test writer: read the code, write a test (the harness confines
+ * writes to `.viberon/scratch/`), run it once, then `done`.
+ */
+export const TEST_WRITER_TOOLS = ["run_command", "view", "find_symbols", "create_file", "edit_file", "done"];
 
 /** Read-only navigation — every agent gets these. */
 export const READ_TOOLS = [

@@ -492,16 +492,15 @@ export class Gate {
     const { root, baseRef } = this.options;
     const command = rootRelative(raw, root);
     const run = (cwd: string) => this.runner(command, { cwd, timeoutMs, signal: this.options.signal, env: pythonPath(cwd) });
-    const mine = await run(root);
     const fmt = (r: RawRun) => summarizeOutput(r.output, r.exitCode, r.timedOut);
     if (!(await changedFiles(root, baseRef)).length) {
+      const mine = await run(root);
       return `(You have not changed anything yet, so both states are identical.)\n${fmt(mine)}\n${tailOf(mine.output, 30)}`;
     }
-    let orig: RawRun;
-    try {
-      orig = await this.onOriginal(run);
-    } catch (error) {
-      return `Error: could not run on the original code (${error instanceof Error ? error.message : String(error)}).\n${tailOf(mine.output, 30)}`;
+    // Both sides at once: the original runs in its own temporary checkout.
+    const [mine, orig] = await Promise.all([run(root), this.onOriginal(run).catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))))]);
+    if (orig instanceof Error) {
+      return `Error: could not run on the original code (${orig.message}).\n${tailOf(mine.output, 30)}`;
     }
     const ok = (r: RawRun) => r.exitCode === 0 && !r.timedOut;
     const [o, m] = [ok(orig), ok(mine)];
@@ -525,8 +524,10 @@ export class Gate {
     beforeOutput: string;
     afterOutput: string;
   }> {
-    const after = await this.runOnce(command, this.options.root);
-    const before = await this.onOriginal((dir) => this.runOnce(command, dir));
+    const [after, before] = await Promise.all([
+      this.runOnce(command, this.options.root),
+      this.onOriginal((dir) => this.runOnce(command, dir)),
+    ]);
     return {
       beforePassed: before.passed,
       afterPassed: after.passed,
@@ -595,23 +596,31 @@ export class Gate {
     if (!related.length) for (const s of this.options.suite) add(s.command, "suite");
     const suiteByCommand = new Map(this.options.suite.map((s) => [s.command.trim(), s]));
 
-    for (const check of checks) check.after = await this.runOnce(check.command, root, suiteByCommand.get(check.command));
-    try {
-      const needBaseline = checks.filter((c) => !this.baselineCache.has(c.command) || c.origin === "agent");
-      if (needBaseline.length) {
-        await this.onOriginal(async (dir) => {
-          for (const check of needBaseline) {
-            const outcome = this.runOnce(check.command, dir, suiteByCommand.get(check.command));
-            // Existing tests on the original code never change: cache them.
-            if (check.origin !== "agent") this.baselineCache.set(check.command, outcome);
-            check.before = await outcome;
-          }
-        });
+    // The two sides run concurrently: the patched side in the work tree, the
+    // original side in its own temporary checkout, so they share no files.
+    // Each side stays sequential (one side's checks can share caches).
+    const patched = (async () => {
+      for (const check of checks) check.after = await this.runOnce(check.command, root, suiteByCommand.get(check.command));
+    })();
+    const original = (async () => {
+      try {
+        const needBaseline = checks.filter((c) => !this.baselineCache.has(c.command) || c.origin === "agent");
+        if (needBaseline.length) {
+          await this.onOriginal(async (dir) => {
+            for (const check of needBaseline) {
+              const outcome = this.runOnce(check.command, dir, suiteByCommand.get(check.command));
+              // Existing tests on the original code never change: cache them.
+              if (check.origin !== "agent") this.baselineCache.set(check.command, outcome);
+              check.before = await outcome;
+            }
+          });
+        }
+        for (const check of checks) check.before ??= (await this.baselineCache.get(check.command)) ?? null;
+      } catch (error) {
+        result.feedback += `(could not run the checks on the original code: ${error instanceof Error ? error.message : String(error)})\n`;
       }
-      for (const check of checks) check.before ??= (await this.baselineCache.get(check.command)) ?? null;
-    } catch (error) {
-      result.feedback += `(could not run the checks on the original code: ${error instanceof Error ? error.message : String(error)})\n`;
-    }
+    })();
+    await Promise.all([patched, original]);
     for (const check of checks) classifyCheck(check);
     result.checks = checks;
 

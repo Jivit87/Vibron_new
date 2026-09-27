@@ -130,6 +130,18 @@ export type OrchestrationEvent =
       /** Whether the task's code snippet failed on the original code (absent when none ran). */
       snippetReproduced?: boolean;
     }
+  /** Acceptance criteria predicted from the task before the solver starts (may be wrong). */
+  | { type: "criteria"; items: string[] }
+  /** The blind independent test writer: it never sees the patch. */
+  | {
+      type: "independent_test";
+      status: "written" | "ran" | "skipped" | "gave_up";
+      command?: string;
+      verdict?: "fixes" | "passes" | "still_failing" | "regression" | "inconclusive";
+      seconds?: number;
+    }
+  /** A harness phase ended (setup, localize, criteria, loop, gate, testWriter, review). */
+  | { type: "phase"; name: string; ms: number }
   /** The harness intervened after a failure: a hint, a forced replan, or a rollback. */
   | {
       type: "recovery";
