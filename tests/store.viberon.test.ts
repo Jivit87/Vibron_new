@@ -8,6 +8,7 @@ import {
 } from "@/store/viberon";
 import { computeWaves, countLineDiff } from "@/lib/agents/events";
 import type { OrchestrationEvent, PlanStep } from "@/lib/agents/events";
+import { MAX_CONCURRENCY } from "@/lib/limits";
 
 /**
  * The store is the contract both shells render from, so these cover the
@@ -333,10 +334,18 @@ describe("settings", () => {
     });
 
     const settings = useViberon.getState().settings;
-    expect(settings.concurrency).toBe(6);
+    expect(settings.concurrency).toBe(MAX_CONCURRENCY);
     expect(settings.retrievalDepth).toBe(1);
     expect(settings.maxNodes).toBe(60);
     expect(settings.editorFontSize).toBe(10);
+  });
+
+  it("allows the new concurrency ceiling and still clamps above it", () => {
+    useViberon.getState().setSettings({ concurrency: MAX_CONCURRENCY });
+    expect(useViberon.getState().settings.concurrency).toBe(10);
+
+    useViberon.getState().setSettings({ concurrency: 99 });
+    expect(useViberon.getState().settings.concurrency).toBe(10);
   });
 
   it("restores defaults on reset", () => {

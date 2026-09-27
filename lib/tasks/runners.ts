@@ -8,6 +8,7 @@
 import { resolveModel } from "@/lib/ai";
 import type { OrchestrationEvent, RunPlan } from "@/lib/agents/events";
 import { runGit } from "@/lib/git";
+import { DEFAULT_CONCURRENCY, MAX_CONCURRENCY, MIN_CONCURRENCY } from "@/lib/limits";
 import {
   branchName,
   createIssueWorktree,
@@ -144,7 +145,10 @@ interface BatchItem {
 }
 
 /** Issues solved at once; each in its own worktree. */
-const BATCH_CONCURRENCY = Math.max(1, Math.min(6, Number(process.env.VIBERON_ISSUE_CONCURRENCY) || 3));
+const BATCH_CONCURRENCY = Math.max(
+  MIN_CONCURRENCY,
+  Math.min(MAX_CONCURRENCY, Number(process.env.VIBERON_ISSUE_CONCURRENCY) || DEFAULT_CONCURRENCY),
+);
 
 /**
  * Many GitHub issues → one pull request. The issues are solved in parallel,
