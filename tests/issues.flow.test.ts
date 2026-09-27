@@ -12,6 +12,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SolveOptions, SolveResult } from "@/lib/harness/solve-types";
+import type { OrchestrationEvent } from "@/lib/agents/events";
 import { issueTaskText, skipReason } from "@/lib/issues";
 import { registerLocalWorkspace } from "@/lib/local-disk-workspace";
 import { resetMemoryStoreForTests } from "@/lib/store";
@@ -114,6 +115,26 @@ afterEach(() => {
 });
 
 describe("issue → fix → pull request", () => {
+  it("plans a prompt-driven batch before solving and opens one PR", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const events: OrchestrationEvent[] = [];
+    const queued = await fixIssues({ repoKey, all: true, combined: true, deliver: true, prompt: "Fix all issues quickly and raise a PR" });
+    expect(queued.tasks).toHaveLength(1);
+    expect(queued.tasks[0]).toMatchObject({ issueTitles: ["add() subtracts"], instructions: "Fix all issues quickly and raise a PR" });
+    await getTaskQueue().subscribe(queued.tasks[0]!.id, (event) => events.push(event), () => undefined);
+    await getTaskQueue().idle();
+    const done = await getTaskQueue().get(queued.tasks[0]!.id);
+    expect(done?.error).toBeUndefined();
+    expect(done?.prUrl).toBe("https://github.com/o/r/pull/12");
+    const prBody = posted.find((request) => request.url.endsWith("/pulls"))?.body as { body: string };
+    expect(prBody.body).not.toContain("combined test suite also passed");
+    expect(events.findIndex((event) => event.type === "plan")).toBeLessThan(events.findIndex((event) => event.type === "run_done"));
+    expect(solved[0]?.task).toContain("The user's request for this run: Fix all issues quickly and raise a PR");
+    expect(vi.mocked(fetch).mock.calls.filter((call) => String(call[0]).endsWith("/issues/7"))).toHaveLength(1);
+  });
+
   it("fixes in an isolated worktree, pushes one fix, opens a PR that closes the issue, and reports back", async () => {
     // The user's own checkout has unrelated uncommitted work; it must survive untouched.
     writeFileSync(path.join(repo.root, "notes.txt"), "my draft\n");

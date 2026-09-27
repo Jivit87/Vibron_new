@@ -93,6 +93,33 @@ describe("OpenAI-compatible adapter", () => {
     expect(res.stopReason).toBe("tool_use");
   });
 
+  it("passes every DeepSeek reasoning turn back as reasoning_content", async () => {
+    process.env.AI_PROVIDER = "deepseek";
+    process.env.AI_BASE_URL = "https://api.deepseek.com/v1";
+    const calls = stubFetch([ok({ content: "done" })]);
+    await openaiCompatProvider.runTurn(request({
+      model: "openai:deepseek-v4-pro",
+      messages: [
+        { role: "user", content: [{ type: "text", text: "fix it" }] },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "first thought", signature: "" },
+          { type: "tool_use", id: "c1", name: "read_file", input: { path: "a.py" } },
+        ] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "a" }] },
+        { role: "assistant", content: [
+          { type: "thinking", thinking: "second thought", signature: "" },
+          { type: "tool_use", id: "c2", name: "read_file", input: { path: "b.py" } },
+        ] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "c2", content: "b" }] },
+        { role: "assistant", content: [{ type: "text", text: "I found the bug." }] },
+        { role: "user", content: [{ type: "text", text: "continue" }] },
+      ],
+    }));
+    const assistant = (calls[0].body.messages as Record<string, unknown>[]).filter((m) => m.role === "assistant");
+    expect(assistant.map((m) => m.reasoning_content)).toEqual(["first thought", "second thought", ""]);
+    expect(assistant.every((m) => !("reasoning" in m))).toBe(true);
+  });
+
   it("falls back to the text protocol when the endpoint rejects tools, and stays there", async () => {
     const calls = stubFetch([
       status(400, "this model does not support tools"),
@@ -225,6 +252,17 @@ describe("provider detection", () => {
     invalidateCredentialCache();
     expect(await getApiKey("openai")).toBe("sk-or-v1-xyz");
     expect(resolveOpenAiCompatEnv()).toMatchObject({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" });
+  });
+
+  it("routes a generic sk key to DeepSeek when AI_MODEL names DeepSeek", () => {
+    delete process.env.AI_BASE_URL;
+    process.env.AI_API_KEY = `sk-${"a".repeat(32)}`;
+    process.env.AI_MODEL = "deepseek-v4-pro";
+    expect(resolveOpenAiCompatEnv()).toMatchObject({
+      provider: "deepseek",
+      baseUrl: "https://api.deepseek.com/v1",
+      model: "deepseek-v4-pro",
+    });
   });
 
   it("registers the AI_MODEL model and prefers it for auto", async () => {

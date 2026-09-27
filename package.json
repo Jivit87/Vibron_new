@@ -10,7 +10,7 @@
   },
   "scripts": {
     "dev": "next dev",
-    "dev:desktop": "concurrently \"pnpm dev\" \"wait-on http://localhost:3000 && electron .\"",
+    "dev:desktop": "node scripts/dev-desktop.js",
     "build": "next build",
     "build:desktop": "pnpm build && electron-builder",
     "start": "next start",

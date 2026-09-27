@@ -188,6 +188,10 @@ Useful flags:
 - `--no-gate` disables verification.
 - `--max-turns` and `--timeout` set the budget.
 - `--worktree` works in a detached git worktree, so your checkout is untouched.
+- `--independent-test` spends one extra model turn after a verified fix to write
+  a blind regression test from the issue and original code. It runs on both
+  trees; an assertion failure on the patch gets one repair pass. This option
+  executes generated test code with the local runner's permissions.
 
 Headless runs keep all state in memory (`VIBERON_STORE=memory`). Everything they write
 to the repo lives under `.viberon/`, which is excluded from git.
@@ -204,6 +208,11 @@ with **hidden tests** the agent never saw. Results go to `eval/results/latest.js
 and `eval/results/results.md`, and `GET /api/eval` serves them. The metrics are pass
 rate, honest verdicts, regressions, tokens, calls and time. Python tasks use a cached
 venv with pytest (`eval/.cache/`).
+
+To compare runs from the Harness Arena JSONL format, use
+`bin/viberon arena report path/to/results.jsonl`. The report de-duplicates
+retries, ranks by fixes then tokens then time, and only ranks tasks completed
+by every harness. `--json` returns the same comparison as structured data.
 
 ## Quickstart: memory in Obsidian
 
@@ -300,6 +309,10 @@ rate limit.
 ---
 
 ## Scripts
+
+Viberon is an Electron desktop application. The web server is only the local
+renderer used by Electron during development and by AI test runs; use
+`pnpm dev:desktop` for the product experience.
 
 ```bash
 pnpm dev            # Next.js dev server

@@ -2,8 +2,7 @@
 
 /**
  * Hand context to whichever composer is visible. The composer listens for
- * `viberon:attach`; if the IDE's agent dock is hidden we switch to Chat so
- * there is a composer to receive it.
+ * `viberon:attach`; in the IDE the agent dock is opened to receive it.
  */
 
 import type { ContextAttachment } from "@/lib/composer/types";
@@ -12,9 +11,14 @@ import { useViberon } from "@/store/viberon";
 
 export function attachToComposer(item: ContextAttachment): void {
   const store = useViberon.getState();
-  const dockVisible =
-    store.appMode === "ide" && store.agentDockOpen && typeof window !== "undefined" && window.innerWidth >= 1080;
-  if (!dockVisible) store.setAppMode("chat");
+  const wide = typeof window !== "undefined" && window.innerWidth >= 1080;
+  // Keep the user's shell: in the IDE, open the agent dock. Only a window too
+  // narrow for the dock falls back to Chat, where a composer is always shown.
+  if (store.appMode === "ide" && wide) {
+    if (!store.agentDockOpen) store.setAgentDockOpen(true);
+  } else if (store.appMode === "ide") {
+    store.setAppMode("chat");
+  }
   // Wait a frame so a freshly mounted composer has its listener attached.
   requestAnimationFrame(() =>
     requestAnimationFrame(() => window.dispatchEvent(new CustomEvent("viberon:attach", { detail: item }))),

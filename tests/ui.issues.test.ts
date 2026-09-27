@@ -5,6 +5,8 @@ import {
   clampInterval,
   ERROR_TEXT,
   issueStatus,
+  isAllIssuesFixRequest,
+  issuePromptRepo,
   issuesError,
   normalizeFix,
   normalizeIssueRow,
@@ -28,6 +30,16 @@ const row = (task: IssueRow["task"]): IssueRow => ({
 });
 
 describe("issues reader", () => {
+  it("recognizes a prompt to fix every issue from either agent mode", () => {
+    expect(isAllIssuesFixRequest("Get the issues of the repo on GitHub and fix them all, then raise a PR")).toBe(true);
+    expect(isAllIssuesFixRequest("Fix every GitHub issue")).toBe(true);
+    expect(isAllIssuesFixRequest("Explain GitHub issues to me")).toBe(false);
+    expect(issuePromptRepo("Fix all issues in https://github.com/acme/widgets.git and open a PR"))
+      .toBe("https://github.com/acme/widgets");
+    expect(issuePromptRepo("Fix all issues in this repo")).toBeNull();
+    expect(issuePromptRepo("Fix every issue in repo acme/widgets"))
+      .toBe("acme/widgets");
+  });
   it("reads the plan's list shape", () => {
     const data = normalizeIssues({
       repo: { owner: "acme", repo: "textkit" },

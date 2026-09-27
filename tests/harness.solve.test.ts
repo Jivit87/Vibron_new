@@ -60,6 +60,50 @@ async function options(overrides: Partial<SolveOptions> = {}): Promise<SolveOpti
 }
 
 describe("solveTask", () => {
+  it("runs a blind issue test after the gate accepts without showing the patch", async () => {
+    const script = "const assert = require('node:assert/strict');\nconst { mean } = require('../../lib');\nassert.equal(mean([]), 0);\n";
+    const fake = installFakeProvider([
+      { calls: [
+        { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+        { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
+      ] },
+      { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+      (req) => {
+        const prompt = JSON.stringify(req.messages);
+        expect(prompt).toContain(ORIGINAL_LINE);
+        expect(prompt).not.toContain(RIGHT_LINE);
+        return { text: JSON.stringify({ language: "javascript", test: script }) };
+      },
+    ]);
+    const result = await solveTask(await options({ independentTest: true }));
+    expect(result.status).toBe("resolved");
+    expect(result.independentTest).toMatchObject({ status: "fixes" });
+    expect(result.metrics.modelCalls).toBe(3);
+    expect(fake.requests).toHaveLength(3);
+  });
+
+  it("uses a failing blind test to send the solver back for a sibling case", async () => {
+    const incomplete = "exports.mean = (xs) => (xs.length ? (xs.length === 2 ? 999 : xs.reduce((a, b) => a + b, 0) / xs.length) : 0);";
+    const blind = "const assert = require('node:assert/strict');\nconst { mean } = require('../../lib');\nassert.equal(mean([2, 4]), 3);\n";
+    installFakeProvider([
+      { calls: [
+        { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+        { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: incomplete, summary: "partial" } },
+      ] },
+      { calls: [{ name: "finish", input: { summary: "partial", reproduction: REPRO } }] },
+      { text: JSON.stringify({ language: "javascript", test: blind }) },
+      (req) => {
+        expect(JSON.stringify(req.messages)).toMatch(/independent regression test.*fails/i);
+        return { calls: [{ name: "edit_file", input: { path: "lib.js", find: incomplete, replace: RIGHT_LINE, summary: "sibling" } }] };
+      },
+      { calls: [{ name: "finish", input: { summary: "fixed sibling case", reproduction: REPRO } }] },
+    ]);
+    const result = await solveTask(await options({ independentTest: true, task: `${TASK}\nmean([2, 4]) should return 3.` }));
+    expect(result.status).toBe("resolved");
+    expect(result.independentTest?.status).toBe("passes");
+    expect(repo.read("lib.js")).toBe(`${RIGHT_LINE}\n`);
+  });
+
   it("reports a missing model credential as a setup error before any attempt", async () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "");
     invalidateCredentialCache();
@@ -166,6 +210,54 @@ describe("solveTask", () => {
     expect(log.of("agent_start")[1].reason).toMatch(/^Attempt 1 ended without proof \(gate: give_up\)/);
     expect(log.of("recovery").some((r) => /re-prompted once/.test(r.detail))).toBe(true);
     // Attempt 1 was auto-verified (it never called finish) and gave up on its regression.
+    expect(log.of("gate").map((g) => g.decision)).toEqual(["give_up", "accept"]);
+  });
+
+  it("hands a small repository's whole source to the agent in its first message", async () => {
+    installFakeProvider([
+      (req) => {
+        const first = req.messages[0].content.map((b) => (b.type === "text" ? b.text : "")).join("");
+        expect(first).toContain('<file path="lib.js">');
+        expect(first).toContain(ORIGINAL_LINE);
+        // Tests are named, not inlined.
+        expect(first).toContain("Test files (not shown): test/lib.test.js");
+        expect(first).not.toContain('<file path="test/lib.test.js">');
+        return {
+          calls: [
+            { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+            { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
+          ],
+        };
+      },
+      { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+    ]);
+    const result = await solveTask(await options({ maxAttempts: 1 }));
+    expect(result.status).toBe("resolved");
+  });
+
+  it("retries a clean but unproven patch as a lead to re-check, not as a rejected approach", async () => {
+    installFakeProvider([
+      // Attempt 1: the right edit, but no reproduction, and it stops without finish.
+      { calls: [{ name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "x" } }] },
+      { text: "Done." },
+      { text: "Done." },
+      // Attempt 2: the lesson keeps the change on the table.
+      (req) => {
+        const first = JSON.stringify(req.messages[0]);
+        expect(first).toMatch(/broke no check/);
+        expect(first).toMatch(/keep the ones that are right/);
+        expect(first).not.toMatch(/REJECTED alternative/);
+        return {
+          calls: [
+            { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+            { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
+          ],
+        };
+      },
+      { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+    ]);
+    const result = await solveTask(await options());
+    expect(result.status).toBe("resolved");
     expect(log.of("gate").map((g) => g.decision)).toEqual(["give_up", "accept"]);
   });
 

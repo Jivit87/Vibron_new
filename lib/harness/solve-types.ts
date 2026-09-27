@@ -34,6 +34,8 @@ export interface SolveOptions {
   review?: boolean;
   /** Model for that review; default: the cheapest agentic model available. */
   reviewModel?: string;
+  /** Generate and run a blind regression test after a strongly verified fix. */
+  independentTest?: boolean;
   /** Test seam: run gate/compare commands through this instead of the terminal. */
   runCheck?: CheckRunner;
   /** Test seam: replace `lib/verify` functions (detection, runners, related tests). */
@@ -69,6 +71,12 @@ export interface SolveResult {
     restoredBest: boolean;
     stuckEvents: number;
     failureClasses: Partial<Record<FailureClass, number>>;
+  };
+  independentTest?: {
+    status: "fixes" | "passes" | "still_failing" | "regression" | "inconclusive";
+    command?: string;
+    output?: string;
+    reason?: string;
   };
   metrics: {
     modelCalls: number;

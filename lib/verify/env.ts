@@ -6,7 +6,7 @@
  * to repo code.
  */
 
-import { existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -15,16 +15,35 @@ import { scrubEnv } from "@/lib/terminal/safety";
 const VENV_NAMES = [".venv", "venv", "env", ".env"];
 
 export function findRepoVenv(root: string): string | null {
-  for (const name of VENV_NAMES) {
-    const candidate = path.join(root, name);
-    if (
-      existsSync(path.join(candidate, "bin", "python")) ||
-      existsSync(path.join(candidate, "Scripts", "python.exe"))
-    ) {
-      return candidate;
+  for (const dir of [root, mainWorktree(root)]) {
+    if (!dir) continue;
+    for (const name of VENV_NAMES) {
+      const candidate = path.join(dir, name);
+      if (
+        existsSync(path.join(candidate, "bin", "python")) ||
+        existsSync(path.join(candidate, "Scripts", "python.exe"))
+      ) {
+        return candidate;
+      }
     }
   }
   return null;
+}
+
+/**
+ * The main checkout behind a linked git worktree (`.git` is a file pointing
+ * at `<main>/.git/worktrees/<name>`), or null. An issue worktree has no
+ * virtualenv of its own, so it uses the one installed in the main checkout.
+ */
+function mainWorktree(root: string): string | null {
+  try {
+    const pointer = readFileSync(path.join(root, ".git"), "utf8");
+    const gitdir = /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim();
+    const match = gitdir && /^(.*)[\\/]\.git[\\/]worktrees[\\/][^\\/]+$/.exec(path.resolve(root, gitdir));
+    return match ? match[1] : null;
+  } catch {
+    return null; // .git is a directory (a normal checkout) or missing.
+  }
 }
 
 /** First match for `name` on a PATH string, or null. */

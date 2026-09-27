@@ -80,16 +80,17 @@ interface ModelState {
 
 const states = new Map<string, ModelState>();
 
-function stateFor(model: string): ModelState {
-  let state = states.get(model);
+function stateFor(model: string, provider = "openai"): ModelState {
+  const key = `${provider}:${model}`;
+  let state = states.get(key);
   if (!state) {
     const mode = (process.env.VIBERON_TOOL_MODE || process.env.AI_TOOL_MODE || "auto").toLowerCase();
     state = {
       dropped: new Set(),
       toolMode: mode === "text" || mode === "native" ? mode : "auto",
-      reasoningWindow: /gpt-oss/i.test(model) ? 6 : 0,
+      reasoningWindow: provider === "deepseek" || /deepseek/i.test(model) ? Infinity : /gpt-oss/i.test(model) ? 6 : 0,
     };
-    states.set(model, state);
+    states.set(key, state);
   }
   return state;
 }
@@ -249,6 +250,7 @@ function buildPayload(
         {
           toolNames: ep.provider !== "openai",
           reasoningWindow: state.reasoningWindow,
+          reasoningField: ep.provider === "deepseek" || /deepseek/i.test(ep.wireModel) ? "reasoning_content" : "reasoning",
           thoughtSignatures: ep.provider === "gemini",
         },
       );
@@ -408,7 +410,7 @@ export const openaiCompatProvider: AiProvider = {
 
   async runTurn(request: AiTurnRequest, handlers: AiTurnHandlers = {}): Promise<AiTurnResult> {
     const ep = await endpoint(request.model);
-    const state = stateFor(request.model);
+    const state = stateFor(request.model, ep.provider);
     const tools = request.tools ?? [];
     let negotiations = 0;
     let lastError = "";

@@ -5,12 +5,27 @@ import {
   createPullRequest,
   getPullRequestDiff,
   GitHubApiError,
+  listIssues,
   parsePrUrl,
   parseRemote,
   type CheckRun,
 } from "@/lib/github-api";
 
 describe("github-api", () => {
+  it("reads subsequent pages when pull requests occupy the first issue page", async () => {
+    const raw = (number: number, pullRequest = false) => ({
+      number, title: `#${number}`, body: "", html_url: `https://github.com/o/r/issues/${number}`,
+      state: "open", labels: [], user: null, comments: 0, created_at: "", updated_at: "",
+      ...(pullRequest ? { pull_request: {} } : {}),
+    });
+    const fake = vi.fn(async (url: string) => new Response(JSON.stringify(
+      new URL(url).searchParams.get("page") === "1" ? [raw(1, true), raw(2, true)] : [raw(3), raw(4)],
+    )));
+    const issues = await listIssues({ owner: "o", repo: "r" }, { limit: 2 }, { token: "test", fetchImpl: fake as unknown as typeof fetch });
+    expect(issues.map((issue) => issue.number)).toEqual([3, 4]);
+    expect(fake).toHaveBeenCalledTimes(2);
+  });
+
   it("parses PR URLs and remotes", () => {
     expect(parsePrUrl("https://github.com/o/r/pull/12/files")).toEqual({ owner: "o", repo: "r", number: 12 });
     expect(parsePrUrl("o/r#7")).toEqual({ owner: "o", repo: "r", number: 7 });

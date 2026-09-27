@@ -17,10 +17,13 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from "react";
+import { useRouter } from "next/navigation";
 import { ArrowUp, CircleDot, FileText, Folder, Loader2, Square, X } from "lucide-react";
+import { toast } from "sonner";
 
 import { cancelRun, sendPrompt } from "@/lib/client/agent-stream";
-import { fetchIssue, findIssueUrl, issuePrompt } from "@/lib/client/clone";
+import { cloneRepository, fetchIssue, findIssueUrl, issuePrompt, recordClone } from "@/lib/client/clone";
+import { fixAllIssuesInOnePr, isAllIssuesFixRequest, issuePromptRepo, stashPendingIssueBatch } from "@/lib/client/issues";
 import { findMentionTrigger, fuzzyScore, removeTrigger } from "@/lib/composer/parsing";
 import {
   attachmentKey,
@@ -86,6 +89,7 @@ type Suggestion =
   | { kind: "file"; path: string; folder: boolean }
   | { kind: "special"; id: string; label: string; hint: string };
 
+
 export function Composer({
   placeholder = "Describe a change, or ask a question",
   autoFocus = false,
@@ -95,6 +99,7 @@ export function Composer({
   autoFocus?: boolean;
   large?: boolean;
 }) {
+  const router = useRouter();
   const streaming = useViberon((s) => s.streaming);
   const settings = useViberon((s) => s.settings);
   const setSettings = useViberon((s) => s.setSettings);
@@ -109,6 +114,7 @@ export function Composer({
   const [highlight, setHighlight] = useState(0);
   const [issue, setIssue] = useState<IssueRef | null>(null);
   const [issueLoading, setIssueLoading] = useState<string | null>(null);
+  const [fixingAll, setFixingAll] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const composerDraft = useViberon((s) => s.composerDraft);
 
@@ -253,8 +259,43 @@ export function Composer({
     }
   }
 
+  async function fixAll(prompt?: string) {
+    const repoKey = useViberon.getState().repoKey;
+    if (!repoKey || fixingAll) return;
+    setFixingAll(true);
+    const target = prompt ? issuePromptRepo(prompt) : null;
+    if (target) {
+      const cloned = await cloneRepository(target, () => {});
+      setFixingAll(false);
+      if (cloned.type !== "done") {
+        toast.error(cloned.type === "error" ? cloned.message : "Could not open the repository.");
+        return;
+      }
+      recordClone({ repoKey: cloned.repoKey, label: cloned.label, url: target, rootPath: cloned.rootPath });
+      if (cloned.repoKey === repoKey) {
+        const error = await fixAllIssuesInOnePr(repoKey, settings.model, prompt);
+        if (error) toast.error(error);
+        else setValue("");
+        return;
+      }
+      stashPendingIssueBatch(cloned.repoKey, prompt!, settings.model);
+      setValue("");
+      router.push(`/workspace/${encodeURIComponent(cloned.repoKey)}`);
+      return;
+    }
+    const error = await fixAllIssuesInOnePr(repoKey, settings.model, prompt);
+    setFixingAll(false);
+    if (error) toast.error(error);
+    else setValue("");
+  }
+
   function submit(event?: FormEvent) {
     event?.preventDefault();
+    // An explicit prompt can start the full issue workflow from Agent or Fix.
+    if ((settings.interaction === "fix" || settings.interaction === "agent") && !issue && isAllIssuesFixRequest(value)) {
+      void fixAll(value);
+      return;
+    }
     const fixIssue = settings.interaction === "fix" ? issue : null;
     const prompt = fixIssue ? issuePrompt(fixIssue, value) : value.trim();
     if (!prompt || streaming || issueLoading) return;
@@ -391,6 +432,24 @@ export function Composer({
               </button>
             )}
           </span>
+        </div>
+      )}
+
+      {fixMode && !issue && !issueLoading && rootPath && (
+        <div className="flex items-center gap-2 px-2 pt-2 text-[11.5px]" style={{ color: "var(--vb-text-dim)" }}>
+          <CircleDot className="size-3 shrink-0" style={{ color: "var(--vb-mint)" }} />
+          <span className="min-w-0 truncate">Paste an issue URL, describe a bug, or</span>
+          <button
+            type="button"
+            className="vb-btn shrink-0"
+            style={{ height: 20, padding: "0 6px" }}
+            disabled={streaming || fixingAll}
+            title="Fix every open GitHub issue of this repository on one branch and open one pull request"
+            onClick={() => void fixAll()}
+          >
+            {fixingAll ? <Loader2 className="size-3 animate-spin" /> : null}
+            Fix all GitHub issues → 1 PR
+          </button>
         </div>
       )}
 

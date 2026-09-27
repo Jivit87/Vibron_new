@@ -36,6 +36,16 @@ export interface Task {
   /** Something the user should know about a task that still succeeded (e.g. why it was not delivered). */
   note?: string;
   issueUrl?: string;
+  /**
+   * A batch: fix every one of these GitHub issues on ONE branch (a commit per
+   * resolved issue, from a clean worktree of origin/<default>) and open ONE
+   * pull request. Mutually exclusive with `issueUrl`.
+   */
+  issueUrls?: string[];
+  /** Titles captured when a batch is queued, for its plan before execution. */
+  issueTitles?: string[];
+  /** The user's original instruction for a batch issue run. */
+  instructions?: string;
   deliver?: boolean;
   model?: string;
 }
@@ -46,6 +56,9 @@ export interface EnqueueInput {
   task: string;
   source: TaskSource;
   issueUrl?: string;
+  issueUrls?: string[];
+  issueTitles?: string[];
+  instructions?: string;
   deliver?: boolean;
   model?: string;
 }
@@ -103,9 +116,14 @@ export class TaskQueue {
   private readonly active = new Set<Promise<void>>();
 
   constructor(
-    private readonly runners: Record<TaskKind, TaskRunner>,
+    private runners: Record<TaskKind, TaskRunner>,
     private readonly options: { storeKey?: string; maxEvents?: number } = {},
   ) {}
+
+  /** Swap the runners (dev hot reload); tasks already running keep theirs. */
+  useRunners(runners: Record<TaskKind, TaskRunner>): void {
+    this.runners = runners;
+  }
 
   private get key() {
     return this.options.storeKey ?? TASKS_KEY;
@@ -145,6 +163,9 @@ export class TaskQueue {
       state: "queued",
       createdAt: Date.now(),
       ...(input.issueUrl ? { issueUrl: input.issueUrl } : {}),
+      ...(input.issueUrls?.length ? { issueUrls: [...input.issueUrls] } : {}),
+      ...(input.issueTitles?.length ? { issueTitles: [...input.issueTitles] } : {}),
+      ...(input.instructions ? { instructions: input.instructions } : {}),
       ...(input.deliver ? { deliver: true } : {}),
       ...(input.model ? { model: input.model } : {}),
     };
@@ -262,18 +283,24 @@ export class TaskQueue {
   }
 }
 
-const GLOBAL = globalThis as { __viberonTaskQueue?: TaskQueue };
+const GLOBAL = globalThis as { __viberonTaskQueue?: TaskQueue; __viberonTaskQueueManaged?: TaskQueue };
 
 /** The process-wide queue with the real runners (survives dev hot reloads). */
 export function getTaskQueue(): TaskQueue {
+  const lazy =
+    (kind: TaskKind): TaskRunner =>
+    async (task, ctx) => {
+      const runners = await import("@/lib/tasks/runners");
+      return (kind === "fix" ? runners.runFixTask : runners.runReviewTask)(task, ctx);
+    };
+  const runners = { fix: lazy("fix"), review: lazy("review") };
   if (!GLOBAL.__viberonTaskQueue) {
-    const lazy =
-      (kind: TaskKind): TaskRunner =>
-      async (task, ctx) => {
-        const runners = await import("@/lib/tasks/runners");
-        return (kind === "fix" ? runners.runFixTask : runners.runReviewTask)(task, ctx);
-      };
-    GLOBAL.__viberonTaskQueue = new TaskQueue({ fix: lazy("fix"), review: lazy("review") });
+    GLOBAL.__viberonTaskQueue = new TaskQueue(runners);
+    GLOBAL.__viberonTaskQueueManaged = GLOBAL.__viberonTaskQueue;
+  } else if (GLOBAL.__viberonTaskQueue === GLOBAL.__viberonTaskQueueManaged) {
+    // The queue outlives dev hot reloads, but its runners must not: a closure
+    // from the first module instance would keep running the first build's code.
+    GLOBAL.__viberonTaskQueue.useRunners(runners);
   }
   return GLOBAL.__viberonTaskQueue;
 }

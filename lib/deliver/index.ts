@@ -15,14 +15,17 @@
  */
 
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { DeliverError } from "@/lib/deliver/errors";
-import { configuredRemoteUrl, runGit } from "@/lib/git";
+import { configuredRemoteUrl, projectRemote, runGit } from "@/lib/git";
 import {
+  canPush,
   createPullRequest,
+  ensureFork,
   findOpenPullRequest,
   getDefaultBranch,
   parseRemote,
@@ -157,6 +160,11 @@ export interface DeliverOptions {
   remote?: string;
   /** The GitHub repo for the PR; default: parsed from the remote URL. */
   repo?: RepoId;
+  /**
+   * "auto" (default): when the token cannot push to the repo, push to the
+   * token user's fork (created if needed) and open the PR from there.
+   */
+  fork?: "auto" | "never";
   token?: string | null;
   fetchImpl?: typeof fetch;
 }
@@ -168,6 +176,35 @@ export interface DeliverResult {
   prNumber: number;
   /** false when an open PR for the branch was updated instead. */
   created: boolean;
+  /** `owner/name` of the fork the branch was pushed to, when not the repo itself. */
+  fork?: string;
+}
+
+export interface DeliveryTarget {
+  /** The GitHub repository the pull request is opened against. */
+  repo: RepoId;
+  /** `origin` already points at a different repo than `upstream`: it is the fork to push to. */
+  originIsFork: boolean;
+}
+
+/**
+ * Which repo a pull request targets, and whether `origin` is already a fork
+ * of it. Pure and synchronous so the fork/upstream decision — the thing that
+ * silently opened a PR against the fork instead of the original repo — can
+ * be tested directly, without a real push or GitHub API calls.
+ *
+ * `origin` is the push target (its parsed identity is `pushRepo`); `upstream`,
+ * when configured, is treated as the project itself, so a repo already set
+ * up as `origin` = fork / `upstream` = original delivers correctly with no
+ * extra GitHub API round trip to detect the fork.
+ */
+export function deliveryTarget(pushRepo: RepoId | null, upstreamRepo: RepoId | null, explicitRepo?: RepoId): DeliveryTarget | null {
+  const repo = explicitRepo ?? upstreamRepo ?? pushRepo;
+  if (!repo) return null;
+  const originIsFork = Boolean(
+    upstreamRepo && pushRepo && `${pushRepo.owner}/${pushRepo.repo}` !== `${upstreamRepo.owner}/${upstreamRepo.repo}`,
+  );
+  return { repo, originIsFork };
 }
 
 export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
@@ -212,14 +249,27 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
 
   // 2. Where it goes (all checked before anything is mutated).
   const url = await remoteUrl(root, remote);
-  const repo = options.repo ?? parseRemote(url);
-  if (!repo) throw new DeliverError(`The remote "${remote}" is not a GitHub repository.`, "not_github", 400);
+  const pushRepo = parseRemote(url);
+  // origin is a fork of `upstream`: push to origin, open the PR on upstream.
+  const upstreamUrl = options.remote || options.repo ? null : await configuredRemoteUrl(root, "upstream");
+  const upstream = upstreamUrl ? parseRemote(upstreamUrl) : null;
+  const target = deliveryTarget(pushRepo, upstream, options.repo);
+  if (!target) throw new DeliverError(`The remote "${remote}" is not a GitHub repository.`, "not_github", 400);
+  const { repo, originIsFork } = target;
   const token = options.token === undefined ? await resolveGithubToken() : options.token;
   if (!token) {
     throw new DeliverError("No GitHub token. Connect GitHub in Settings → Integrations (or set GITHUB_TOKEN).", "no_token", 401);
   }
   const api: ApiOptions = { token, fetchImpl: options.fetchImpl };
-  const auth = gitAuthEnv(token, url);
+  // No push access (e.g. someone else's public repo): deliver through a fork.
+  const fork = originIsFork
+    ? pushRepo
+    : options.fork !== "never" && !(await canPush(repo, api).catch(() => true))
+      ? await ensureFork(repo, api)
+      : null;
+  const pushUrl = fork ? `https://github.com/${fork.owner}/${fork.repo}.git` : url;
+  const pushRemote = fork ? pushUrl : remote;
+  const auth = gitAuthEnv(token, pushUrl);
 
   let branch: string;
   if (options.branch) {
@@ -230,7 +280,7 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
       throw new DeliverError(`Branch ${branch} already exists; pick another name.`, "branch_exists", 409);
     }
   } else {
-    branch = onDeliveryBranch ? current : branchName(title, await existingBranches(root, remote, auth));
+    branch = onDeliveryBranch ? current : branchName(title, await existingBranches(root, pushRemote, auth));
   }
   const base = options.baseBranch?.trim() || (await getDefaultBranch(repo, api));
 
@@ -244,11 +294,11 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
 
   // 4. Push; on failure the local branch and commit stay.
-  const push = await gitWithAuth(root, ["push", remote, `HEAD:refs/heads/${branch}`], auth);
+  const push = await gitWithAuth(root, ["push", pushRemote, `HEAD:refs/heads/${branch}`], auth);
   if (push.code !== 0) {
     const reason = redact(push.output, token).split("\n").slice(-4).join(" ").slice(0, 500);
     throw new DeliverError(
-      `Push to ${remote} failed: ${reason || `exit ${push.code}`}. Commit ${commit.slice(0, 12)} is on local branch ${branch}; fix the cause and deliver again.`,
+      `Push to ${fork ? `${fork.owner}/${fork.repo}` : remote} failed: ${reason || `exit ${push.code}`}. Commit ${commit.slice(0, 12)} is on local branch ${branch}; fix the cause and deliver again.`,
       "push_failed",
       502,
       { branch, commit },
@@ -256,11 +306,30 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   }
 
   // 5. Open or update the PR.
-  const existing = await findOpenPullRequest(repo, branch, api);
+  const headOwner = fork?.owner ?? repo.owner;
+  const existing = await findOpenPullRequest(repo, branch, api, headOwner);
   const pr = existing
     ? await updatePullRequest({ ...repo, number: existing.number }, { title, body: options.body }, api)
-    : await createPullRequest(repo, { title, body: options.body, head: branch, base, draft: options.draft ?? true }, api);
-  return { branch, commit, prUrl: pr.html_url, prNumber: pr.number, created: !existing };
+    : await createPullRequest(
+        repo,
+        {
+          title,
+          body: options.body,
+          head: fork ? `${fork.owner}:${branch}` : branch,
+          base,
+          draft: options.draft ?? true,
+          ...(fork ? { maintainer_can_modify: true } : {}),
+        },
+        api,
+      );
+  return {
+    branch,
+    commit,
+    prUrl: pr.html_url,
+    prNumber: pr.number,
+    created: !existing,
+    ...(fork ? { fork: `${fork.owner}/${fork.repo}` } : {}),
+  };
 }
 
 /* --------------------------- isolated issue work --------------------------- */
@@ -280,21 +349,33 @@ export interface IssueWorktree {
  */
 export async function createIssueWorktree(
   root: string,
-  options: { token?: string | null; fetchImpl?: typeof fetch } = {},
+  options: { token?: string | null; fetchImpl?: typeof fetch; baseBranch?: string } = {},
 ): Promise<IssueWorktree> {
-  const url = await remoteUrl(root, "origin");
+  const project = await projectRemote(root);
+  const url = await remoteUrl(root, project);
   const repo = parseRemote(url);
-  if (!repo) throw new DeliverError("The origin remote is not a GitHub repository.", "no_github_remote", 400);
+  if (!repo) throw new DeliverError(`The ${project} remote is not a GitHub repository.`, "no_github_remote", 400);
   const token = options.token === undefined ? await resolveGithubToken() : options.token;
-  const base = await getDefaultBranch(repo, { token, fetchImpl: options.fetchImpl });
+  const base = options.baseBranch ?? await getDefaultBranch(repo, { token, fetchImpl: options.fetchImpl });
   if (!/^[\w./-]+$/.test(base) || base.startsWith("-")) throw new DeliverError(`Unexpected default branch "${base}".`, "invalid_input", 400);
 
-  const fetched = await gitWithAuth(root, ["fetch", "--quiet", "origin", `refs/heads/${base}:refs/remotes/origin/${base}`], gitAuthEnv(token, url));
-  if (fetched.code !== 0) {
-    throw new DeliverError(`Could not fetch origin/${base}: ${redact(fetched.output, token).slice(0, 300)}`, "fetch_failed", 502);
+  if (!options.baseBranch) {
+    const fetched = await gitWithAuth(root, ["fetch", "--quiet", project, `refs/heads/${base}:refs/remotes/${project}/${base}`], gitAuthEnv(token, url));
+    if (fetched.code !== 0) {
+      throw new DeliverError(`Could not fetch ${project}/${base}: ${redact(fetched.output, token).slice(0, 300)}`, "fetch_failed", 502);
+    }
   }
   const dir = path.join(await mkdtemp(path.join(os.tmpdir(), "viberon-issue-")), "repo");
-  await runGit(root, ["worktree", "add", "--detach", dir, `refs/remotes/origin/${base}`], { timeoutMs: 120_000 });
+  await runGit(root, ["worktree", "add", "--detach", dir, `refs/remotes/${project}/${base}`], { timeoutMs: 120_000 });
+  // The worktree has no installed dependencies: link the checkout's own, but
+  // only where git ignores the link, so it can never end up in a commit.
+  for (const name of [".venv", "venv", "node_modules"]) {
+    if (!existsSync(path.join(root, name))) continue;
+    const link = path.join(dir, name);
+    await symlink(path.join(root, name), link).catch(() => undefined);
+    const ignored = await runGit(dir, ["check-ignore", "-q", "--no-index", name], { allowFailure: true });
+    if (ignored.code !== 0) await rm(link, { force: true }).catch(() => undefined);
+  }
   return { dir, base, repo };
 }
 

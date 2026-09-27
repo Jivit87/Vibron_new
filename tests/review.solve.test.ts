@@ -80,6 +80,22 @@ const review = (severity: string) => (req: AiTurnRequest): ScriptedTurn => {
 };
 
 describe("solve-loop reviewer", () => {
+  it("keeps the earlier verified patch if review edits break the blind test", async () => {
+    const broken = "exports.mean = (xs) => (xs.length ? (xs.length === 2 ? 999 : xs.reduce((a, b) => a + b, 0) / xs.length) : 0);";
+    const blind = "const assert = require('node:assert/strict');\nconst { mean } = require('../../lib');\nassert.equal(mean([2, 4]), 3);\n";
+    installFakeProvider([
+      ...solve,
+      { text: JSON.stringify({ language: "javascript", test: blind }) },
+      review("high"),
+      { calls: [{ name: "edit_file", input: { path: "lib.js", find: FIXED, replace: broken, summary: "review edit" } }] },
+      { calls: [{ name: "finish", input: { summary: "reviewed", reproduction: REPRO } }] },
+    ]);
+    const result = await solveTask(await options({ independentTest: true, review: true }));
+    expect(result.status).toBe("resolved");
+    expect(repo.read("lib.js")).toBe(`${FIXED}\n`);
+    expect(result.independentTest?.status).toBe("passes");
+  });
+
   it("sends an accepted change back once on a high finding and keeps the revised change", async () => {
     const withNewFile: ScriptedTurn = {
       calls: [
