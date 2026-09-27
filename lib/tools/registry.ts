@@ -143,6 +143,103 @@ function normalizePath(path: string): string {
   return path.trim().replace(/^\.\//, "").replace(/\/+/g, "/");
 }
 
+/* ----------------------------- output caps -------------------------------- */
+/*
+ * Every tool result stays in the transcript and is re-sent on every later
+ * turn, so each one is bounded here. A capped result always says what was
+ * dropped and how to get it, so the model never mistakes a cut for the end.
+ */
+
+/** read_file without a range returns this many lines. */
+export const READ_DEFAULT_LINES = 200;
+/** read_file with an explicit range returns at most this many lines. */
+export const READ_MAX_LINES = 400;
+/** grep: total matching lines shown, and per file. */
+export const GREP_DEFAULT_RESULTS = 50;
+export const GREP_MAX_RESULTS = 100;
+export const GREP_PER_FILE = 12;
+/** symbol_index: files listed; each `exports:` line is cut to this many chars. */
+export const INDEX_MAX_FILES = 100;
+const INDEX_EXPORTS_CHARS = 240;
+/** symbol_outline: lines of outline. */
+export const OUTLINE_MAX_LINES = 120;
+/** graph_search: symbols, and characters of source in the slice. */
+export const GRAPH_MAX_SYMBOLS = 30;
+export const GRAPH_MAX_CHARS = 16_000;
+/** list_files / directory view: entries listed. */
+export const LIST_MAX_ENTRIES = 150;
+
+/** Keep the first `max` lines of `text`, ending with a note on the rest. */
+export function capLines(text: string, max: number, hint: string): string {
+  const lines = text.split("\n");
+  if (lines.length <= max) return text;
+  return `${lines.slice(0, max).join("\n")}\n[… ${lines.length - max} more lines not shown; ${hint}]`;
+}
+
+/** Keep whole lines of `text` up to `max` characters, ending with a note on the rest. */
+export function capChars(text: string, max: number, hint: string): string {
+  if (text.length <= max) return text;
+  const cut = text.lastIndexOf("\n", max);
+  const head = text.slice(0, cut > max / 2 ? cut : max);
+  const dropped = text.slice(head.length).split("\n").length;
+  return `${head}\n[… ${dropped} more lines not shown; ${hint}]`;
+}
+
+/**
+ * `path:line: text` rows (searchCode's format) regrouped under one header
+ * per file, at most `perFile` rows each: the path is not repeated per hit,
+ * and one noisy file cannot crowd out the rest.
+ */
+export function groupByFile(output: string, perFile = GREP_PER_FILE): string {
+  const lines = output.split("\n");
+  const groups = new Map<string, string[]>();
+  const rest: string[] = [];
+  let header: string | null = null;
+  for (const line of lines) {
+    const m = line.match(/^([^\s:][^:]*):(\d+): ?(.*)$/);
+    if (!m) {
+      if (header === null && groups.size === 0) header = line;
+      else rest.push(line);
+      continue;
+    }
+    const list = groups.get(m[1]) ?? [];
+    list.push(`  ${m[2]}: ${m[3]}`);
+    groups.set(m[1], list);
+  }
+  if (groups.size === 0) return output;
+  const body: string[] = [];
+  for (const [path, rows] of groups) {
+    // A lone hit keeps the classic `path:line: text` row.
+    if (rows.length === 1) {
+      body.push(`${path}:${rows[0].trimStart()}`);
+      continue;
+    }
+    body.push(`${path} (${rows.length}):`);
+    body.push(...rows.slice(0, perFile));
+    if (rows.length > perFile) body.push(`  … ${rows.length - perFile} more in this file (use glob to see them)`);
+  }
+  return [header ?? "", ...body, ...rest].filter((l, i) => i > 0 || l).join("\n");
+}
+
+/**
+ * A large list of paths as folders (up to two levels) with file counts and
+ * token totals, so an unfiltered listing stays a map rather than a dump.
+ */
+export function folderSummary(files: { path: string; tokens: number }[], depth = 2): string[] {
+  const dirs = new Map<string, { files: number; tokens: number }>();
+  for (const f of files) {
+    const parts = f.path.split("/");
+    const key = parts.length > depth ? `${parts.slice(0, depth).join("/")}/` : parts.length > 1 ? `${parts.slice(0, -1).join("/")}/` : f.path;
+    const entry = dirs.get(key) ?? { files: 0, tokens: 0 };
+    entry.files += 1;
+    entry.tokens += f.tokens;
+    dirs.set(key, entry);
+  }
+  return [...dirs.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, v]) => (key.endsWith("/") ? `${key} (${v.files} files, ${v.tokens}t)` : `${key} (${v.tokens}t)`));
+}
+
 /**
  * Enforce a specialist's write scope so parallel agents cannot collide.
  *
@@ -196,28 +293,36 @@ const symbolIndexTool: ToolImpl = {
   def: {
     name: "symbol_index",
     description:
-      "START HERE to find code. Returns a map of files to the symbols they export, with token costs. Costs a fraction of reading files. Use a filter to narrow to a folder or symbol name.",
+      "START HERE to find code: files → exported symbols, with token sizes. Far cheaper than reading files.",
     input_schema: {
       type: "object",
       properties: {
         filter: {
           type: "string",
-          description:
-            "Optional substring matched against paths and symbol names, e.g. 'auth' or 'components/'.",
+          description: "Substring of a path or symbol name, e.g. 'auth'.",
         },
         with_imports: {
           type: "boolean",
-          description: "Include each file's import edges. Costs more tokens.",
+          description: "Also list imports (costs more).",
         },
       },
     },
   },
   async run(args, ctx) {
-    return buildSymbolIndex(ctx.engine, {
+    const text = buildSymbolIndex(ctx.engine, {
       filter: str(args.filter) || undefined,
       withImports: args.with_imports === true,
-      limit: 250,
+      limit: INDEX_MAX_FILES,
     });
+    // A barrel or constants file can export hundreds of names.
+    return text
+      .split("\n")
+      .map((line) =>
+        line.length > INDEX_EXPORTS_CHARS && /^\s+(exports|imports): /.test(line)
+          ? `${line.slice(0, line.lastIndexOf(",", INDEX_EXPORTS_CHARS))}, … (symbol_outline for all)`
+          : line,
+      )
+      .join("\n");
   },
 };
 
@@ -225,22 +330,21 @@ const graphSearchTool: ToolImpl = {
   def: {
     name: "graph_search",
     description:
-      "Semantic search over the code graph. Give it a free-text description of the behavior you're looking for; it returns the most relevant functions and classes WITH their source, plus the import/call edges connecting them. This is the cheapest way to understand how something works — prefer it over read_file.",
+      "Semantic search: describe a behavior in plain words; returns the most relevant functions/classes WITH source and their call/import edges. Cheapest way to learn how something works — prefer it over read_file.",
     input_schema: {
       type: "object",
       properties: {
         query: {
           type: "string",
-          description:
-            "What you're looking for, in plain language. e.g. 'where user sessions are validated'.",
+          description: "e.g. 'where user sessions are validated'.",
         },
         depth: {
           type: "number",
-          description: "Graph hops from the seed symbols, 1-4. Default 2.",
+          description: "Graph hops, 1-4 (default 2).",
         },
         max_symbols: {
           type: "number",
-          description: "Cap on returned symbols, 5-60. Default 30.",
+          description: "5-30 (default 30).",
         },
       },
       required: ["query"],
@@ -251,13 +355,14 @@ const graphSearchTool: ToolImpl = {
     if (!query) return "Error: `query` is required.";
     const slice = buildGraphSlice(ctx.engine, query, {
       depth: num(args.depth) ?? ctx.retrieval?.depth,
-      maxNodes: num(args.max_symbols) ?? ctx.retrieval?.maxNodes,
+      maxNodes: clampSymbols(num(args.max_symbols)) ?? ctx.retrieval?.maxNodes,
     });
     const saved = Math.max(0, slice.baselineTokens - slice.tokens);
     const footer = slice.deduped
       ? ""
       : `\n\n[graph slice: ${slice.nodeIds.length} symbols from ${slice.files.length} files, ${slice.tokens} tokens — reading those files whole would have cost ${slice.baselineTokens} (${saved} saved)]`;
-    return slice.text + footer;
+    const text = capChars(slice.text, GRAPH_MAX_CHARS, "narrow the query or lower max_symbols");
+    return text + footer;
   },
 };
 
@@ -265,11 +370,11 @@ const symbolOutlineTool: ToolImpl = {
   def: {
     name: "symbol_outline",
     description:
-      "The symbol table for ONE file: every function/class with its signature and line range, plus what uses it and what it depends on — without the bodies. Usually enough to plan an edit at ~10% of the file's token cost. Follow with read_file on a narrow line range.",
+      "One file's symbols: signatures, line ranges, users and dependencies, no bodies (~10% of the file's cost). Then read_file a narrow range.",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative file path." },
+        path: { type: "string" },
       },
       required: ["path"],
     },
@@ -277,28 +382,27 @@ const symbolOutlineTool: ToolImpl = {
   async run(args, ctx) {
     const path = str(args.path).trim();
     if (!path) return "Error: `path` is required.";
-    return buildSymbolOutline(ctx.engine, path);
+    return capLines(buildSymbolOutline(ctx.engine, path), OUTLINE_MAX_LINES, "read_file a line range for the rest");
   },
 };
+
+/** A model-supplied `max_symbols`, held to 5..GRAPH_MAX_SYMBOLS. */
+function clampSymbols(n: number | undefined): number | undefined {
+  return n === undefined ? undefined : Math.min(GRAPH_MAX_SYMBOLS, Math.max(5, Math.round(n)));
+}
 
 const grepTool: ToolImpl = {
   def: {
     name: "grep",
     description:
-      "Search file contents and return only the matching lines with paths and line numbers. Use for literal strings the graph does not index: config values, CSS classes, env var names, text copy.",
+      "Matching lines, grouped by file with line numbers. For literals the graph does not index: config values, CSS classes, env vars, copy.",
     input_schema: {
       type: "object",
       properties: {
-        pattern: { type: "string", description: "Text or regex to find." },
-        glob: {
-          type: "string",
-          description: "Optional path glob, e.g. 'src/**/*.ts'.",
-        },
-        regex: {
-          type: "boolean",
-          description: "Treat `pattern` as a regular expression.",
-        },
-        max_results: { type: "number", description: "Default 60." },
+        pattern: { type: "string" },
+        glob: { type: "string", description: "e.g. 'src/**/*.ts'." },
+        regex: { type: "boolean" },
+        max_results: { type: "number", description: "Default 50, max 100." },
       },
       required: ["pattern"],
     },
@@ -306,11 +410,14 @@ const grepTool: ToolImpl = {
   async run(args, ctx) {
     const pattern = str(args.pattern);
     if (!pattern) return "Error: `pattern` is required.";
-    return searchCode(ctx.engine, pattern, {
+    const requested = num(args.max_results);
+    const maxResults = Math.min(GREP_MAX_RESULTS, Math.max(1, Math.round(requested ?? GREP_DEFAULT_RESULTS)));
+    const found = await searchCode(ctx.engine, pattern, {
       glob: str(args.glob) || undefined,
       regex: args.regex === true,
-      maxResults: num(args.max_results),
+      maxResults,
     });
+    return groupByFile(found);
   },
 };
 
@@ -318,14 +425,11 @@ const listFilesTool: ToolImpl = {
   def: {
     name: "list_files",
     description:
-      "List workspace file paths with their token sizes. Supports a glob. Returns paths only — never contents.",
+      "File paths with token sizes, never contents. Without a glob, a large workspace is summarized by folder.",
     input_schema: {
       type: "object",
       properties: {
-        glob: {
-          type: "string",
-          description: "Optional glob such as 'app/**/*.tsx'.",
-        },
+        glob: { type: "string", description: "e.g. 'app/**/*.tsx'." },
       },
     },
   },
@@ -337,10 +441,17 @@ const listFilesTool: ToolImpl = {
     if (files.length === 0) {
       return glob ? `No files match ${glob}.` : "Workspace is empty.";
     }
-    const shown = files.slice(0, 400);
+    if (!glob && files.length > LIST_MAX_ENTRIES) {
+      const folders = folderSummary(files);
+      const shownFolders = folders.slice(0, LIST_MAX_ENTRIES);
+      const moreFolders =
+        folders.length > shownFolders.length ? `\n… +${folders.length - shownFolders.length} more folders` : "";
+      return `${files.length} files, by folder (pass a glob such as 'lib/**' to list files):\n${shownFolders.join("\n")}${moreFolders}`;
+    }
+    const shown = files.slice(0, LIST_MAX_ENTRIES);
     const lines = shown.map((f) => `${f.path} (${f.tokens}t)`);
     const more =
-      files.length > shown.length ? `\n… +${files.length - shown.length} more` : "";
+      files.length > shown.length ? `\n… +${files.length - shown.length} more; narrow the glob` : "";
     return `${files.length} files:\n${lines.join("\n")}${more}`;
   },
 };
@@ -349,13 +460,13 @@ const readFileTool: ToolImpl = {
   def: {
     name: "read_file",
     description:
-      "Read a file's raw source. EXPENSIVE — prefer graph_search or symbol_outline first, then read only the line range you need. Always pass start_line/end_line for files over ~200 lines.",
+      "Read raw source. EXPENSIVE: use graph_search/symbol_outline first, then read only the lines you need. Returns at most 200 lines without a range, 400 with one.",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative path." },
-        start_line: { type: "number", description: "1-indexed first line." },
-        end_line: { type: "number", description: "1-indexed last line." },
+        path: { type: "string" },
+        start_line: { type: "number", description: "1-indexed." },
+        end_line: { type: "number" },
       },
       required: ["path"],
     },
@@ -363,10 +474,19 @@ const readFileTool: ToolImpl = {
   async run(args, ctx) {
     const path = str(args.path).trim();
     if (!path) return "Error: `path` is required.";
-    const window = await buildFileWindow(ctx.engine, path, {
-      start: num(args.start_line),
-      end: num(args.end_line),
-    });
+    const start = Math.max(1, Math.round(num(args.start_line) ?? 1));
+    const askedEnd = num(args.end_line);
+    const explicit = askedEnd !== undefined && askedEnd !== -1;
+    const limit = explicit || args.start_line !== undefined ? READ_MAX_LINES : READ_DEFAULT_LINES;
+    const end = Math.min(explicit ? Math.max(start, Math.round(askedEnd)) : Infinity, start + limit - 1);
+    const window = await buildFileWindow(ctx.engine, path, { start, end });
+    // "lines a-b of n" in the header: say what is left and how to get it.
+    const m = window.text.match(/lines (\d+)-(\d+) of (\d+)/);
+    const shownEnd = m ? Number(m[2]) : 0;
+    const total = m ? Number(m[3]) : 0;
+    if (!window.deduped && m && shownEnd < total && (!explicit || shownEnd < Math.round(askedEnd))) {
+      return `${window.text}\n[${total - shownEnd} more lines; call read_file with start_line=${shownEnd + 1} to continue]`;
+    }
     return window.text;
   },
 };
@@ -375,16 +495,13 @@ const writeFileTool: ToolImpl = {
   def: {
     name: "write_file",
     description:
-      "Create a file or replace its entire contents. Use for new files and for rewrites where most lines change; for an EXISTING file prefer edit_file or multi_edit, which cost only the changed lines. A new file over ~400 lines: write the first ~300 lines here, then add the rest in order with append_file; never resend content already written.",
+      "Create a file or replace it whole. For an existing file prefer edit_file/multi_edit (only changed lines). Over ~400 lines: write ~300 here, then append_file the rest in order.",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative path." },
-        content: { type: "string", description: "Full file contents." },
-        summary: {
-          type: "string",
-          description: "One sentence describing the change.",
-        },
+        path: { type: "string" },
+        content: { type: "string" },
+        summary: { type: "string", description: "One sentence." },
       },
       required: ["path", "content", "summary"],
     },
@@ -425,12 +542,12 @@ const createFileTool: ToolImpl = {
   def: {
     name: "create_file",
     description:
-      "Create a new file with the given content (an existing file is replaced whole). Put reproduction scripts and other throwaway files in .viberon/scratch/, which is never part of the patch. Use edit_file to change existing files. A new file over ~400 lines: create it with the first part, then extend it with edit_file (find = its last few lines), or split it into several files.",
+      "Create a file (an existing one is replaced whole); use edit_file to change files. Throwaway files (repro scripts) go in .viberon/scratch/, never part of the patch. Over ~400 lines: create the first part, then extend it with edit_file (find = its last lines).",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Repository-relative path." },
-        content: { type: "string", description: "Full file contents." },
+        path: { type: "string" },
+        content: { type: "string" },
       },
       required: ["path", "content"],
     },
@@ -450,13 +567,13 @@ const appendFileTool: ToolImpl = {
   def: {
     name: "append_file",
     description:
-      "Append content to the end of a file (created if missing). Use it to write a large file in parts: write_file the first ~300 lines, then append_file each following part in order. Never resend content already written. Parts are not syntax-gated (a half-written file cannot parse); the result says whether the file parses so far, and it must after the last part.",
+      "Append to a file (created if missing), to write a large file in parts after write_file. Never resend written content. Not syntax-gated; the file must parse after the last part.",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative path." },
-        content: { type: "string", description: "Text to add at the end of the file." },
-        summary: { type: "string", description: "One sentence on this part." },
+        path: { type: "string" },
+        content: { type: "string" },
+        summary: { type: "string" },
       },
       required: ["path", "content"],
     },
@@ -509,25 +626,24 @@ const multiEditTool: ToolImpl = {
   def: {
     name: "multi_edit",
     description:
-      "Apply several find/replace edits to ONE file in a single call, in order and atomically: if any edit fails nothing is written and the failing edit is named. Same tolerant matching and syntax gate as edit_file. Prefer it over several edit_file calls, and over rewriting an existing file with write_file.",
+      "Several find/replace edits to ONE file, in order, all-or-nothing (the failing edit is named). Same matching and syntax gate as edit_file. Prefer it over repeated edit_file or write_file.",
     input_schema: {
       type: "object",
       properties: {
         path: { type: "string" },
         edits: {
           type: "array",
-          description: "Edits applied in order; each sees the result of the ones before it.",
           items: {
             type: "object",
             properties: {
-              old_str: { type: "string", description: "Exact text to replace (unique unless replace_all)." },
-              new_str: { type: "string", description: "Replacement text." },
+              old_str: { type: "string", description: "Exact text, unique unless replace_all." },
+              new_str: { type: "string" },
               replace_all: { type: "boolean" },
             },
             required: ["old_str", "new_str"],
           },
         },
-        summary: { type: "string", description: "One sentence on the change." },
+        summary: { type: "string" },
       },
       required: ["path", "edits"],
     },
@@ -566,13 +682,13 @@ const viewTool: ToolImpl = {
   def: {
     name: "view",
     description:
-      "Show a file with line numbers, or a directory listing. A file over 400 lines comes back as an outline of its definitions with the sections matching your recent searches expanded; pass start_line/end_line to read a specific region.",
+      "A file with line numbers, or a directory listing. A file over 400 lines returns an outline with the sections matching your recent searches expanded; pass start_line/end_line for a region (max 400 lines).",
     input_schema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Repository-relative file or directory path." },
-        start_line: { type: "number", description: "1-indexed first line." },
-        end_line: { type: "number", description: "1-indexed last line (-1 = end of file)." },
+        path: { type: "string" },
+        start_line: { type: "number" },
+        end_line: { type: "number", description: "-1 = end of file." },
       },
       required: ["path"],
     },
@@ -587,10 +703,11 @@ const viewTool: ToolImpl = {
     const prefix = path && path !== "." ? `${path}/` : "";
     const inside = all.filter((f) => f.startsWith(prefix));
     if (inside.length) {
-      const entries = [
-        ...new Set(inside.map((f) => f.slice(prefix.length).split("/").slice(0, 2).join("/"))),
-      ].slice(0, 400);
-      return `Files up to 2 levels deep in ${prefix || "the repository root"}:\n${entries.join("\n")}`;
+      const all2 = [...new Set(inside.map((f) => f.slice(prefix.length).split("/").slice(0, 2).join("/")))];
+      const entries = all2.slice(0, LIST_MAX_ENTRIES);
+      const more =
+        all2.length > entries.length ? `\n… +${all2.length - entries.length} more; view a subdirectory` : "";
+      return `Files up to 2 levels deep in ${prefix || "the repository root"}:\n${entries.join("\n")}${more}`;
     }
     const base = path.split("/").pop() ?? "";
     const similar = all.filter((f) => f.split("/").pop() === base).slice(0, 5);
@@ -602,10 +719,10 @@ const findSymbolsTool: ToolImpl = {
   def: {
     name: "find_symbols",
     description:
-      "Locate where a class, function, method or constant is defined: file, line range, signature and callers, from the code graph. Accepts a bare name ('parse_url'), a qualified name ('Session.send') or a dotted path.",
+      "Where a class/function/method/constant is defined: file, lines, signature, callers. Accepts 'parse_url', 'Session.send' or a dotted path.",
     input_schema: {
       type: "object",
-      properties: { query: { type: "string", description: "The symbol name to look up." } },
+      properties: { query: { type: "string" } },
       required: ["query"],
     },
   },
@@ -627,21 +744,15 @@ const editFileTool: ToolImpl = {
   def: {
     name: "edit_file",
     description:
-      "Replace text in a file. Preferred over write_file for targeted changes — cheaper and safer. `find` must match uniquely (include 2-3 lines of context) unless replace_all is true; copy it from the file WITHOUT the line-number column. Edits that would make the file unparseable are rejected with the syntax error.",
+      "Replace text in a file. `find` must match once (include 2-3 lines of context) unless replace_all; copy it WITHOUT the line-number column. Edits that break parsing are rejected with the error.",
     input_schema: {
       type: "object",
       properties: {
         path: { type: "string" },
-        find: {
-          type: "string",
-          description: "Exact text to replace, including whitespace.",
-        },
-        replace: { type: "string", description: "Replacement text." },
-        replace_all: {
-          type: "boolean",
-          description: "Replace every occurrence instead of requiring uniqueness.",
-        },
-        summary: { type: "string", description: "One sentence on the change." },
+        find: { type: "string", description: "Exact current text." },
+        replace: { type: "string" },
+        replace_all: { type: "boolean" },
+        summary: { type: "string", description: "One sentence." },
       },
       required: ["path", "find", "replace", "summary"],
     },
@@ -690,12 +801,12 @@ const compareTool: ToolImpl = {
   def: {
     name: "compare",
     description:
-      "Run a command on the ORIGINAL code and on your CURRENT code and compare the results (verdict: fixes / regression / pre_existing / passes). Use it whenever a test fails, to see whether your change caused the failure or it already existed, and to show your reproduction goes from failing to passing. Pre-existing failures unrelated to the task are not yours to fix.",
+      "Run a command on the ORIGINAL and your CURRENT code; verdict: fixes / regression / pre_existing / passes. Use it when a test fails (did you cause it?) and to show your repro goes fail→pass. Unrelated pre-existing failures are not yours to fix.",
     input_schema: {
       type: "object",
       properties: {
-        command: { type: "string", description: "Shell command to run in both states (keep it targeted)." },
-        timeout_seconds: { type: "number", description: "Kill after this long. Default 180." },
+        command: { type: "string", description: "Targeted shell command." },
+        timeout_seconds: { type: "number", description: "Default 180." },
       },
       required: ["command"],
     },
@@ -715,15 +826,14 @@ const finishTool: ToolImpl = {
   def: {
     name: "finish",
     description:
-      "End the task. The harness then VERIFIES your work: it runs your reproduction command and the existing tests related to the files you changed, on the original code and on your patched code. A reproduction that fails before and passes after is proof of the fix; a test that passed before and fails after is a regression, and the task comes back to you with the failing output.",
+      "End the task. The harness VERIFIES it: runs your reproduction and the tests related to your changed files on the original and patched code. Repro fail→pass proves the fix; a test pass→fail is a regression and returns the task to you.",
     input_schema: {
       type: "object",
       properties: {
-        summary: { type: "string", description: "Root cause and what you changed, 2-6 sentences." },
+        summary: { type: "string", description: "Root cause and change, 2-6 sentences." },
         reproduction: {
           type: "string",
-          description:
-            "Shell command (run from the repo root) that fails on the original code and passes with your fix, e.g. 'python .viberon/scratch/repro.py'.",
+          description: "Command (repo root) failing before and passing after your fix, e.g. 'python .viberon/scratch/repro.py'.",
         },
       },
       required: ["summary"],
@@ -744,7 +854,7 @@ const finishTool: ToolImpl = {
 const doneTool: ToolImpl = {
   def: {
     name: "done",
-    description: "Finish: give the shell command, run from the repository root, that runs your independent test.",
+    description: "Finish: the command (from the repo root) that runs your independent test.",
     input_schema: {
       type: "object",
       properties: {
@@ -766,12 +876,12 @@ const deleteFileTool: ToolImpl = {
   def: {
     name: "delete_file",
     description:
-      "Delete a file from the workspace. Irreversible from the agent's side, though the user can restore it from the change trace.",
+      "Delete a file (the user can restore it from the change trace).",
     input_schema: {
       type: "object",
       properties: {
         path: { type: "string" },
-        summary: { type: "string", description: "Why it is being deleted." },
+        summary: { type: "string", description: "Why." },
       },
       required: ["path", "summary"],
     },
@@ -807,7 +917,7 @@ const renameFileTool: ToolImpl = {
   def: {
     name: "rename_file",
     description:
-      "Move or rename a file. Remember to update imports that referenced the old path — use grep to find them.",
+      "Move or rename a file, then grep for and update imports of the old path.",
     input_schema: {
       type: "object",
       properties: {
@@ -872,23 +982,13 @@ const runCommandTool: ToolImpl = {
   def: {
     name: "run_command",
     description:
-      "Run a shell command in the workspace root. Use it to install dependencies, run builds, run tests, start dev servers, and inspect git. Output is returned (trimmed). For long-running servers, set background: true and read the URL from the result.",
+      "Run a shell command in the workspace root (install, build, test, git). Output is condensed. For servers set background: true and read the URL from the result.",
     input_schema: {
       type: "object",
       properties: {
-        command: {
-          type: "string",
-          description: "The shell command, e.g. 'npm install' or 'npm run build'.",
-        },
-        background: {
-          type: "boolean",
-          description:
-            "For dev servers and watchers: start it and return immediately instead of waiting for exit.",
-        },
-        timeout_seconds: {
-          type: "number",
-          description: "Kill after this long. Default 120.",
-        },
+        command: { type: "string" },
+        background: { type: "boolean", description: "Return immediately (servers, watchers)." },
+        timeout_seconds: { type: "number", description: "Default 120." },
       },
       required: ["command"],
     },
@@ -998,23 +1098,17 @@ const rememberTool: ToolImpl = {
   def: {
     name: "remember",
     description:
-      "Write something into durable project memory so future sessions know it without re-deriving it. Use for architecture decisions and their rationale, conventions you discovered, non-obvious facts, and suggestions you are not acting on now. Keep each entry to one sentence.",
+      "Save one sentence to durable project memory for future sessions: a decision and why, a convention, a non-obvious fact, or a suggestion for later.",
     input_schema: {
       type: "object",
       properties: {
         kind: {
           type: "string",
           enum: ["decision", "fact", "convention", "suggestion"],
-          description:
-            "decision = a choice made and why. fact = something true about the code. convention = a rule to follow. suggestion = an idea for later.",
         },
-        text: { type: "string", description: "One-sentence statement." },
-        why: { type: "string", description: "Rationale, if it matters." },
-        files: {
-          type: "array",
-          items: { type: "string" },
-          description: "Related file paths.",
-        },
+        text: { type: "string" },
+        why: { type: "string" },
+        files: { type: "array", items: { type: "string" } },
       },
       required: ["kind", "text"],
     },
@@ -1041,11 +1135,11 @@ const describeProjectTool: ToolImpl = {
   def: {
     name: "describe_project",
     description:
-      "Set or refine the project overview in memory — a short paragraph on what this project is and how it is organised. Update it whenever the architecture meaningfully changes.",
+      "Set the project overview in memory: a short paragraph on what it is and how it is organised. Update it when the architecture changes.",
     input_schema: {
       type: "object",
       properties: {
-        overview: { type: "string", description: "A short paragraph." },
+        overview: { type: "string" },
       },
       required: ["overview"],
     },
@@ -1063,12 +1157,12 @@ const describeFileTool: ToolImpl = {
   def: {
     name: "describe_file",
     description:
-      "Attach a one-line purpose to a file in the symbol index, so future turns understand it without opening it. Cheap and high-leverage — do this for files you just wrote.",
+      "Attach a one-line purpose to a file in the symbol index so later turns need not open it. Do it for files you just wrote.",
     input_schema: {
       type: "object",
       properties: {
         path: { type: "string" },
-        purpose: { type: "string", description: "One line, under 100 chars." },
+        purpose: { type: "string", description: "Under 100 chars." },
       },
       required: ["path", "purpose"],
     },
@@ -1087,7 +1181,7 @@ const trackTaskTool: ToolImpl = {
   def: {
     name: "track_task",
     description:
-      "Create or update a durable task. These survive reloads, so the project always knows what is in flight and what remains. Mark tasks done as you finish them.",
+      "Create or update a durable task (survives reloads). Mark tasks done as you finish them.",
     input_schema: {
       type: "object",
       properties: {
@@ -1120,7 +1214,7 @@ const listWorkspaceTool: ToolImpl = {
   def: {
     name: "workspace_stats",
     description:
-      "Current workspace totals: file count, total source tokens, indexed symbols, and available npm scripts. Use to sanity-check scale before a broad change.",
+      "Workspace totals: files, source tokens, symbols, npm scripts. Check scale before a broad change.",
     input_schema: { type: "object", properties: {} },
   },
   async run(_args, ctx) {
@@ -1150,7 +1244,7 @@ const todoWriteTool: ToolImpl = {
   def: {
     name: "todo_write",
     description:
-      "Keep a visible checklist for this task. Send the FULL list every time (it replaces the previous one). Use it for work with three or more steps: write the plan first, keep exactly one item in_progress, and mark items completed as soon as they are done.",
+      "Visible checklist for work of 3+ steps. Send the FULL list each time (it replaces the last); keep one item in_progress; mark items completed when done.",
     input_schema: {
       type: "object",
       properties: {
@@ -1159,8 +1253,8 @@ const todoWriteTool: ToolImpl = {
           items: {
             type: "object",
             properties: {
-              id: { type: "string", description: "Stable id, e.g. '1'." },
-              content: { type: "string", description: "Short imperative." },
+              id: { type: "string" },
+              content: { type: "string" },
               status: { type: "string", enum: [...TODO_STATUSES] },
             },
             required: ["content", "status"],

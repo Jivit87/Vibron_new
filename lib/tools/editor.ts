@@ -207,6 +207,9 @@ export function similarity(a: string, b: string): number {
   return (2 * overlap) / (a.length - 1 + (b.length - 1));
 }
 
+/** A miss report shows the similar region whole up to this many lines. */
+const MISS_MAX_LINES = 30;
+
 function missReport(content: string, oldStr: string, rel: string): string {
   const fileLines = content.split("\n");
   const oldLines = oldStr.split("\n");
@@ -231,7 +234,9 @@ function missReport(content: string, oldStr: string, rel: string): string {
   if (bestI >= 0 && best > 0.45) {
     const lo = Math.max(0, bestI - 2);
     const hi = Math.min(fileLines.length, bestI + k + 2);
-    message += `\nThe most similar region (${Math.round(Math.min(1, best) * 100)}% similar) is lines ${bestI + 1}-${bestI + k}:\n${numberLines(fileLines.slice(lo, hi), lo + 1)}\nCopy the exact current text from the file (without the line-number column) into \`find\`.`;
+    // A long `find` must not come back whole: show its ends only.
+    const region = hi - lo > MISS_MAX_LINES ? changeSnippet(fileLines, bestI, bestI + k - 1) : numberLines(fileLines.slice(lo, hi), lo + 1);
+    message += `\nThe most similar region (${Math.round(Math.min(1, best) * 100)}% similar) is lines ${bestI + 1}-${bestI + k}:\n${region}\nCopy the exact current text from the file (without the line-number column) into \`find\`.`;
   } else {
     message += " Read the relevant lines again to copy the exact current text.";
   }

@@ -18,6 +18,8 @@ export const VIEW_FULL_MAX_LINES = 400;
 const VIEW_RANGE_MAX = 400;
 const SECTION_MAX = 120;
 const OUTLINE_MAX = 200;
+/** Lines of expanded sections in a long file's outline; further matches stay folded. */
+const EXPANDED_MAX = 240;
 
 const DEF_RE =
   /^(\s*)(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:def|class|function\*?|interface|type|enum|struct|impl|fn|func|trait|module)\s+[A-Za-z_$][\w$]*|^(\s*)(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:\(|function|[A-Za-z_$][\w$]*\s*=>)|^(\s+)(?:(?:public|private|protected|static|async|get|set|override|readonly)\s+)*(?!(?:if|for|while|switch|catch|return|else|do|with)\b)[A-Za-z_$][\w$]*\s*\([^)]*\)\s*(?::[^={]+)?\{\s*$/;
@@ -88,14 +90,27 @@ export function renderView(path: string, source: string, options: { start?: numb
   const shown = new Set<number>();
   for (const s of secs.slice(0, OUTLINE_MAX)) shown.add(s.start);
   const expanded: string[] = [];
+  const covered = new Set<number>();
+  let folded = 0;
   if (terms.length) {
     for (let i = 0; i < n; i += 1) {
-      if (!mentions(lines[i], terms)) continue;
+      if (covered.has(i) || !mentions(lines[i], terms)) continue;
       // The innermost definition around the hit; a long one shows a window instead.
       const around = secs.filter((s) => s.start <= i && i <= s.end).sort((a, b) => a.end - a.start - (b.end - b.start))[0];
       const [lo, hi] =
         around && around.end - around.start < SECTION_MAX ? [around.start, around.end] : [Math.max(0, i - 15), Math.min(n - 1, i + 15)];
-      for (let k = lo; k <= hi; k += 1) shown.add(k);
+      let added = 0;
+      for (let k = lo; k <= hi; k += 1) if (!covered.has(k)) added += 1;
+      // Past the budget, further matches stay folded (the first always shows).
+      if (covered.size > 0 && covered.size + added > EXPANDED_MAX) {
+        folded += 1;
+        for (let k = lo; k <= hi; k += 1) covered.add(k);
+        continue;
+      }
+      for (let k = lo; k <= hi; k += 1) {
+        shown.add(k);
+        covered.add(k);
+      }
       if (expanded.length < 8) expanded.push(`${lo + 1}-${hi + 1}`);
     }
   }
@@ -112,7 +127,8 @@ export function renderView(path: string, source: string, options: { start?: numb
   const head = expanded.length
     ? `${path} is long (${n} lines). Outline, with the sections matching your recent searches (${terms.slice(0, 6).join(", ")}) expanded at lines ${expanded.join(", ")}:`
     : `${path} is long (${n} lines). Outline (definition lines) and the first 30 lines:`;
-  return `${head}\n${out.join("\n")}\n[Use view with start_line/end_line to read any other region.]`;
+  const more = folded ? ` ${folded} more matching section(s) left folded.` : "";
+  return `${head}\n${out.join("\n")}\n[Use view with start_line/end_line to read any other region.${more}]`;
 }
 
 /** Definitions of a symbol: graph first, grep for what the graph does not cover. */
