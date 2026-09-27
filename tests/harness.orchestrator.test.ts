@@ -2,7 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import type { RunPlan } from "@/lib/agents/events";
 import { orchestrate, renormalizePlan, type OrchestrationInput } from "@/lib/agents/orchestrator";
-import { httpError, installFakeProvider, uninstallFakeProvider } from "./helpers/fake-provider";
+import {
+  httpError,
+  installConcurrencyProbe,
+  installFakeProvider,
+  uninstallFakeProvider,
+  waitUntil,
+} from "./helpers/fake-provider";
+import { MAX_CONCURRENCY } from "@/lib/limits";
 import { eventLog, makeWorkspace, type TestWorkspace } from "./helpers/harness-workspace";
 
 const FILES = [
@@ -131,6 +138,35 @@ describe("orchestrate", () => {
     await orchestrate(input(log, { interaction: "plan" }));
     const end = log.of("agent_tool").find((t) => t.callId === "p1" && t.phase === "end");
     expect(end?.ok).toBe(false);
+  });
+
+  it("raises the wave's actual in-flight specialists to the new ceiling of 10", async () => {
+    const probe = installConcurrencyProbe();
+    const steps = Array.from({ length: MAX_CONCURRENCY }, (_, i) => ({
+      id: `s${i}`,
+      title: `Step ${i}`,
+      role: "backend" as const,
+      detail: "Do work",
+      files: [`src/f${i}.ts`],
+      dependsOn: [],
+    }));
+    const approved: RunPlan = { summary: "Ten independent steps.", steps, waves: [] };
+
+    const log = eventLog();
+    const pending = orchestrate(input(log, { plan: approved, concurrency: MAX_CONCURRENCY }));
+
+    // Every step is independent, so the whole wave should be in flight at
+    // once — this is the genuine, end-to-end proof that raising the setting
+    // actually raises how many specialist model calls run concurrently.
+    await waitUntil(() => probe.inFlight === MAX_CONCURRENCY);
+    expect(probe.maxInFlight).toBe(MAX_CONCURRENCY);
+
+    probe.releaseAll();
+    await pending;
+
+    const done = log.of("agent_done");
+    expect(done).toHaveLength(MAX_CONCURRENCY);
+    expect(done.every((d) => !d.error)).toBe(true);
   });
 
   it("ends a cancelled run with run_done status cancelled", async () => {

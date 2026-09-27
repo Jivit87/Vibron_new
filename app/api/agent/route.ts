@@ -24,6 +24,7 @@ import { solveTask } from "@/lib/harness/solve";
 import { resolveModel } from "@/lib/ai";
 import { detectVerifyCommands } from "@/lib/verify";
 import { recordFixNote } from "@/lib/memory/graph";
+import { DEFAULT_CONCURRENCY, MAX_CONCURRENCY, MIN_CONCURRENCY } from "@/lib/limits";
 
 export const runtime = "nodejs";
 /** Long-horizon runs: a full-stack build can legitimately take minutes. */
@@ -99,7 +100,10 @@ export async function POST(request: Request) {
       ? body.commandPolicy
       : "ask";
   const editPolicy = body.editPolicy === "ask" ? "ask" : "auto";
-  const concurrency = Math.max(1, Math.min(6, Number(body.concurrency) || 3));
+  const concurrency = Math.max(
+    MIN_CONCURRENCY,
+    Math.min(MAX_CONCURRENCY, Number(body.concurrency) || DEFAULT_CONCURRENCY),
+  );
   const showThinking = body.showThinking !== false;
   const autoCheckpoint = body.autoCheckpoint !== false;
   const retrieval = {

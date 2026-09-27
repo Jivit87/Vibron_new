@@ -142,3 +142,56 @@ export function uninstallFakeProvider(): void {
 export function httpError(status: number, message = `HTTP ${status}`): Error {
   return Object.assign(new Error(message), { status });
 }
+
+/**
+ * A provider whose every `runTurn` blocks until `releaseAll` is called, so a
+ * test can watch how many calls the orchestrator opens at once before
+ * letting them all finish. `maxInFlight` is the high-water mark.
+ */
+export class ConcurrencyProbeProvider implements AiProvider {
+  readonly id = "anthropic" as const;
+  inFlight = 0;
+  maxInFlight = 0;
+  private waiters: Array<() => void> = [];
+
+  isConfigured(): boolean {
+    return true;
+  }
+
+  async runTurn(): Promise<AiTurnResult> {
+    this.inFlight += 1;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+    this.inFlight -= 1;
+    return {
+      text: "Done.",
+      thinking: "",
+      toolCalls: [],
+      stopReason: "end_turn",
+      content: [{ type: "text", text: "Done." }],
+      usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    };
+  }
+
+  /** Unblock every call currently parked on the barrier. */
+  releaseAll(): void {
+    const pending = this.waiters;
+    this.waiters = [];
+    pending.forEach((resolve) => resolve());
+  }
+}
+
+export function installConcurrencyProbe(): ConcurrencyProbeProvider {
+  const provider = new ConcurrencyProbeProvider();
+  setProviderOverride(provider, { sleep: async () => {} });
+  return provider;
+}
+
+/** Poll `cond` until it is true or `timeoutMs` elapses. */
+export async function waitUntil(cond: () => boolean, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitUntil: timed out");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}

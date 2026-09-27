@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import { MAX_CONCURRENCY, MIN_CONCURRENCY } from "@/lib/limits";
 import type { Graph } from "@/lib/graph";
 import type { OrchestrationEvent, PlanStep, RunPlan } from "@/lib/agents/events";
 import type { Interaction } from "@/lib/harness/contracts";
@@ -201,7 +202,7 @@ function loadSettings(): AppSettings {
 function clampSettings(settings: AppSettings): AppSettings {
   return {
     ...settings,
-    concurrency: Math.max(1, Math.min(6, Math.round(settings.concurrency))),
+    concurrency: Math.max(MIN_CONCURRENCY, Math.min(MAX_CONCURRENCY, Math.round(settings.concurrency))),
     retrievalDepth: Math.max(1, Math.min(4, Math.round(settings.retrievalDepth))),
     maxNodes: Math.max(5, Math.min(60, Math.round(settings.maxNodes))),
     editorFontSize: Math.max(10, Math.min(22, Math.round(settings.editorFontSize))),

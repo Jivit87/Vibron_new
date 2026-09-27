@@ -10,6 +10,7 @@ import { Eye, EyeOff, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { isMockMode, MOCK_PROVIDER_STATUS } from "@/lib/client/mock-run";
+import { MAX_CONCURRENCY } from "@/lib/limits";
 import {
   anyProviderReady,
   normalizeProviderStatus,
@@ -223,8 +224,11 @@ export function SettingsPage() {
                 </Row>
               )}
               {show("parallel specialists concurrency") && (
-                <Row label="Parallel specialists" hint="Higher finishes sooner but hits provider rate limits more often.">
-                  <NumberInput value={settings.concurrency} min={1} max={6} onChange={set("concurrency")} />
+                <Row
+                  label="Parallel specialists"
+                  hint="Higher finishes sooner but hits rate limits more: at 10, NVIDIA's free tier (40 requests/min) and Groq's token cap will throttle more — runs slow down rather than fail. With a Claude subscription (CLI) model each specialist is a separate process (~150–250 MB RAM each)."
+                >
+                  <NumberInput value={settings.concurrency} min={1} max={MAX_CONCURRENCY} onChange={set("concurrency")} />
                 </Row>
               )}
               {show("show reasoning thinking") && (
