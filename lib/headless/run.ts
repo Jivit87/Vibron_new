@@ -50,7 +50,7 @@ export interface HeadlessOptions {
   signal?: AbortSignal;
   /** Progress lines (stderr in the CLI). */
   log?: (line: string) => void;
-  /** Final `reviewDiff` pass on an accepted fix (off by default). */
+  /** Final `reviewDiff` pass on an accepted fix (on unless false). */
   review?: boolean;
   reviewModel?: string;
   /** Run a blind independent issue test after the verification gate accepts. */
@@ -366,7 +366,8 @@ export async function runHeadless(options: HeadlessOptions, deps: HeadlessDeps =
           baseline: !options.noGate,
         },
         useRepoRules: false,
-        ...(options.review ? { review: true, ...(options.reviewModel ? { reviewModel: options.reviewModel } : {}) } : {}),
+        review: options.review !== false,
+        ...(options.reviewModel ? { reviewModel: options.reviewModel } : {}),
         ...(options.independentTest ? { independentTest: true } : {}),
       });
     } finally {

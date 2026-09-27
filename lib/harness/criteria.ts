@@ -17,8 +17,9 @@ ${issue}
 </issue>
 
 List the concrete, observable behaviours a maintainer's regression test would assert once the issue is resolved:
+- item 1: the general invariant the issue implies, stated in full generality (not only for the example's data);
 - every example in the issue, with its expected result;
-- natural sibling cases the same fix must also cover (related functions, classes, modes or arguments that share the code path);
+- sibling cases that vary the KIND of input, not just its shape: other value types or containers the same rule applies to (lists, sets, objects, not only the type in the example), other entry points or arguments that share the code path, and boundary values (empty, single, nested, None);
 - existing behaviour that must remain unchanged.
 Write at most ${MAX_CRITERIA} lines, each formatted "N. <inputs/situation> -> <expected observable result>". Be specific. Do not propose an implementation. If an expected result cannot be determined from the issue, write "unspecified" for it.`;
 

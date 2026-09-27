@@ -120,6 +120,24 @@ describe("blind independent test writer", () => {
     ]);
   });
 
+  it("starts without criteria still in flight and gets them appended on arrival", async () => {
+    let arrive!: (items: string[]) => void;
+    const options = await writerOptions({ criteria: [], lateCriteria: new Promise((resolve) => (arrive = resolve)) });
+    installFakeProvider([
+      (req) => {
+        expect(JSON.stringify(req.messages)).not.toContain("predicted_acceptance_criteria");
+        arrive(["answer() -> 2 for every caller"]);
+        return { calls: [{ name: "view", input: { path: "lib.js" } }] };
+      },
+      (req) => {
+        expect(JSON.stringify(req.messages.slice(1))).toContain("answer() -> 2 for every caller");
+        return { calls: [{ name: "create_file", input: { path: TEST_PATH, content: "require('node:assert/strict').equal(require('../../lib').answer(), 2);\n" } }] };
+      },
+      { calls: [{ name: "done", input: { command: COMMAND } }] },
+    ]);
+    expect((await draftIndependentTest(options))?.command).toBe(COMMAND);
+  });
+
   it("gives up without a command and says so", async () => {
     const options = await writerOptions({ maxSteps: 3 });
     installFakeProvider([{ text: "I cannot." }, { text: "Still no." }]);

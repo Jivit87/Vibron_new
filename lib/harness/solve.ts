@@ -682,14 +682,16 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
      */
     const draftP: Promise<IndependentDraft | null> = !writerOn
       ? Promise.resolve(null)
-      : criteriaReady
+      : Promise.race([criteriaReady, new Promise((resolve) => setTimeout(resolve, CRITERIA_GRACE_MS))])
           .then(() =>
             timed("testWriter", () =>
               draftIndependentTest({
                 root: workRoot,
                 baseRef: ref,
                 task: options.task,
-                criteria,
+                // Like the solver, the writer does not wait on a slow criteria call.
+                criteria: [...criteria],
+                ...(criteria.length ? {} : { lateCriteria: criteriaReady }),
                 summary: overview,
                 relatedTests: loc.testFiles,
                 model: options.reviewModel ?? options.model,

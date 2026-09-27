@@ -49,6 +49,8 @@ export interface DraftOptions {
   baseRef: string;
   task: string;
   criteria: string[];
+  /** Criteria still being predicted when the writer started: appended to its next turn on arrival. */
+  lateCriteria?: Promise<string[]>;
   /** Repository overview (stack, file count, test command). */
   summary: string;
   relatedTests: string[];
@@ -128,8 +130,16 @@ export async function draftIndependentTest(options: DraftOptions): Promise<Indep
     let command: string | null = null;
     let nudged = false;
     const refusal = `Refused: you may only create or edit files under ${SCRATCH_DIR}/. Never modify source files.`;
+    let late: string[] | null = null;
+    let lateSent = false;
+    void options.lateCriteria?.then((items) => (late = items)).catch(() => undefined);
     const controller: RunController = {
       isDone: () => command !== null,
+      onTurnEnd: async () => {
+        if (lateSent || !late?.length) return null;
+        lateSent = true;
+        return `[harness] ${renderCriteria(late)}`;
+      },
       beforeMutation: async ({ input }) => (inScratch(dir, input.path) ? null : refusal),
       onFinishAttempt: async () => {
         if (command !== null || nudged) return null;

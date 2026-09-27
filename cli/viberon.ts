@@ -6,7 +6,7 @@
  *   viberon run --repo <path> (--task <spec> | --issue <spec> | --task-file <file>)
  *               [--worktree] [--keep-worktree] [--out <dir>] [--test-cmd <cmd>]
  *               [--no-gate] [--max-turns <n>] [--timeout <sec>] [--model <id>]
- *               [--task-id <id>] [--json] [--review [--review-model <id>]]
+ *               [--task-id <id>] [--json] [--no-review] [--review-model <id>]
  *               [--deliver [--issue-url <url>]]
  *   viberon review [--repo <path>] [--base <ref> | --pr <url>] [--model <id>] [--json]
  *   viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--no-deliver] [--model <id>] [--json]
@@ -29,8 +29,9 @@ export const USAGE = `Usage:
       --model <id>        model id (default $VIBERON_MODEL, else the best configured model)
       --task-id <id>      id used for the bundle directory
       --json              print result.json to stdout
-      --review            review an accepted fix with a cheap model; a high finding sends it back once
-      --review-model <id> model for --review (default: the cheapest agentic model)
+      --no-review         skip the reviewer (on by default: a cheap model reviews an accepted fix for
+                          missed sibling cases; a high finding sends it back once)
+      --review-model <id> model for the reviewer (default: the cheapest agentic model)
       --independent-test  generate and execute a blind issue test with local runner permissions
       --deliver           on a verified fix: branch viberon/<slug>, commit, push, open a draft PR
       --issue-url <url>   with --deliver: comment the PR and evidence on this issue
@@ -133,7 +134,7 @@ export type CliArgs = RunArgs | ReviewArgs | IssuesArgs | CloneArgs | EvalArgs |
 
 export class CliError extends Error {}
 
-const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-deliver", "independent-test", "gold"]);
+const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-review", "no-deliver", "independent-test", "gold"]);
 
 function splitFlags(argv: string[]): { flags: Map<string, string | true>; positionals: string[] } {
   const flags = new Map<string, string | true>();
@@ -179,7 +180,7 @@ const KNOWN: Record<string, Set<string>> = {
   run: new Set([
     "repo", "task", "issue", "task-file", "task-id", "worktree", "keep-worktree", "out", "test-cmd",
     "no-gate", "max-turns", "timeout", "model", "json", "help", "deliver", "issue-url",
-    "review", "review-model", "independent-test",
+    "review", "no-review", "review-model", "independent-test",
   ]),
   review: new Set(["repo", "base", "pr", "model", "json", "help"]),
   issues: new Set(["repo", "label", "fix", "no-deliver", "model", "json", "help"]),
@@ -217,7 +218,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
     const issueUrl = stringFlag(flags, "issue-url");
     if (issueUrl && !flags.has("deliver")) throw new CliError("run: --issue-url needs --deliver");
     const reviewModel = stringFlag(flags, "review-model");
-    if (reviewModel && !flags.has("review")) throw new CliError("run: --review-model needs --review");
+    if (reviewModel && flags.has("no-review")) throw new CliError("run: --review-model conflicts with --no-review");
     return {
       command,
       repo,
@@ -235,7 +236,8 @@ export function parseCliArgs(argv: string[]): CliArgs {
       json: flags.has("json"),
       ...(flags.has("deliver") ? { deliver: true } : {}),
       ...(issueUrl ? { issueUrl } : {}),
-      ...(flags.has("review") ? { review: true } : {}),
+      // The reviewer is on by default: it is the layer that catches incomplete fixes.
+      review: !flags.has("no-review"),
       ...(reviewModel ? { reviewModel } : {}),
       ...(flags.has("independent-test") ? { independentTest: true } : {}),
     };

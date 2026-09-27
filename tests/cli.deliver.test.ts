@@ -27,12 +27,14 @@ describe("parseCliArgs: deliver and review", () => {
     expect(() => parseCliArgs(["review", "--base", "main", "--pr", "x"])).toThrow(CliError);
   });
 
-  it("parses run --review --review-model", () => {
-    expect(parseCliArgs(["run", "--repo", "/r", "--task", "t", "--review", "--review-model", "m"])).toMatchObject({
+  it("reviews by default; --no-review turns it off; --review-model picks the reviewer", () => {
+    expect(parseCliArgs(["run", "--repo", "/r", "--task", "t"])).toMatchObject({ review: true });
+    expect(parseCliArgs(["run", "--repo", "/r", "--task", "t", "--review-model", "m"])).toMatchObject({
       review: true,
       reviewModel: "m",
     });
-    expect(() => parseCliArgs(["run", "--repo", "/r", "--task", "t", "--review-model", "m"])).toThrow(CliError);
+    expect(parseCliArgs(["run", "--repo", "/r", "--task", "t", "--no-review"])).toMatchObject({ review: false });
+    expect(() => parseCliArgs(["run", "--repo", "/r", "--task", "t", "--no-review", "--review-model", "m"])).toThrow(CliError);
   });
 
   it("review: exit 0 with nothing to review, 2 on a bad base ref", async () => {
