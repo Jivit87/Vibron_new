@@ -10,7 +10,7 @@
  */
 
 import { isMockMode, mockFixIssues, mockIssues, mockSaveWatch, mockWatch } from "@/lib/client/mock-run";
-import { normalizeTask, normalizeTaskState, type TaskRow, type TaskState } from "@/lib/client/deliver";
+import { normalizeTask, normalizeTaskState, taskUsage, type TaskRow, type TaskState, type TaskUsageRow } from "@/lib/client/deliver";
 
 /* -------------------------------- helpers -------------------------------- */
 
@@ -45,6 +45,7 @@ export interface IssueTask {
   prUrl?: string;
   error?: string;
   note?: string;
+  usage?: TaskUsageRow;
 }
 
 export interface IssueRow {
@@ -91,6 +92,7 @@ export function normalizeIssueTask(raw: unknown): IssueTask | null {
     prUrl: str(r.prUrl) ?? str(result?.prUrl) ?? str(r.pr_url),
     error: str(err) ?? str(rec(err)?.message),
     note: str(r.note) ?? str(result?.note) ?? str(r.reason),
+    usage: taskUsage(r),
   };
 }
 
@@ -210,7 +212,7 @@ export function issueStatus(task: IssueTask | null): IssueStatus {
     case "failed":
       return { kind: "failed", label: "failed", detail: task.error ?? task.note };
     case "cancelled":
-      return { kind: "cancelled", label: "cancelled", detail: task.note };
+      return { kind: "cancelled", label: "stopped", detail: task.note };
     case "done":
       return task.prUrl
         ? { kind: "done", label: "done" }

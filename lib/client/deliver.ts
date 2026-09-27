@@ -19,6 +19,7 @@ import {
   mockTasks,
 } from "@/lib/client/mock-run";
 import type { Evidence } from "@/lib/client/run-reducer";
+import { formatTok, formatUsd } from "@/lib/client/usage";
 
 /* -------------------------------- helpers -------------------------------- */
 
@@ -360,6 +361,36 @@ export interface TaskRow {
   prUrl?: string;
   issueUrl?: string;
   error?: string;
+  /** Why a task that succeeded was not delivered, or a caveat. */
+  note?: string;
+  /** Token use and cost: live while running, final after. */
+  usage?: TaskUsageRow;
+}
+
+export interface TaskUsageRow {
+  tokens: number;
+  costUsd: number;
+}
+
+/**
+ * A task's usage: the server's `usage` (summed from the task's `turn_usage`
+ * events while it runs, final after), else the solve result's metrics (a
+ * task persisted before usage was recorded).
+ */
+export function taskUsage(raw: unknown): TaskUsageRow | undefined {
+  const r = rec(raw);
+  const u = rec(r?.usage) ?? rec(rec(r?.result)?.metrics);
+  if (!u) return undefined;
+  const tokens =
+    (num(u.inputTokens) ?? 0) + (num(u.outputTokens) ?? 0) + (num(u.cacheReadTokens) ?? 0) + (num(u.cacheWriteTokens) ?? 0);
+  const costUsd = num(u.costUsd) ?? 0;
+  return tokens > 0 || costUsd > 0 ? { tokens, costUsd } : undefined;
+}
+
+/** "48.2k tok · $0.07" (the format of the status bar's usage line). */
+export function taskUsageLine(usage: TaskUsageRow | undefined): string {
+  if (!usage) return "";
+  return `${formatTok(usage.tokens)} tok · ${formatUsd(usage.costUsd)}`;
 }
 
 export function normalizeTaskState(value: unknown): TaskState {
@@ -390,6 +421,8 @@ export function normalizeTask(raw: unknown): TaskRow | null {
     prUrl: str(r.prUrl) ?? str(result?.prUrl),
     issueUrl: str(r.issueUrl),
     error: str(r.error) ?? (typeof rec(r.error)?.message === "string" ? String(rec(r.error)?.message) : undefined),
+    note: str(r.note),
+    usage: taskUsage(r),
   };
 }
 
@@ -457,6 +490,23 @@ export async function cancelTask(id: string): Promise<{ ok: boolean; error?: str
     return { ok: false, error: str(body?.error) ?? `Cancel failed (HTTP ${response.status})` };
   } catch {
     return { ok: false, error: "Network error" };
+  }
+}
+
+/** Stop all: cancel every queued and running task of the repo. */
+export async function stopAllTasks(repoKey: string): Promise<{ ok: boolean; stopped: number; error?: string }> {
+  if (isMockMode()) {
+    const active = normalizeTasks(mockTasks()).filter((t) => t.state === "queued" || t.state === "running");
+    for (const t of active) mockCancelTask(t.id);
+    return { ok: true, stopped: active.length };
+  }
+  try {
+    const response = await fetch(`/api/tasks?repoKey=${encodeURIComponent(repoKey)}`, { method: "DELETE" });
+    const body = rec(await response.json().catch(() => null));
+    if (!response.ok) return { ok: false, stopped: 0, error: str(body?.error) ?? `Stop failed (HTTP ${response.status})` };
+    return { ok: true, stopped: Array.isArray(body?.tasks) ? body.tasks.length : 0 };
+  } catch {
+    return { ok: false, stopped: 0, error: "Network error" };
   }
 }
 

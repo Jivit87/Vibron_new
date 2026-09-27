@@ -186,3 +186,158 @@ describe("tasks routes", () => {
     delete (globalThis as { __viberonTaskQueue?: TaskQueue }).__viberonTaskQueue;
   });
 });
+
+describe("Stop and usage", () => {
+  const usage = (n: number): OrchestrationEvent => ({
+    type: "turn_usage",
+    agentId: "solver",
+    model: "m",
+    inputTokens: 1000 * n,
+    outputTokens: 100 * n,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costUsd: 0.01 * n,
+    uncachedUsd: 0.01 * n,
+    contextTokens: 0,
+    at: n,
+  });
+
+  it("Stop all cancels the repo's queued tasks before they start and aborts the running one", async () => {
+    const { started, runners } = controlledRunners();
+    const cancelled: string[] = [];
+    const q = new TaskQueue(runners, { storeKey: key, onCancel: (t) => cancelled.push(t.id) });
+    const running = await q.enqueue(input("A", "one"));
+    const queued = await q.enqueue(input("A", "two"));
+    const other = await q.enqueue(input("B", "other repo"));
+    await tick();
+    const stopped = await q.cancelAll("A");
+    expect(stopped.map((t) => t.id).sort()).toEqual([running.id, queued.id].sort());
+    await tick();
+    expect((await q.get(running.id))!.state).toBe("cancelled");
+    expect((await q.get(queued.id))!.state).toBe("cancelled");
+    // The queued task never started; the other repo is untouched.
+    expect(started.map((s) => s.task.id)).toEqual([running.id, other.id]);
+    expect(cancelled).toEqual([running.id]);
+    expect((await q.get(other.id))!.state).toBe("running");
+    started[1]!.finish();
+    await q.idle();
+  });
+
+  it("a runner that ignores Stop is finished as cancelled after the grace period, and the next task starts", async () => {
+    const started: string[] = [];
+    let release: () => void = () => {};
+    const stubborn: TaskRunner = (task) => {
+      started.push(task.task);
+      if (task.task === "stuck") return new Promise((resolve) => (release = () => resolve({ prUrl: "https://github.com/o/r/pull/9" })));
+      return Promise.resolve({});
+    };
+    const q = new TaskQueue({ fix: stubborn, review: stubborn }, { storeKey: key, cancelGraceMs: 50 });
+    const stuck = await q.enqueue(input("A", "stuck"));
+    await q.enqueue(input("A", "next"));
+    await tick();
+    const at = Date.now();
+    await q.cancel(stuck.id);
+    for (let i = 0; i < 100 && (await q.get(stuck.id))!.state === "running"; i += 1) await tick();
+    expect(Date.now() - at).toBeLessThan(2_000);
+    expect(await q.get(stuck.id)).toMatchObject({ state: "cancelled" });
+    await tick();
+    expect(started).toEqual(["stuck", "next"]);
+    // Its late outcome is dropped: a stopped task never reports a PR.
+    release();
+    await q.idle();
+    expect((await q.get(stuck.id))!.prUrl).toBeUndefined();
+    expect((await q.get(stuck.id))!.state).toBe("cancelled");
+  });
+
+  it("ends an attached run view with run_done{cancelled} when the task is stopped", async () => {
+    const { started, runners } = controlledRunners();
+    const q = new TaskQueue(runners, { storeKey: key });
+    const task = await q.enqueue(input("A", "x"));
+    await tick();
+    started[0]!.emit({ type: "run_start", runId: task.id, mode: "single", model: "m", at: 1 });
+    const seen: OrchestrationEvent[] = [];
+    await q.subscribe(task.id, (e) => seen.push(e), () => undefined);
+    await q.cancel(task.id);
+    await q.idle();
+    expect(seen.at(-1)).toMatchObject({ type: "run_done", status: "cancelled" });
+  });
+
+  it("tracks token use live from turn_usage events and persists the final numbers", async () => {
+    const { started, runners } = controlledRunners();
+    const q = new TaskQueue(runners, { storeKey: key });
+    const task = await q.enqueue(input("A", "x"));
+    await tick();
+    started[0]!.emit(usage(2));
+    started[0]!.emit(usage(3));
+    expect((await q.get(task.id))!.usage).toEqual({
+      inputTokens: 5000,
+      outputTokens: 500,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      costUsd: 0.05,
+      calls: 2,
+    });
+    started[0]!.finish();
+    await q.idle();
+    // A fresh queue (a restart) reads the persisted usage.
+    const reloaded = new TaskQueue(controlledRunners().runners, { storeKey: key });
+    expect((await reloaded.get(task.id))!.usage?.costUsd).toBe(0.05);
+  });
+
+  it("prefers the solve's own metrics when they account for more (calls outside the runner)", async () => {
+    const runner: TaskRunner = async (_task, ctx) => {
+      ctx.emit(usage(1));
+      return {
+        result: { status: "resolved", metrics: { inputTokens: 4000, outputTokens: 400, cacheReadTokens: 1000, cacheWriteTokens: 0, costUsd: 0.2, modelCalls: 4 } } as never,
+      };
+    };
+    const q = new TaskQueue({ fix: runner, review: runner }, { storeKey: key });
+    const task = await q.enqueue(input("A", "x"));
+    await q.idle();
+    expect((await q.get(task.id))!.usage).toMatchObject({ inputTokens: 4000, costUsd: 0.2, calls: 4 });
+  });
+
+  it("routes: GET keeps live usage; GET :id returns the task; DELETE ?repoKey stops all", async () => {
+    const { started, runners } = controlledRunners();
+    const q = new TaskQueue(runners, { storeKey: key });
+    (globalThis as { __viberonTaskQueue?: TaskQueue }).__viberonTaskQueue = q;
+    try {
+      const { GET, DELETE } = await import("@/app/api/tasks/route");
+      const one = await import("@/app/api/tasks/[id]/route");
+      const a = await q.enqueue(input("A", "a"));
+      const b = await q.enqueue(input("A", "b"));
+      await tick();
+      started[0]!.emit(usage(1));
+      const list = (await (await GET(new Request("http://x/api/tasks?repoKey=A"))).json()) as { tasks: Task[] };
+      expect(list.tasks[0]).toMatchObject({ id: a.id, usage: { costUsd: 0.01 } });
+      expect((await DELETE(new Request("http://x/api/tasks"))).status).toBe(400);
+      const stopped = (await (await DELETE(new Request("http://x/api/tasks?repoKey=A"))).json()) as { tasks: Task[] };
+      expect(stopped.tasks.map((t) => t.id).sort()).toEqual([a.id, b.id].sort());
+      await q.idle();
+      const got = await one.GET(new Request("http://x"), { params: Promise.resolve({ id: a.id }) });
+      expect(((await got.json()) as Task).state).toBe("cancelled");
+      expect((await one.GET(new Request("http://x"), { params: Promise.resolve({ id: "nope" }) })).status).toBe(404);
+    } finally {
+      delete (globalThis as { __viberonTaskQueue?: TaskQueue }).__viberonTaskQueue;
+    }
+  });
+
+  it("GET /api/tasks omits each task's result (the Tasks panel polls it every 3s)", async () => {
+    const big = { status: "resolved", diff: "x".repeat(200_000), metrics: { costUsd: 0.1, inputTokens: 10, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+    const runner: TaskRunner = async () => ({ result: big as never });
+    const q = new TaskQueue({ fix: runner, review: runner }, { storeKey: key });
+    (globalThis as { __viberonTaskQueue?: TaskQueue }).__viberonTaskQueue = q;
+    try {
+      const { GET } = await import("@/app/api/tasks/route");
+      await q.enqueue(input("A", "a"));
+      await q.idle();
+      const slim = await (await GET(new Request("http://x/api/tasks?repoKey=A"))).text();
+      const full = await (await GET(new Request("http://x/api/tasks?repoKey=A&full=1"))).text();
+      expect(full.length).toBeGreaterThan(200_000);
+      expect(slim.length).toBeLessThan(2_000);
+      expect(JSON.parse(slim).tasks[0]).toMatchObject({ resultStatus: "resolved", usage: { costUsd: 0.1 } });
+    } finally {
+      delete (globalThis as { __viberonTaskQueue?: TaskQueue }).__viberonTaskQueue;
+    }
+  });
+});

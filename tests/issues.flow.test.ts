@@ -20,9 +20,23 @@ import type { Task } from "@/lib/tasks";
 import { makeTmpRepo, type TmpRepo } from "./helpers/tmp-repo";
 
 const solved: SolveOptions[] = [];
+/** Per-test behaviour before the stub solve finishes (block, abort, fail). */
+const hooks: { beforeSolve: ((options: SolveOptions) => Promise<void | "fail">) | null } = { beforeSolve: null };
 vi.mock("@/lib/harness/solve", () => ({
   solveTask: async (options: SolveOptions): Promise<SolveResult> => {
     solved.push(options);
+    const verdict = await hooks.beforeSolve?.(options);
+    if (verdict === "fail") {
+      return {
+        status: "failed",
+        summary: "could not reproduce",
+        diff: "",
+        filesChanged: [],
+        gate: { enabled: true, command: "python -m unittest", baseline: null, final: null, newFailures: [], fixed: [], rejections: 0, ranAfterLastEdit: true, reason: "no fix" },
+        recovery: { checkpoints: 0, rollbacks: 0, restoredBest: false, stuckEvents: 0, failureClasses: {} },
+        metrics: { modelCalls: 2 } as SolveResult["metrics"],
+      };
+    }
     writeFileSync(path.join(options.handle.rootPath!, "calc.py"), "def add(a, b):\n    return a + b\n");
     return {
       status: "resolved",
@@ -78,6 +92,14 @@ function fakeGithub(input: string | URL | Request, init?: RequestInit): Promise<
     });
   }
   if (url.includes("/issues/7/comments") && method === "GET") return json([{ body: "Still broken on main.", user: { login: "maint" } }]);
+  // More open issues for batch scenarios: #9..#12.
+  const other = /\/repos\/o\/r\/issues\/(9|10|11|12)(\/comments)?(\?|$)/.exec(url);
+  if (other && method === "GET") {
+    const n = Number(other[1]);
+    return other[2]
+      ? json([])
+      : json({ number: n, title: `issue ${n}`, body: "b", html_url: `https://github.com/o/r/issues/${n}`, state: "open", labels: [], user: null, comments: 0, created_at: "", updated_at: "" });
+  }
   if (url.includes("/pulls?state=open")) return json([]);
   if (url.endsWith("/repos/o/r/pulls") && method === "POST") {
     return json({ number: 12, title: body.title, body: body.body, html_url: "https://github.com/o/r/pull/12", state: "open", head: { ref: body.head, sha: "x" }, base: { ref: "main" } }, 201);
@@ -89,6 +111,7 @@ function fakeGithub(input: string | URL | Request, init?: RequestInit): Promise<
 beforeEach(() => {
   resetMemoryStoreForTests();
   solved.length = 0;
+  hooks.beforeSolve = null;
   posted.length = 0;
   process.env.GITHUB_TOKEN = "ghp_test";
   // Model resolution needs a configured provider; the stubbed solver never calls it.
@@ -223,5 +246,80 @@ describe("issue helpers", () => {
     expect(skipReason(t("done", "https://github.com/o/r/pull/1"))).toMatch(/already fixed/);
     expect(skipReason(t("failed"))).toBeNull();
     expect(skipReason(t("done"))).toBeNull();
+  });
+});
+
+describe("Stop", () => {
+  const issueTask = (repoKey: string): Task => ({
+    id: "stop-1",
+    kind: "fix",
+    repoKey,
+    task: "#7 add() subtracts",
+    source: "issue",
+    state: "running",
+    createdAt: Date.now(),
+    issueUrl: "https://github.com/o/r/issues/7",
+    deliver: true,
+    model: "claude-opus-5",
+  });
+
+  it("a stop that lands after the solve finished still pushes nothing and opens no PR", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { runFixTask } = await import("@/lib/tasks/runners");
+    const controller = new AbortController();
+    // The user presses Stop while the solve returns its (resolved) result.
+    hooks.beforeSolve = async () => controller.abort();
+    const outcome = await runFixTask(issueTask(repoKey), { emit: () => undefined, signal: controller.signal });
+    expect(outcome.error).toBe("Stopped.");
+    expect(outcome.prUrl).toBeUndefined();
+    expect(posted).toEqual([]);
+    expect(execFileSync("git", ["--git-dir", bare, "for-each-ref", "--format=%(refname)"], { encoding: "utf8" }).trim()).toBe("refs/heads/main");
+    expect(repo.git("worktree", "list").trim().split("\n")).toHaveLength(1);
+  });
+
+  it("stopping a batch aborts the running solves, never starts the next issue, and cleans up", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    // Every solve parks until Stop.
+    hooks.beforeSolve = (options) =>
+      new Promise<void>((resolve) => {
+        if (options.signal?.aborted) resolve();
+        options.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    const { tasks } = await fixIssues({ repoKey, numbers: [7, 9, 10, 11], combined: true, deliver: true });
+    const queue = getTaskQueue();
+    for (let i = 0; i < 400 && solved.length < 3; i += 1) await new Promise((r) => setTimeout(r, 10));
+    expect(solved).toHaveLength(3);
+    const stoppedAt = Date.now();
+    await queue.cancel(tasks[0]!.id);
+    await queue.idle();
+    expect(Date.now() - stoppedAt).toBeLessThan(2_000);
+    expect(solved).toHaveLength(3);
+    expect(await queue.get(tasks[0]!.id)).toMatchObject({ state: "cancelled" });
+    expect(posted).toEqual([]);
+    expect(repo.git("worktree", "list").trim().split("\n")).toHaveLength(1);
+    expect(repo.git("for-each-ref", "refs/viberon").trim()).toBe("");
+  });
+
+  it("a batch PR only claims the issues it fixed; the others stay fixable", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    hooks.beforeSolve = async (options) => (options.task.includes("issue 9") ? "fail" : undefined);
+    const { tasks } = await fixIssues({ repoKey, numbers: [7, 9], combined: true, deliver: true });
+    await getTaskQueue().idle();
+    const done = await getTaskQueue().get(tasks[0]!.id);
+    expect(done?.prUrl).toBe("https://github.com/o/r/pull/12");
+    expect(done?.issueResults).toEqual([
+      { url: "https://github.com/o/r/issues/7", fixed: true },
+      expect.objectContaining({ url: "https://github.com/o/r/issues/9", fixed: false }),
+    ]);
+    hooks.beforeSolve = async () => new Promise<void>(() => undefined);
+    const again = await fixIssues({ repoKey, numbers: [7, 9], deliver: false });
+    expect(again.skipped).toEqual([{ number: 7, reason: "already fixed in https://github.com/o/r/pull/12" }]);
+    expect(again.tasks.map((t) => t.issueUrl)).toEqual(["https://github.com/o/r/issues/9"]);
+    await getTaskQueue().cancelAll(repoKey);
+    await getTaskQueue().idle();
   });
 });

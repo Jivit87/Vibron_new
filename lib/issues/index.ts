@@ -89,11 +89,27 @@ function tasksByIssue(tasks: Task[]): Map<string, Task> {
     for (const url of t.issueUrls ?? (t.issueUrl ? [t.issueUrl] : [])) {
       const prev = out.get(url);
       if (!prev || (active(t) && !active(prev)) || (active(t) === active(prev) && t.createdAt > prev.createdAt)) {
-        out.set(url, t);
+        out.set(url, forIssue(t, url));
       }
     }
   }
   return out;
+}
+
+/**
+ * A finished batch's view for one of its issues: only the issues its PR
+ * really fixes are "done with a PR". The rest read as failed with their
+ * reason, so they can be fixed again (and the watcher does not skip them).
+ */
+function forIssue(task: Task, url: string): Task {
+  const outcome = task.issueResults?.find((r) => r.url === url);
+  if (!outcome || outcome.fixed || task.state === "queued" || task.state === "running") return task;
+  return {
+    ...task,
+    prUrl: undefined,
+    state: task.state === "cancelled" ? "cancelled" : "failed",
+    error: outcome.detail ?? "not fixed in this batch",
+  };
 }
 
 /** Why an issue must not be enqueued again, or null. */
@@ -112,7 +128,7 @@ export interface IssueRow {
   author: string | null;
   comments: number;
   updatedAt: string;
-  task: Pick<Task, "id" | "state" | "prUrl" | "error" | "note"> | null;
+  task: Pick<Task, "id" | "state" | "prUrl" | "error" | "note" | "usage"> | null;
 }
 
 export async function issueRows(repoKey: string, labels: string[] = [], opts?: ApiOptions): Promise<{ repo: RepoId; issues: IssueRow[] }> {
@@ -131,7 +147,7 @@ export async function issueRows(repoKey: string, labels: string[] = [], opts?: A
         author: i.author,
         comments: i.comments,
         updatedAt: i.updated_at,
-        task: t ? { id: t.id, state: t.state, prUrl: t.prUrl, error: t.error, note: t.note } : null,
+        task: t ? { id: t.id, state: t.state, prUrl: t.prUrl, error: t.error, note: t.note, ...(t.usage ? { usage: t.usage } : {}) } : null,
       };
     }),
   };

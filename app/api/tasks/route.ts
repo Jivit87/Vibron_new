@@ -8,7 +8,13 @@
  *   A review task's `task` may be a PR URL (reviews the PR) or instructions
  *   for reviewing the work tree's changes.
  *
- * GET /api/tasks?repoKey= → 200 { tasks: Task[] } (all repos when omitted), oldest first.
+ * GET /api/tasks?repoKey=[&full=1] → 200 { tasks: Task[] } (all repos when omitted), oldest first.
+ *   Polled every few seconds by the Tasks panel, so each task's `result` (a
+ *   whole SolveResult: diff, gate reports, metrics) is left out unless
+ *   `full=1`; `resultStatus`, `usage`, `prUrl`, `error` and `note` stay.
+ *
+ * DELETE /api/tasks?repoKey= → 200 { tasks: Task[] }: Stop all. Every queued
+ *   task of the repo is cancelled and every running one aborted.
  */
 
 import { ciFixTask, ciStatus } from "@/lib/deliver";
@@ -63,6 +69,20 @@ export async function POST(request: Request) {
 }
 
 export async function GET(request: Request) {
-  const repoKey = new URL(request.url).searchParams.get("repoKey") ?? undefined;
-  return Response.json({ tasks: await getTaskQueue().list(repoKey || undefined) });
+  const params = new URL(request.url).searchParams;
+  const repoKey = params.get("repoKey") ?? undefined;
+  const tasks = await getTaskQueue().list(repoKey || undefined);
+  if (params.get("full") === "1") return Response.json({ tasks });
+  return Response.json({
+    tasks: tasks.map(({ result, ...rest }) => ({
+      ...rest,
+      ...(result ? { resultStatus: (result as { status?: string }).status } : {}),
+    })),
+  });
+}
+
+export async function DELETE(request: Request) {
+  const repoKey = new URL(request.url).searchParams.get("repoKey")?.trim();
+  if (!repoKey) return Response.json({ error: "repoKey is required" }, { status: 400 });
+  return Response.json({ tasks: await getTaskQueue().cancelAll(repoKey) });
 }

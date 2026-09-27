@@ -67,3 +67,91 @@ describe("client ↔ deliver routes", () => {
     expect(normalizeRerun({ ok: true, attempt: 1, remaining: 2 }, 200)).toMatchObject({ reruns: 1, limit: 3 });
   });
 });
+
+describe("Stop and usage: client ↔ tasks routes", () => {
+  function stubWindow() {
+    vi.stubGlobal("window", {
+      location: { search: "" },
+      requestAnimationFrame: (cb: () => void) => setTimeout(cb, 0) as unknown as number,
+      cancelAnimationFrame: (id: number) => clearTimeout(id),
+      sessionStorage: { getItem: () => null, setItem: () => undefined, removeItem: () => undefined },
+    });
+  }
+
+  it("Stop on a task shown in the run view cancels the task on the server and ends the view as stopped", async () => {
+    stubWindow();
+    const calls: { url: string; method: string }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, method: init?.method ?? "GET" });
+        if (url === "/api/tasks/t1/events") {
+          const encoder = new TextEncoder();
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "run_start", runId: "t1", mode: "single", model: "m", at: 1 })}\n\n`));
+              init?.signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+            },
+          });
+          return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+        }
+        if (url === "/api/tasks/t1" && init?.method === "DELETE") return Response.json({ id: "t1", state: "running" });
+        return new Response("{}", { status: 404 });
+      }),
+    );
+    const { attachTaskRun, cancelRun } = await import("@/lib/client/agent-stream");
+    const { useViberon } = await import("@/store/viberon");
+    const attached = attachTaskRun({ id: "t1", task: "Fix #1" });
+    for (let i = 0; i < 100 && !useViberon.getState().run?.id; i += 1) await new Promise((r) => setTimeout(r, 5));
+    expect(useViberon.getState().streaming).toBe(true);
+    await cancelRun();
+    await attached;
+    expect(calls).toContainEqual({ url: "/api/tasks/t1", method: "DELETE" });
+    expect(calls.some((c) => c.url === "/api/agent/cancel")).toBe(false);
+    expect(useViberon.getState().streaming).toBe(false);
+    expect(useViberon.getState().run?.status).toBe("cancelled");
+  });
+
+  it("an attached stream that ends without run_done takes the task's real final state", async () => {
+    stubWindow();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url === "/api/tasks/t2/events") {
+          return new Response(`data: ${JSON.stringify({ type: "run_start", runId: "t2", mode: "single", model: "m", at: 1 })}\n\n`, {
+            headers: { "Content-Type": "text/event-stream" },
+          });
+        }
+        if (url === "/api/tasks/t2") return Response.json({ id: "t2", state: "failed", error: "boom" });
+        return new Response("{}", { status: 404 });
+      }),
+    );
+    const { attachTaskRun } = await import("@/lib/client/agent-stream");
+    const { useViberon } = await import("@/store/viberon");
+    await attachTaskRun({ id: "t2", task: "x" });
+    expect(useViberon.getState().run?.status).toBe("failed");
+  });
+
+  it("task rows carry live and final usage as '48.2k tok · $0.07'", async () => {
+    const { normalizeTasks, taskUsageLine } = await import("@/lib/client/deliver");
+    const { normalizeIssues } = await import("@/lib/client/issues");
+    const rows = normalizeTasks({
+      tasks: [
+        // GET /api/tasks: live usage from the server.
+        { id: "a", kind: "fix", repoKey: "k", task: "t", source: "ui", state: "running", createdAt: 1, usage: { inputTokens: 40_000, outputTokens: 2_200, cacheReadTokens: 6_000, cacheWriteTokens: 0, costUsd: 0.0712, calls: 3 } },
+        // A task stored before usage was recorded: its result's metrics.
+        { id: "b", kind: "fix", repoKey: "k", task: "t", source: "ui", state: "done", createdAt: 1, result: { metrics: { inputTokens: 900, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0.002 } } },
+        { id: "c", kind: "review", repoKey: "k", task: "t", source: "ui", state: "queued", createdAt: 2 },
+      ],
+    });
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    expect(taskUsageLine(byId.get("a")!.usage)).toBe("48.2k tok · $0.07");
+    expect(taskUsageLine(byId.get("b")!.usage)).toBe("950 tok · $0.0020");
+    expect(taskUsageLine(byId.get("c")!.usage)).toBe("");
+    // The issues route's rows carry the same usage for the Issues panel.
+    const list = normalizeIssues({
+      issues: [{ number: 1, title: "t", url: "u", labels: [], author: null, comments: 0, updatedAt: 0, task: { id: "a", state: "running", usage: { inputTokens: 1000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0.01 } } }],
+    });
+    expect(taskUsageLine(list.issues[0]!.task!.usage)).toBe("1k tok · $0.01");
+  });
+});

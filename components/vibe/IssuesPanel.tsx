@@ -8,11 +8,12 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ExternalLink, Loader2, RefreshCw } from "lucide-react";
+import { ExternalLink, Loader2, RefreshCw, Square } from "lucide-react";
 import { toast } from "sonner";
 
 import { attachedTask, attachTaskRun } from "@/lib/client/agent-stream";
-import { shortRef } from "@/lib/client/deliver";
+import { cancelTask, shortRef, taskUsageLine } from "@/lib/client/deliver";
+import { sameJson, usePolling } from "@/lib/client/use-polling";
 import {
   canFix,
   clampInterval,
@@ -68,6 +69,8 @@ export function IssuesPanel() {
   const [pending, setPending] = useState<Set<number>>(new Set());
   const [skipped, setSkipped] = useState<Map<number, string>>(new Map());
   const [fixError, setFixError] = useState<IssuesError | null>(null);
+  /** Fix tasks the user asked to stop that the server still reports active. */
+  const [stopping, setStopping] = useState<Set<string>>(new Set());
 
   const [watch, setWatch] = useState<WatchConfig>(WATCH_DEFAULT);
   const [watchLabel, setWatchLabel] = useState(WATCH_DEFAULT.label);
@@ -101,7 +104,15 @@ export function IssuesPanel() {
     }
     const { data } = result;
     setError(null);
-    setRows(data.issues);
+    setRows((prev) => (prev && sameJson(prev, data.issues) ? prev : data.issues));
+    setStopping((prev) => {
+      if (!prev.size) return prev;
+      const active = new Set(
+        data.issues.filter((r) => r.task && (r.task.state === "running" || r.task.state === "queued")).map((r) => r.task!.id),
+      );
+      const kept = new Set([...prev].filter((id) => active.has(id)));
+      return kept.size === prev.size ? prev : kept;
+    });
     setRepo(data.repo ? `${data.repo.owner}/${data.repo.repo}` : null);
     if (data.watch) applyWatch(data.watch);
     // Drop selections that are gone or no longer fixable.
@@ -117,10 +128,26 @@ export function IssuesPanel() {
 
   useEffect(() => {
     void refresh();
-    if (stop) return;
-    const id = window.setInterval(() => void refresh(), interval);
-    return () => window.clearInterval(id);
-  }, [refresh, interval, stop]);
+  }, [refresh]);
+  // Paused while the window is hidden; the server answers from GitHub's
+  // ETag cache, so an unchanged issue list costs no rate limit.
+  usePolling(refresh, interval, !stop);
+
+  async function stopTask(row: IssueRow) {
+    if (!row.task) return;
+    const id = row.task.id;
+    setStopping((prev) => new Set(prev).add(id));
+    const result = await cancelTask(id);
+    if (!result.ok) {
+      toast.error(result.error ?? "Could not stop the fix.");
+      setStopping((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+    void refresh();
+  }
 
   async function fixAll() {
     if (!repoKey) return;
@@ -365,6 +392,7 @@ export function IssuesPanel() {
                   </th>
                   <th className="w-[70px] py-0.5 pl-3 font-normal">updated</th>
                   <th className="w-[132px] py-0.5 font-normal">status</th>
+                  <th className="w-[112px] py-0.5 font-normal">tokens</th>
                   <th className="w-[66px] py-0.5" />
                 </tr>
               </thead>
@@ -377,6 +405,8 @@ export function IssuesPanel() {
                   const skipReason = skipped.get(row.number);
                   const fixableRow = canFix(row);
                   const isAttached = Boolean(row.task && attached === row.task.id);
+                  const isActiveTask = row.task?.state === "running" || row.task?.state === "queued";
+                  const isStopping = Boolean(row.task && isActiveTask && stopping.has(row.task.id));
                   return (
                     <tr
                       key={row.number}
@@ -427,7 +457,23 @@ export function IssuesPanel() {
                           onAttach={() => !isAttached && attach(row)}
                         />
                       </td>
+                      <td className="truncate pr-2 font-mono text-[11px]" style={{ color: "var(--vb-text-dim)" }}>
+                        {taskUsageLine(row.task?.usage)}
+                      </td>
                       <td className="pr-2 text-right">
+                        {isActiveTask && (
+                          <button
+                            type="button"
+                            className="vb-btn vb-btn-ghost"
+                            style={{ ...SMALL_BTN, color: "var(--vb-rose)" }}
+                            disabled={isStopping}
+                            title={isStopping ? "Stopping…" : `Stop the fix for #${row.number}`}
+                            onClick={() => void stopTask(row)}
+                          >
+                            {isStopping ? <Loader2 className="size-3 animate-spin" /> : <Square className="size-3" />}
+                            {isStopping ? "Stopping" : "Stop"}
+                          </button>
+                        )}
                         {fixableRow && (
                           <button
                             type="button"

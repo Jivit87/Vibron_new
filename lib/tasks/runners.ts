@@ -22,7 +22,7 @@ import { parsePrUrl } from "@/lib/github-api";
 import { recordFixNote, relevantLessons } from "@/lib/memory/graph";
 import { fetchIssueTask } from "@/lib/issues";
 import { registerLocalWorkspace } from "@/lib/local-disk-workspace";
-import type { Task, TaskOutcome, TaskRunner } from "@/lib/tasks";
+import { addUsage, usageFromResult, type Task, type TaskOutcome, type TaskRunner, type TaskUsage } from "@/lib/tasks";
 import { diffForTarget, reviewDiff, reviewModel } from "@/lib/review";
 import { detectVerifyCommands, runVerification } from "@/lib/verify";
 import { openWorkspace } from "@/lib/workspace";
@@ -43,6 +43,7 @@ export const runFixTask: TaskRunner = async (task, { emit, signal }) => {
   // An issue fix runs in its own worktree of origin/<default>: one fix per
   // PR, from a clean base, without touching the user's checkout.
   const { text, issue } = await fetchIssueTask(task.issueUrl);
+  if (signal.aborted) return { error: "Stopped." };
   const tree = await createIssueWorktree(home);
   try {
     const meta = await registerLocalWorkspace(tree.dir);
@@ -90,6 +91,9 @@ async function fixIn(
       });
     },
   });
+  // Stopped: nothing leaves the machine after the user said stop, even when
+  // the solve finished its last step before noticing.
+  if (ctx.signal.aborted) return { result, error: "Stopped." };
   if (result.status !== "resolved" && result.status !== "unverified") {
     return { result, error: result.error ?? `The fix ended ${result.status}: ${result.gate.reason || result.summary}`.slice(0, 500) };
   }
@@ -112,7 +116,7 @@ async function fixIn(
   } catch (error) {
     return { result, error: `Delivery failed: ${error instanceof Error ? error.message : String(error)}` };
   }
-  if (task.issueUrl) {
+  if (task.issueUrl && !ctx.signal.aborted) {
     await reportOnIssue({ issueUrl: task.issueUrl, prUrl: outcome.prUrl!, summary: result.summary, evidence }).catch(
       (error: unknown) => {
         outcome.note = `The PR is open, but commenting on the issue failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -199,6 +203,7 @@ async function fixIssueBatch(
   // A setup problem (no usable model, no credentials) fails every issue the
   // same way: stop at the first one instead of burning through the rest.
   let fatal: string | null = null;
+  let batchUsage: TaskUsage | undefined;
   const { solveTask } = await import("@/lib/harness/solve");
   let firstTree: ReturnType<typeof createIssueWorktree> | null = null;
   const issueTree = async () => {
@@ -226,14 +231,18 @@ async function fixIssueBatch(
             : text),
           model,
           // Parallel solves would interleave in one trace: the checklist and
-          // one line per issue are the batch's view.
-          emit: () => {},
+          // one line per issue are the batch's view. Only token use goes
+          // through, so the task shows what the whole batch costs.
+          emit: (event) => {
+            if (event.type === "turn_usage") ctx.emit(event);
+          },
           signal: ctx.signal,
           runId: `${task.id}-${item.number}`,
           budget: { maxTurns: 30, maxWallMs: 8 * 60_000 },
           verify: { enabled: true, commands: await detectVerifyCommands(tree.dir).catch(() => []), timeoutMs: 180_000, baseline: true },
           useRepoRules: true,
         });
+        batchUsage = addUsage(batchUsage, usageFromResult(result));
         if (result.status === "error" || (result.metrics.modelCalls === 0 && result.error)) {
           fatal = result.error ?? "the solver could not start";
           throw new Error(fatal);
@@ -307,7 +316,9 @@ async function fixIssueBatch(
         if (report.exitCode !== 0) outcome.error = `The combined fixes fail the test suite (${report.counts.failed} failing), so no pull request was opened. Branch: ${branch}.`;
         else combinedSuitePassed = true;
       }
-      if (!outcome.error && !task.deliver) {
+      if (!outcome.error && ctx.signal.aborted) {
+        outcome.error = "Cancelled before the pull request was opened.";
+      } else if (!outcome.error && !task.deliver) {
         outcome.note = `Fixed ${fixed().length}/${items.length} on local branch ${branch}; not delivered.`;
       } else if (!outcome.error) {
         say("Opening the pull request…");
@@ -351,8 +362,16 @@ async function fixIssueBatch(
     summary,
     filesChanged: fixed().length,
     durationMs: Date.now() - startedAt,
-    costUsd: 0,
+    costUsd: batchUsage?.costUsd ?? 0,
   });
+  // Which issues the PR really fixes: the others stay fixable (and visible
+  // as failed with their reason), instead of all counting as "fixed in PR".
+  outcome.issueResults = items.map((i) => ({
+    url: i.url,
+    fixed: i.state === "resolved" && Boolean(outcome.prUrl),
+    ...(i.detail ? { detail: i.detail } : {}),
+  }));
+  if (batchUsage) outcome.usage = batchUsage;
   return outcome;
 }
 

@@ -48,6 +48,78 @@ export interface Task {
   instructions?: string;
   deliver?: boolean;
   model?: string;
+  /**
+   * Token use and cost: live while running (summed from the task's
+   * `turn_usage` events), final once it ends (the solve's own metrics win
+   * when they account for more). Persisted with the task.
+   */
+  usage?: TaskUsage;
+  /** A batch's per-issue outcome: which issues its PR actually fixes. */
+  issueResults?: IssueResult[];
+}
+
+export interface TaskUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number;
+  /** Model calls counted. */
+  calls: number;
+}
+
+export interface IssueResult {
+  url: string;
+  fixed: boolean;
+  detail?: string;
+}
+
+export const EMPTY_USAGE: TaskUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0, calls: 0 };
+
+export function usageTokens(u: TaskUsage | undefined): number {
+  return u ? u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheWriteTokens : 0;
+}
+
+export function addUsage(a: TaskUsage | undefined, b: TaskUsage | undefined): TaskUsage {
+  const x = a ?? EMPTY_USAGE;
+  const y = b ?? EMPTY_USAGE;
+  return {
+    inputTokens: x.inputTokens + y.inputTokens,
+    outputTokens: x.outputTokens + y.outputTokens,
+    cacheReadTokens: x.cacheReadTokens + y.cacheReadTokens,
+    cacheWriteTokens: x.cacheWriteTokens + y.cacheWriteTokens,
+    costUsd: Math.round((x.costUsd + y.costUsd) * 1e6) / 1e6,
+    calls: x.calls + y.calls,
+  };
+}
+
+/** A solve's own totals (`SolveResult.metrics`), or undefined. */
+export function usageFromResult(result: unknown): TaskUsage | undefined {
+  const m = (result as { metrics?: Record<string, unknown> } | undefined)?.metrics;
+  if (!m || typeof m !== "object") return undefined;
+  const n = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  const usage: TaskUsage = {
+    inputTokens: n(m.inputTokens),
+    outputTokens: n(m.outputTokens),
+    cacheReadTokens: n(m.cacheReadTokens),
+    cacheWriteTokens: n(m.cacheWriteTokens),
+    costUsd: n(m.costUsd),
+    calls: n(m.modelCalls),
+  };
+  return usageTokens(usage) > 0 || usage.costUsd > 0 ? usage : undefined;
+}
+
+/** One `turn_usage` event as usage. */
+function usageFromEvent(event: OrchestrationEvent): TaskUsage | undefined {
+  if (event.type !== "turn_usage") return undefined;
+  return {
+    inputTokens: event.inputTokens,
+    outputTokens: event.outputTokens,
+    cacheReadTokens: event.cacheReadTokens,
+    cacheWriteTokens: event.cacheWriteTokens,
+    costUsd: event.costUsd,
+    calls: 1,
+  };
 }
 
 export interface EnqueueInput {
@@ -69,6 +141,9 @@ export interface TaskOutcome {
   /** Set → the task failed with this message. */
   error?: string;
   note?: string;
+  /** Usage the events did not carry (e.g. a batch's inner solves). */
+  usage?: TaskUsage;
+  issueResults?: IssueResult[];
 }
 
 export type TaskRunner = (
@@ -80,6 +155,13 @@ export const TASKS_KEY = "tasks:v1";
 const MAX_STORED = 50;
 const MAX_LOGS = 20;
 const TERMINAL: TaskState[] = ["done", "failed", "cancelled"];
+/**
+ * A cancelled runner gets this long to unwind (abort its model call, kill
+ * its processes, remove its worktree). After that the task is marked
+ * cancelled anyway, so a runner stuck in something that ignores the signal
+ * can never leave the UI spinning or block the repo's queue.
+ */
+export const CANCEL_GRACE_MS = 10_000;
 
 interface Listener {
   onEvent: (event: OrchestrationEvent) => void;
@@ -117,7 +199,13 @@ export class TaskQueue {
 
   constructor(
     private runners: Record<TaskKind, TaskRunner>,
-    private readonly options: { storeKey?: string; maxEvents?: number } = {},
+    private readonly options: {
+      storeKey?: string;
+      maxEvents?: number;
+      /** Called when a running task is cancelled (the real queue kills its terminal sessions). */
+      onCancel?: (task: Task) => void;
+      cancelGraceMs?: number;
+    } = {},
   ) {}
 
   /** Swap the runners (dev hot reload); tasks already running keep theirs. */
@@ -186,7 +274,11 @@ export class TaskQueue {
     return task ? { ...task } : null;
   }
 
-  /** Queued → cancelled now; running → aborted (becomes cancelled when it stops). Null if unknown. */
+  /**
+   * Queued → cancelled now; running → aborted: its model calls and
+   * processes are stopped and it becomes cancelled when the runner unwinds
+   * (at the latest after the grace period). Null if unknown.
+   */
   async cancel(id: string): Promise<Task | null> {
     await this.load();
     const task = this.tasks.find((t) => t.id === id);
@@ -196,9 +288,47 @@ export class TaskQueue {
       this.logs.get(id)?.end();
       await this.persist();
     } else if (task.state === "running") {
-      this.controllers.get(id)?.abort();
+      this.stopRunning(task);
     }
     return { ...task };
+  }
+
+  /** Stop every queued and running task of a repo (queued first, so none starts). */
+  async cancelAll(repoKey: string): Promise<Task[]> {
+    await this.load();
+    const mine = this.tasks.filter((t) => t.repoKey === repoKey && (t.state === "queued" || t.state === "running"));
+    const now = Date.now();
+    for (const task of mine) {
+      if (task.state !== "queued") continue;
+      Object.assign(task, { state: "cancelled", finishedAt: now });
+      this.logs.get(task.id)?.end();
+    }
+    if (mine.some((t) => t.state === "cancelled")) await this.persist();
+    for (const task of mine) if (task.state === "running") this.stopRunning(task);
+    return mine.map((t) => ({ ...t }));
+  }
+
+  private stopRunning(task: Task) {
+    const controller = this.controllers.get(task.id);
+    if (!controller || controller.signal.aborted) return;
+    controller.abort();
+    try {
+      this.options.onCancel?.(task);
+    } catch {
+      // Best effort: the abort signal is the primary stop.
+    }
+    const timer = setTimeout(() => this.forceFinish(task), this.options.cancelGraceMs ?? CANCEL_GRACE_MS);
+    timer.unref?.();
+  }
+
+  /** The runner ignored its abort for the whole grace period: finish the task anyway. */
+  private forceFinish(task: Task) {
+    if (task.state !== "running") return;
+    Object.assign(task, { state: "cancelled", finishedAt: Date.now(), note: "Stopped; the runner did not exit in time." });
+    const log = this.logs.get(task.id);
+    if (log) this.closeLog(task, log);
+    void this.persist().catch(() => undefined);
+    this.pump(task.repoKey);
   }
 
   /**
@@ -260,26 +390,72 @@ export class TaskQueue {
     const controller = new AbortController();
     this.controllers.set(task.id, controller);
     const log = this.logFor(task.id);
+    let live: TaskUsage | undefined;
+    const emit = (event: OrchestrationEvent) => {
+      const used = usageFromEvent(event);
+      if (used) {
+        live = addUsage(live, used);
+        // Visible to list()/GET /api/tasks while it runs (persisted at the end).
+        if (task.state === "running") task.usage = live;
+      }
+      log.push(event);
+    };
     try {
       await this.persist();
-      const out = await this.runners[task.kind]({ ...task }, { emit: (e) => log.push(e), signal: controller.signal });
+      const out = await this.runners[task.kind]({ ...task }, { emit, signal: controller.signal });
+      // Forced to cancelled after the grace period: the late outcome is dropped.
+      if (task.state !== "running") return;
       Object.assign(task, {
         ...(out.result ? { result: out.result } : {}),
         ...(out.prUrl ? { prUrl: out.prUrl } : {}),
         ...(out.note ? { note: out.note } : {}),
+        ...(out.issueResults ? { issueResults: out.issueResults } : {}),
       });
+      const final = addUsage(usageFromResult(out.result), out.usage);
+      if (usageTokens(final) >= usageTokens(live) && usageTokens(final) > 0) task.usage = final;
       if (controller.signal.aborted) task.state = "cancelled";
       else if (out.error) Object.assign(task, { state: "failed", error: out.error });
       else task.state = "done";
     } catch (error) {
+      if (task.state !== "running") return;
       task.state = controller.signal.aborted ? "cancelled" : "failed";
       if (task.state === "failed") task.error = error instanceof Error ? error.message : String(error);
     } finally {
-      task.finishedAt = Date.now();
       this.controllers.delete(task.id);
-      log.end();
+      if (!task.finishedAt || task.state === "running") task.finishedAt = Date.now();
+      this.closeLog(task, log);
       await this.persist().catch(() => undefined);
     }
+  }
+
+  /**
+   * End the task's stream with a `run_done` that matches its final state, so
+   * an attached run view never shows "done" for a task that was stopped or
+   * failed (and never keeps a spinner for one that ended without its own
+   * `run_done`, e.g. a runner that threw).
+   */
+  private closeLog(task: Task, log: EventLog) {
+    if (log.ended) return;
+    // Only a stream that started a run view (run_start) needs closing.
+    if (!log.events.some((e) => e.type === "run_start")) {
+      log.end();
+      return;
+    }
+    const last = [...log.events].reverse().find((e) => e.type === "run_done");
+    const status = task.state === "cancelled" ? "cancelled" : task.state === "failed" ? "failed" : "done";
+    const lastStatus = last?.type === "run_done" ? (last.status ?? "done") : null;
+    const agrees = lastStatus === status || (status === "done" && lastStatus === "incomplete") || (status === "failed" && lastStatus === "incomplete");
+    if (!last || !agrees) {
+      log.push({
+        type: "run_done",
+        status,
+        summary: task.state === "cancelled" ? "Stopped." : (task.error ?? task.note ?? (last?.type === "run_done" ? last.summary : "")),
+        filesChanged: last?.type === "run_done" ? last.filesChanged : 0,
+        durationMs: (task.finishedAt ?? Date.now()) - (task.startedAt ?? task.createdAt),
+        costUsd: task.usage?.costUsd ?? 0,
+      });
+    }
+    log.end();
   }
 }
 
@@ -295,7 +471,7 @@ export function getTaskQueue(): TaskQueue {
     };
   const runners = { fix: lazy("fix"), review: lazy("review") };
   if (!GLOBAL.__viberonTaskQueue) {
-    GLOBAL.__viberonTaskQueue = new TaskQueue(runners);
+    GLOBAL.__viberonTaskQueue = new TaskQueue(runners, { onCancel: killTaskSessions });
     GLOBAL.__viberonTaskQueueManaged = GLOBAL.__viberonTaskQueue;
   } else if (GLOBAL.__viberonTaskQueue === GLOBAL.__viberonTaskQueueManaged) {
     // The queue outlives dev hot reloads, but its runners must not: a closure
@@ -303,6 +479,25 @@ export function getTaskQueue(): TaskQueue {
     GLOBAL.__viberonTaskQueue.useRunners(runners);
   }
   return GLOBAL.__viberonTaskQueue;
+}
+
+/** The solve run ids a task uses (a batch solves each issue as `<task>-<number>`). */
+export function taskRunIds(task: Pick<Task, "id" | "issueUrls">): string[] {
+  const numbers = (task.issueUrls ?? []).map((url) => /\/issues\/(\d+)/.exec(url)?.[1]).filter(Boolean);
+  return [task.id, ...numbers.map((n) => `${task.id}-${n}`)];
+}
+
+/**
+ * Backstop for Stop: kill every terminal session the task's solves started.
+ * The abort signal already stops model calls, checks and foreground
+ * commands; background sessions (dev servers) are only reachable this way.
+ */
+function killTaskSessions(task: Task): void {
+  void import("@/lib/terminal")
+    .then((terminal) => {
+      for (const runId of taskRunIds(task)) terminal.killSessionsByRun(runId);
+    })
+    .catch(() => undefined);
 }
 
 export function enqueue(input: EnqueueInput): Promise<Task> {

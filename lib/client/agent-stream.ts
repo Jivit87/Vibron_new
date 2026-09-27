@@ -46,16 +46,24 @@ export async function cancelRun(): Promise<void> {
   const controller = activeController;
   if (!controller) return;
   const runId = activeRunId;
-  if (runId && !isMockMode()) {
+  // A queued task shown in the run view (Fix mode, issue fixes, reviews) runs
+  // on the server's task queue, not as an /api/agent run: Stop cancels the
+  // task itself. Only closing the stream would leave it running and billing.
+  const taskId = attachedTaskId;
+  const stop = isMockMode()
+    ? null
+    : taskId
+      ? fetch(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" })
+      : runId
+        ? fetch("/api/agent/cancel", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ runId }),
+          })
+        : null;
+  if (stop) {
     try {
-      await Promise.race([
-        fetch("/api/agent/cancel", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ runId }),
-        }),
-        new Promise((resolve) => setTimeout(resolve, 1500)),
-      ]);
+      await Promise.race([stop, new Promise((resolve) => setTimeout(resolve, 1500))]);
     } catch {
       // Fall through to the abort.
     }
@@ -171,6 +179,14 @@ export async function sendPrompt(
   });
 }
 
+/** A finished task's state as the run view's status (null while it still runs). */
+export function taskRunStatus(state: unknown): RunStatus | null {
+  if (state === "cancelled") return "cancelled";
+  if (state === "failed") return "failed";
+  if (state === "done") return "done";
+  return null;
+}
+
 /** The queued task whose event stream the run view is showing, if any. */
 let attachedTaskId: string | null = null;
 
@@ -181,8 +197,8 @@ export function attachedTask(): string | null {
 /**
  * Show a queued task's live solve in the normal run view. The task's
  * `GET /api/tasks/:id/events` stream carries the same events as
- * `/api/agent`, so it goes through the same reader. Stopping detaches the
- * view; it does not cancel the task (that is the Tasks panel's Cancel).
+ * `/api/agent`, so it goes through the same reader. Stop (`cancelRun`)
+ * cancels the task on the server, then closes the stream.
  */
 export async function attachTaskRun(task: { id: string; task: string }): Promise<void> {
   const store = useViberon.getState();
@@ -202,6 +218,12 @@ export async function attachTaskRun(task: { id: string; task: string }): Promise
               headers: { Accept: "text/event-stream" },
               signal,
             }),
+      settle: async () => {
+        if (isMockMode()) return null;
+        const response = await fetch(`/api/tasks/${encodeURIComponent(task.id)}`);
+        const body = (await response.json().catch(() => null)) as { state?: string } | null;
+        return taskRunStatus(body?.state);
+      },
     });
   } finally {
     if (attachedTaskId === task.id) attachedTaskId = null;
@@ -215,9 +237,12 @@ export async function attachTaskRun(task: { id: string; task: string }): Promise
 async function pumpRun({
   open,
   conversational,
+  settle,
 }: {
   open: (signal: AbortSignal) => Promise<Response>;
   conversational: boolean;
+  /** The final status when the stream ends without a `run_done`. */
+  settle?: () => Promise<RunStatus | null>;
 }): Promise<void> {
   const controller = new AbortController();
   activeController = controller;
@@ -349,6 +374,9 @@ async function pumpRun({
     }
 
     flush();
+    // A stream that ended without run_done: ask its owner how it ended
+    // rather than claiming success.
+    if (!finalStatus && settle) finalStatus = await settle().catch(() => null);
     useViberon.getState().endRun(finalStatus ?? "done");
   } catch (error) {
     flush();
