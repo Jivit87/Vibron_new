@@ -239,6 +239,19 @@ function gitWithAuth(
   });
 }
 
+/**
+ * A clean tree and a named branch other than the current one that already
+ * exists locally with commits the base lacks: an earlier delivery of the
+ * same fix (a repeat click). Delivery then re-pushes that branch as is.
+ */
+async function isRepeatDelivery(root: string, branch: string | undefined, current: string): Promise<boolean> {
+  const name = branch?.trim();
+  if (!name || name === current || name.startsWith("-")) return false;
+  if ((await runGit(root, ["check-ref-format", "--branch", name], { allowFailure: true })).code !== 0) return false;
+  const ahead = await runGit(root, ["rev-list", "--count", `HEAD..refs/heads/${name}`], { allowFailure: true });
+  return ahead.code === 0 && Number(ahead.stdout.trim()) > 0;
+}
+
 async function remoteUrl(root: string, remote: string): Promise<string> {
   if (!/^[\w.-]+$/.test(remote)) return remote; // already a URL or path
   const url = await configuredRemoteUrl(root, remote);
@@ -376,8 +389,12 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
     );
   }
   const current = (await runGit(root, ["branch", "--show-current"])).stdout.trim();
-  const onDeliveryBranch = current.startsWith(BRANCH_PREFIX);
-  if (!changed.length && !onDeliveryBranch) {
+  const onDeliveryBranch = current.startsWith(BRANCH_PREFIX) || (!!options.branch && options.branch.trim() === current);
+  // A repeat click (Pramana web/github.py): the fix is already committed on
+  // the named branch and the tree is clean, so re-push that branch and return
+  // its PR instead of refusing, resetting it, or opening a second one.
+  const repeat = !changed.length && (await isRepeatDelivery(root, options.branch, current));
+  if (!changed.length && !onDeliveryBranch && !repeat) {
     throw new DeliverError("Nothing to deliver: the working tree has no changes.", "nothing_to_deliver", 409);
   }
 
@@ -389,7 +406,7 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   const upstream = upstreamUrl ? parseRemote(upstreamUrl) : null;
   const target = deliveryTarget(pushRepo, upstream, options.repo);
   if (!target) {
-    if (options.pushOnly) return pushBranchOnly(options, { title, remote, current, onDeliveryBranch, changed });
+    if (options.pushOnly) return pushBranchOnly(options, { title, remote, current, onDeliveryBranch, changed, repeat });
     throw new DeliverError(
       `The remote "${remote}" is not a GitHub repository, so no pull request can be opened. Deliver with pushOnly to push the branch without one.`,
       "not_github",
@@ -419,6 +436,7 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
     if (branch.startsWith("-") || valid.code !== 0) throw new DeliverError(`Invalid branch name: ${branch}`, "invalid_input", 400);
     if (
       !options.replaceBranch &&
+      !repeat &&
       branch !== current &&
       (await runGit(root, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFailure: true })).code === 0
     ) {
@@ -429,17 +447,18 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   }
   const base = options.baseBranch?.trim() || (await getDefaultBranch(repo, api));
 
-  // 3. Branch and commit locally.
-  if (branch !== current) await runGit(root, ["switch", options.replaceBranch ? "-C" : "-c", branch]);
+  // 3. Branch and commit locally (a repeat leaves the checkout alone).
+  if (branch !== current && !repeat) await runGit(root, ["switch", options.replaceBranch ? "-C" : "-c", branch]);
   if (changed.length) {
     await runGit(root, ["add", "-A", "--", ...changed]);
     const message = `${title}\n\nFiles changed:\n${changed.map((p) => `- ${p}`).join("\n")}\n\nDelivered by Viberon.`;
     await runGit(root, ["commit", "-q", "-m", message]);
   }
-  const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+  const src = repeat ? `refs/heads/${branch}` : "HEAD";
+  const commit = (await runGit(root, ["rev-parse", src])).stdout.trim();
 
   // 4. Push; on failure the local branch and commit stay.
-  const refspec = `HEAD:refs/heads/${branch}`;
+  const refspec = `${src}:refs/heads/${branch}`;
   let push = await gitWithAuth(root, options.replaceBranch ? ["push", "--force-with-lease", pushRemote, refspec] : ["push", pushRemote, refspec], auth);
   if (
     push.code !== 0 &&
@@ -514,16 +533,17 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
  */
 async function pushBranchOnly(
   options: DeliverOptions,
-  state: { title: string; remote: string; current: string; onDeliveryBranch: boolean; changed: string[] },
+  state: { title: string; remote: string; current: string; onDeliveryBranch: boolean; changed: string[]; repeat: boolean },
 ): Promise<DeliverResult> {
   const { root } = options;
-  const { title, remote, current, onDeliveryBranch, changed } = state;
+  const { title, remote, current, onDeliveryBranch, changed, repeat } = state;
   let branch: string;
   if (options.branch) {
     branch = options.branch.trim();
     const valid = await runGit(root, ["check-ref-format", "--branch", branch], { allowFailure: true });
     if (branch.startsWith("-") || valid.code !== 0) throw new DeliverError(`Invalid branch name: ${branch}`, "invalid_input", 400);
     if (
+      !repeat &&
       branch !== current &&
       (await runGit(root, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFailure: true })).code === 0
     ) {
@@ -532,14 +552,15 @@ async function pushBranchOnly(
   } else {
     branch = onDeliveryBranch ? current : branchName(title, await existingBranches(root, remote, {}));
   }
-  if (branch !== current) await runGit(root, ["switch", "-c", branch]);
+  if (branch !== current && !repeat) await runGit(root, ["switch", "-c", branch]);
   if (changed.length) {
     await runGit(root, ["add", "-A", "--", ...changed]);
     const message = `${title}\n\nFiles changed:\n${changed.map((p) => `- ${p}`).join("\n")}\n\nDelivered by Viberon.`;
     await runGit(root, ["commit", "-q", "-m", message]);
   }
-  const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
-  const push = await gitWithAuth(root, ["push", remote, `HEAD:refs/heads/${branch}`], {});
+  const src = repeat ? `refs/heads/${branch}` : "HEAD";
+  const commit = (await runGit(root, ["rev-parse", src])).stdout.trim();
+  const push = await gitWithAuth(root, ["push", remote, `${src}:refs/heads/${branch}`], {});
   if (push.code !== 0) {
     const reason = explainPushFailure(push.output).message;
     throw new DeliverError(

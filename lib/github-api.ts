@@ -513,8 +513,10 @@ export function listIssueComments(
   return call("GET", `/repos/${issue.owner}/${issue.repo}/issues/${issue.number}/comments?per_page=${Math.min(100, limit)}`, undefined, opts);
 }
 
-/** `https://github.com/o/r/issues/12` → { owner, repo, number }. */
+/** `https://github.com/o/r/issues/12` (or `www.github.com`, or `o/r#12`) → { owner, repo, number }. */
 export function parseIssueUrl(value: string): PrRef | null {
-  const m = /^https?:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)/i.exec(value.trim());
+  const url = /^https?:\/\/(?:www\.)?github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)/i.exec(value.trim());
+  const short = /^([\w-][\w.-]*)\/([\w.-]+)#(\d+)$/.exec(value.trim());
+  const m = url ?? short;
   return m ? { owner: m[1], repo: m[2].replace(/\.git$/, ""), number: Number(m[3]) } : null;
 }
