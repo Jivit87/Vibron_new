@@ -17,6 +17,8 @@ import {
   type RunState,
 } from "@/lib/client/run-reducer";
 import { isMockMode } from "@/lib/client/mock-run";
+import { compactSummary, summarizeRun } from "@/lib/client/usage";
+import { runUsageExtra } from "@/store/usage";
 import type { LedgerSnapshot } from "@/lib/context/ledger";
 import type { ProjectMemory } from "@/lib/memory/types";
 import {
@@ -273,6 +275,7 @@ function toStoredRun(run: RunState, messageId?: string): StoredRun {
     tokensOut: run.tokensOut,
     checkpointId: run.checkpointId,
     messageId,
+    usage: compactSummary(summarizeRun(run, runUsageExtra(run.id))),
   };
 }
 

@@ -35,6 +35,7 @@ import { loadFile } from "@/lib/file-loader";
 import { refreshWorkspace } from "@/lib/client/agent-stream";
 import { isPrUrl } from "@/lib/client/review";
 import { useReview } from "@/store/review";
+import { useUsageStore } from "@/store/usage";
 import { useViberon, type TerminalSessionView } from "@/store/viberon";
 import { cx, Kbd, truncatePath } from "@/components/vibe/primitives";
 
@@ -184,10 +185,27 @@ export function CommandPalette() {
       },
       {
         id: "view.ledger",
-        label: "Token ledger",
-        hint: "What the graph and cache saved",
+        label: "Token usage",
+        hint: "Tokens, cost, context and what the graph and cache saved",
         icon: <Zap className="size-3.5" />,
-        run: () => store.setBottomPanel("ledger"),
+        run: () => {
+          store.setAppMode("ide");
+          store.setBottomPanel("ledger");
+        },
+      },
+      {
+        id: "view.tokenHeatmap",
+        label: "Toggle token heatmap",
+        hint: "Shade the code graph by context tokens sent",
+        icon: <Zap className="size-3.5" />,
+        run: () => {
+          const next = !useUsageStore.getState().graphHeat;
+          useUsageStore.getState().setGraphHeat(next);
+          if (next) {
+            store.setAppMode("ide");
+            store.openGraphTab();
+          }
+        },
       },
       {
         id: "view.settings",

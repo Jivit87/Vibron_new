@@ -33,6 +33,8 @@ import { answerApproval, refreshWorkspace, runPlan } from "@/lib/client/agent-st
 import { diffLines, withContext } from "@/lib/client/line-diff";
 import { addStep, moveStep, removeStep, updateStep } from "@/lib/client/plan-edit";
 import { activeTodos, tailWindow, type FeedItem } from "@/lib/client/run-reducer";
+import { contextFill, formatTok, formatUsd, runTotals, totalTokens } from "@/lib/client/usage";
+import { ContextMeter, fillTitle } from "@/components/vibe/usage-ui";
 import {
   AttemptSeparator,
   CriteriaBlock,
@@ -47,6 +49,7 @@ import {
 } from "@/components/vibe/FixRun";
 import { canDeliver, DeliverBar } from "@/components/vibe/DeliverBar";
 import { pendingReviews } from "@/lib/editor/review";
+import { useUsageStore } from "@/store/usage";
 import {
   useViberon,
   type AgentLane,
@@ -59,7 +62,6 @@ import {
   cx,
   DiffCounts,
   Dot,
-  formatCost,
   formatDuration,
   formatTokens,
   RoleChip,
@@ -179,13 +181,45 @@ function RunHeader({ run }: { run: RunState }) {
           {run.rules.length} rule{run.rules.length === 1 ? "" : "s"}
         </span>
       )}
-      {run.tokensIn > 0 && (
-        <span title={`${run.tokensIn} in, ${run.tokensOut} out, ${run.tokensCached} cached`}>
-          {formatTokens(run.tokensIn + run.tokensOut)} tok
-        </span>
-      )}
-      {run.costUsd > 0 && <span>{formatCost(run.costUsd)}</span>}
+      <RunUsage run={run} />
     </div>
+  );
+}
+
+/** Tokens, cost, and the context-window meter; opens the usage panel. */
+function RunUsage({ run }: { run: RunState }) {
+  const extra = useUsageStore((s) => s.live[run.id]);
+  const totals = runTotals(run, extra);
+  const tokens = totalTokens(totals);
+  if (tokens === 0 && totals.costUsd === 0) return null;
+  const last = extra?.turns.at(-1);
+  const fill = last ? contextFill(last.contextTokens, last.model) : null;
+  const detail = [
+    `${formatTok(totals.input)} input`,
+    `${formatTok(totals.cacheRead)} cache read`,
+    totals.cacheWrite > 0 ? `${formatTok(totals.cacheWrite)} cache write` : "",
+    `${formatTok(totals.output)} output`,
+    fill && last ? fillTitle(fill, last.model) : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    <button
+      type="button"
+      title={`${detail}\nOpen the usage panel`}
+      onClick={() => {
+        const store = useViberon.getState();
+        useUsageStore.getState().setScope("run");
+        store.setAppMode("ide");
+        store.setBottomPanel("ledger");
+      }}
+      className="flex h-5 items-center gap-2 rounded-[3px] px-1 tabular-nums hover:bg-[var(--vb-hover)]"
+      style={{ color: "var(--vb-text-dim)" }}
+    >
+      <span>{formatTok(tokens)} tok</span>
+      {totals.costUsd > 0 && <span>{formatUsd(totals.costUsd)}</span>}
+      {fill && <ContextMeter fill={fill} width={24} />}
+    </button>
   );
 }
 

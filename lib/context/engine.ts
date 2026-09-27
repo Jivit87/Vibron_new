@@ -253,6 +253,7 @@ export function buildGraphSlice(
     "graph_slice",
     `graph slice for "${query}"`,
     selection.contextString,
+    { paths: files, nodeIds: selection.nodeIds },
   );
 
   return {
@@ -322,7 +323,11 @@ export async function buildFileWindow(
       ? `\n[truncated at ${MAX_WINDOW_LINES} lines — request a further range to continue]`
       : "");
 
-  const offered = input.ledger.offer("read_file", path, text);
+  // Symbols whose bodies fall inside the window, for per-symbol attribution.
+  const nodeIds = (input.graph?.nodes ?? [])
+    .filter((n) => n.file === path && n.startLine <= capped && n.endLine >= start)
+    .map((n) => n.id);
+  const offered = input.ledger.offer("read_file", path, text, { paths: [path], nodeIds });
   return {
     text: offered.text,
     tokens: offered.tokens,
@@ -372,9 +377,43 @@ export function buildSymbolOutline(input: EngineInput, path: string): string {
     if (outbound.length) relations += `\n  depends on:\n${fmt(outbound, "to")}`;
   }
 
-  return `### ${path} — ${nodes.length} symbols${
+  const outline = `### ${path} — ${nodes.length} symbols${
     digest ? ` (${digest.tokens} tokens of source)` : ""
   }\n${lines.join("\n")}${relations}`;
+  input.ledger.record("symbol_outline", path, outline, {
+    paths: [path],
+    nodeIds: sorted.map((n) => n.id),
+  });
+  return outline;
+}
+
+/**
+ * Attribution for a tool result made of `path:line…` rows (grep hits,
+ * symbol lookups): the files it quotes, and the graph nodes whose ranges
+ * contain the quoted lines.
+ */
+export function attributeRows(
+  input: Pick<EngineInput, "graph" | "memory">,
+  text: string,
+): { paths: string[]; nodeIds: string[] } {
+  const paths = new Set<string>();
+  const nodeIds = new Set<string>();
+  const byFile = new Map<string, GraphNode[]>();
+  for (const node of input.graph?.nodes ?? []) {
+    const list = byFile.get(node.file);
+    if (list) list.push(node);
+    else byFile.set(node.file, [node]);
+  }
+  for (const match of text.matchAll(/^([^\s:]+):(\d+)/gm)) {
+    const path = match[1];
+    if (!input.memory.files[path] && !byFile.has(path)) continue;
+    paths.add(path);
+    const line = Number(match[2]);
+    for (const node of byFile.get(path) ?? []) {
+      if (node.startLine <= line && node.endLine >= line) nodeIds.add(node.id);
+    }
+  }
+  return { paths: [...paths], nodeIds: [...nodeIds] };
 }
 
 /* --------------------------- misc helpers -------------------------------- */
@@ -420,9 +459,12 @@ export async function searchCode(
   if (results.length === 0) {
     return `No matches for "${pattern}" across ${scanned} files.`;
   }
-  return `${results.length} match${results.length === 1 ? "" : "es"} for "${pattern}" (scanned ${scanned} files):\n${results.join("\n")}${
+  const text = `${results.length} match${results.length === 1 ? "" : "es"} for "${pattern}" (scanned ${scanned} files):\n${results.join("\n")}${
     results.length >= maxResults ? "\n… result cap reached; narrow the pattern." : ""
   }`;
+  // Grep hits bypass dedupe; record them for per-file attribution only.
+  input.ledger.record("grep", `grep "${pattern}"`, text, attributeRows(input, text));
+  return text;
 }
 
 /** Minimal glob: supports `*` and `**`, which covers the realistic cases. */

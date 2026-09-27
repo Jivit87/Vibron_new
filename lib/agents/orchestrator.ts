@@ -313,6 +313,7 @@ export async function orchestrate(input: OrchestrationInput): Promise<void> {
       tokensIn: totalUsage.inputTokens + totalUsage.cacheReadTokens,
       tokensOut: totalUsage.outputTokens,
       tokensCached: totalUsage.cacheReadTokens,
+      tokensCacheWrite: totalUsage.cacheWriteTokens,
       costUsd: totalCost,
       uncachedUsd: totalUncachedCost,
     });

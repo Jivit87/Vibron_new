@@ -178,7 +178,7 @@ function BottomTabs({ current }: { current: Exclude<BottomPanel, null> }) {
     { id: "tasks", label: "Tasks" },
     { id: "issues", label: "Issues" },
     { id: "review", label: "Review", count: reviewCount },
-    { id: "ledger", label: "Tokens" },
+    { id: "ledger", label: "Usage" },
   ];
   return (
     <div className="flex h-[30px] shrink-0 items-stretch gap-4 border-b px-3" style={{ borderColor: "var(--vb-line)" }}>

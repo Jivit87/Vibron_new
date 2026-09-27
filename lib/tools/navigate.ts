@@ -145,7 +145,13 @@ export async function findSymbols(engine: EngineInput, query: string): Promise<s
       return `${n.file}:${n.startLine}-${n.endLine}  ${n.kind} ${n.name}\n    ${n.signature.split("\n")[0].slice(0, 200)}${used}`;
     });
     const more = hits.length > 12 ? `\n… ${hits.length - 12} more; qualify the name (e.g. Class.method).` : "";
-    return `${hits.length} definition(s) for ${query}:\n${rows.join("\n")}${more}`;
+    const text = `${hits.length} definition(s) for ${query}:\n${rows.join("\n")}${more}`;
+    const shown = hits.slice(0, 12);
+    engine.ledger.record("find_symbols", query, text, {
+      paths: shown.map((n) => n.file),
+      nodeIds: shown.map((n) => n.id),
+    });
+    return text;
   }
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = `\\b(def|class|function|interface|type|enum|struct|fn|func)\\s+${esc}\\b|\\b(const|let|var)\\s+${esc}\\s*=|^\\s*${esc}\\s*[:=]`;

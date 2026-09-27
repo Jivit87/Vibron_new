@@ -18,6 +18,7 @@
  */
 
 import type { ChatMessage } from "@/store/viberon";
+import { normalizeSummary, type UsageSummary } from "@/lib/client/usage";
 
 const INDEX_KEY = (repoKey: string) => `viberon.conv.index.${repoKey}`;
 const RECORD_KEY = (repoKey: string, id: string) =>
@@ -65,6 +66,18 @@ export interface StoredRun {
   checkpointId?: string;
   /** Assistant message this run produced, for scroll-to linking. */
   messageId?: string;
+  /** Compacted usage breakdown (absent on receipts saved before it existed). */
+  usage?: UsageSummary;
+}
+
+/** Validate a stored receipt's usage; drop it if it is not a summary. */
+function normalizeRun(run: StoredRun): StoredRun {
+  if (run.usage === undefined) return run;
+  const usage = normalizeSummary(run.usage);
+  if (usage) return { ...run, usage };
+  const rest = { ...run };
+  delete rest.usage;
+  return rest;
 }
 
 export interface StoredConversation {
@@ -174,7 +187,9 @@ export function loadConversation(
         typeof m.content === "string" &&
         (m.role === "user" || m.role === "assistant"),
     ),
-    runs: Array.isArray(raw.runs) ? raw.runs : [],
+    runs: Array.isArray(raw.runs)
+      ? raw.runs.filter((r) => Boolean(r) && typeof r.id === "string").map(normalizeRun)
+      : [],
   };
 }
 
