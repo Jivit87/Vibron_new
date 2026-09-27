@@ -39,6 +39,29 @@ All three are measured, not asserted — open the **token ledger** to audit any 
    marked with a cache breakpoint, so every turn after the first re-reads them at
    roughly a tenth of the price.
 
+The solve loop also carries harness mechanisms ported from Pramana. The
+module-by-module status is in [`docs/PORT-AI-HARNESS.md`](docs/PORT-AI-HARNESS.md).
+
+- **Append-only transcript.** The provider prompt cache keeps hitting. Past the
+  compaction threshold, old tool output is elided first and the middle is
+  summarized only if that is not enough (`lib/harness/compact.ts`).
+- **Stale views dropped.** A file view is replaced by a one-line marker once that
+  file is edited, because its line numbers are wrong anyway.
+- **Zero-token steps.** Localization, the issue-snippet reproduction and the
+  harness checkpoint (the harness re-runs the agent's proof itself and says
+  "submit now") use no model tokens.
+- **Lazy evidence.** The second attempt, the blind test writer and the reviewer
+  run only when the evidence calls for them.
+
+**Fast path, today and planned.** Today a solve starts with medium reasoning
+effort, and the heavy evidence layers switch on only when the first attempt
+misses. The route for a single agent skips team planning. *Planned:* Pramana's
+one-call fast path, where a zero-token triage sends small issues to one call that
+returns the edits plus a test that fails on the original code. There is also a
+near-miss SEARCH/REPLACE apply, issue logs condensed once at intake, and a
+rate limiter shared per endpoint. The target is to keep a small project under
+100k tokens per task.
+
 ### Persistent project memory
 
 Agents write what they learn into a durable brain that survives sessions:
