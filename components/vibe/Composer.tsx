@@ -598,7 +598,13 @@ function ModelPicker({
                 close();
               }}
               title={model.label}
-              hint={model.available ? model.blurb : `Needs a ${model.provider} key`}
+              hint={
+                model.available
+                  ? model.blurb
+                  : /^claude[-_]?cli$/i.test(model.provider)
+                    ? "Needs the claude CLI logged in"
+                    : `Needs a ${model.provider} key`
+              }
               trailing={
                 !model.agentic ? (
                   <span

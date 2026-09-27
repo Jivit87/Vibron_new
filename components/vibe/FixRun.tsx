@@ -13,11 +13,14 @@ import { Check, ChevronRight, CornerDownRight, Loader2, RotateCcw, X } from "luc
 import {
   evidenceOf,
   fixPhases,
+  impliedOutcomes,
+  phaseStrip,
   type CheckRow,
   type CheckVerdict,
   type EvidenceOutcome,
   type GateDecision,
   type GateRecord,
+  type IndependentTest,
   type PhaseState,
   type RecoveryRecord,
   type RunState,
@@ -58,6 +61,141 @@ function PhaseIcon({ state }: { state: PhaseState }) {
   if (state === "done") return <Check className="size-3" style={{ color: "var(--vb-mint)" }} />;
   if (state === "failed") return <X className="size-3" style={{ color: "var(--vb-rose)" }} />;
   return <span className="inline-block size-[7px] rounded-full border" style={{ borderColor: "var(--vb-text-faint)" }} />;
+}
+
+/* ------------------------------ phase timing ------------------------------ */
+
+const PHASE_NAME: Record<string, string> = {
+  setup: "setup",
+  localize: "localize",
+  criteria: "criteria",
+  loop: "agent loop",
+  gate: "gate",
+  testWriter: "test writer",
+  review: "review",
+  deliver: "deliver",
+};
+
+/** Alternating fills of one token, so adjacent segments stay apart. */
+const SEGMENT_OPACITY = [0.8, 0.45, 0.65, 0.3];
+
+/**
+ * One thin bar of where the wall time went, segment width by ms. Hovering a
+ * segment names it; the run's wall time sits on the right. While the run is
+ * live, a faint tail covers time no finished phase accounts for yet.
+ */
+export function PhaseTimingStrip({ run }: { run: RunState }) {
+  const [hover, setHover] = useState<string | null>(null);
+  const strip = phaseStrip(run, Date.now());
+  const active = run.status === "planning" || run.status === "running";
+  if (strip.segments.length === 0 && !active) return null;
+  const total = Math.max(1, strip.sumMs + strip.liveMs);
+  const hovered = strip.segments.find((s) => s.name === hover);
+  const label = (name: string) => PHASE_NAME[name] ?? name;
+  const summary = strip.segments.map((s) => `${label(s.name)} ${formatDuration(s.ms)}`).join(", ");
+
+  return (
+    <div className="flex h-5 min-w-0 items-center gap-2 font-mono text-[11px]" style={{ color: "var(--vb-text-faint)" }}>
+      <div
+        className="flex h-[5px] min-w-0 flex-1 gap-px overflow-hidden rounded-[2px]"
+        style={{ background: "var(--vb-fill)" }}
+        role="img"
+        aria-label={`Phase time: ${summary || "starting"}`}
+        onMouseLeave={() => setHover(null)}
+      >
+        {strip.segments.map((s, i) => (
+          <span
+            key={s.name}
+            className="h-full"
+            style={{
+              flexGrow: s.ms,
+              flexBasis: 0,
+              minWidth: 2,
+              background: "var(--vb-text-mid)",
+              opacity: hover === s.name ? 1 : SEGMENT_OPACITY[i % SEGMENT_OPACITY.length],
+            }}
+            title={`${label(s.name)}: ${s.ms.toLocaleString()} ms`}
+            onMouseEnter={() => setHover(s.name)}
+          />
+        ))}
+        {strip.liveMs > 0 && (
+          <span
+            className="h-full"
+            style={{ flexGrow: strip.liveMs, flexBasis: 0, background: "var(--vb-text-faint)", opacity: 0.35 }}
+            title="In progress"
+            onMouseEnter={() => setHover("__live")}
+          />
+        )}
+      </div>
+      <span className="w-[150px] shrink-0 truncate text-right">
+        {hovered ? (
+          <>
+            <span style={{ color: "var(--vb-text-mid)" }}>{label(hovered.name)}</span> {hovered.ms.toLocaleString()} ms
+            <span> · {Math.round((hovered.ms / total) * 100)}%</span>
+          </>
+        ) : hover === "__live" ? (
+          "in progress"
+        ) : strip.segments.length > 0 ? (
+          `${strip.segments.length} phase${strip.segments.length === 1 ? "" : "s"}`
+        ) : (
+          "setting up"
+        )}
+      </span>
+      <span className="shrink-0 tabular-nums" style={{ color: "var(--vb-text-dim)" }} title="Wall time">
+        {formatDuration(Math.max(0, Math.round(strip.wallMs)))}
+      </span>
+    </div>
+  );
+}
+
+/* --------------------------- acceptance criteria -------------------------- */
+
+const CRITERIA_FOLD = 3;
+
+/** What a maintainer would check, predicted before the solver starts. */
+export function CriteriaBlock({ run }: { run: RunState }) {
+  const [open, setOpen] = useState(false);
+  const items = run.criteria ?? [];
+  if (items.length === 0) return null;
+  const shown = open ? items.slice(0, 300) : items.slice(0, CRITERIA_FOLD);
+  const rest = items.length - CRITERIA_FOLD;
+  return (
+    <section className="flex flex-col" aria-label="Acceptance criteria">
+      <div className="flex h-6 items-center gap-2 text-[12px]">
+        <span style={{ color: "var(--vb-text)" }}>Acceptance criteria</span>
+        <span className="text-[11.5px]" style={{ color: "var(--vb-text-faint)" }}>
+          predicted
+        </span>
+        <div className="flex-1" />
+        <span className="font-mono text-[11px]" style={{ color: "var(--vb-text-faint)" }}>
+          {items.length}
+        </span>
+      </div>
+      <ol className="flex flex-col">
+        {shown.map((item, i) => (
+          <li key={i} className="flex min-w-0 gap-2 py-[2px] text-[12px] leading-[18px]">
+            <span className="w-4 shrink-0 text-right font-mono text-[11px]" style={{ color: "var(--vb-text-faint)" }}>
+              {i + 1}
+            </span>
+            <span className="min-w-0" style={{ color: "var(--vb-text-mid)" }}>
+              {item}
+            </span>
+          </li>
+        ))}
+      </ol>
+      {rest > 0 && (
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex h-[22px] items-center gap-1 self-start pl-6 text-[11.5px] hover:text-[var(--vb-text)]"
+          style={{ color: "var(--vb-text-dim)" }}
+          aria-expanded={open}
+        >
+          {open ? "Show fewer" : `Show ${rest} more`}
+        </button>
+      )}
+    </section>
+  );
 }
 
 /* ------------------------------ localization ------------------------------ */
@@ -273,15 +411,20 @@ const VERDICT: Record<CheckVerdict, { label: string; color: string; order: numbe
 export function VerificationBlock({ run }: { run: RunState }) {
   const [showExcerpt, setShowExcerpt] = useState(false);
   const [showPassing, setShowPassing] = useState(false);
+  const [showAll, setShowAll] = useState(false);
   const baseline = run.verifications.find((v) => v.phase === "baseline");
   const latest = [...run.verifications].reverse().find((v) => v.phase !== "baseline");
   const lastGate = run.gates[run.gates.length - 1];
-  if (!baseline && !latest) return null;
+  const independent = run.independentTest;
+  if (!baseline && !latest && !independent) return null;
 
   const checks = [...(latest?.checks ?? [])].sort((a, b) => VERDICT[a.verdict].order - VERDICT[b.verdict].order);
   const passing = checks.filter((c) => c.verdict === "pass");
-  const visible = showPassing ? checks : checks.filter((c) => c.verdict !== "pass");
+  const filtered = showPassing ? checks : checks.filter((c) => c.verdict !== "pass");
+  // Big suites can report thousands of checks; worst verdicts sort first, so cap the tail.
+  const visible = showAll ? filtered : filtered.slice(0, CHECK_CAP);
   const excerpt = (latest ?? baseline)?.excerpt ?? "";
+  const live = run.status === "planning" || run.status === "running";
 
   return (
     <section className="@container flex flex-col border-t pt-1.5" style={{ borderColor: "var(--vb-line)" }} aria-label="Verification">
@@ -299,7 +442,7 @@ export function VerificationBlock({ run }: { run: RunState }) {
         <Counts label="patched" record={latest} pending={!latest} />
       </div>
 
-      {visible.length > 0 && (
+      {(visible.length > 0 || independent) && (
         <table className="mt-1 w-full table-fixed border-collapse text-[11.5px]" aria-label="Evidence per check">
           <thead>
             <tr className="text-left" style={{ color: "var(--vb-text-faint)" }}>
@@ -309,6 +452,7 @@ export function VerificationBlock({ run }: { run: RunState }) {
             </tr>
           </thead>
           <tbody>
+            {independent && <IndependentTestLine test={independent} live={live} />}
             {visible.map((check) => (
               <CheckLine key={check.name} check={check} />
             ))}
@@ -316,7 +460,24 @@ export function VerificationBlock({ run }: { run: RunState }) {
         </table>
       )}
 
+      {independent?.status === "written" && live && (
+        <p className="flex h-[22px] items-center gap-1.5 text-[11.5px]" style={{ color: "var(--vb-text-dim)" }}>
+          <Loader2 className="size-3 animate-spin" />
+          Independent test written without seeing the patch; running it on the original and the patched code
+        </p>
+      )}
+
       <div className="flex items-center gap-3">
+        {filtered.length > CHECK_CAP && (
+          <button
+            type="button"
+            onClick={() => setShowAll((v) => !v)}
+            className="h-[22px] text-[11.5px] hover:text-[var(--vb-text)]"
+            style={{ color: "var(--vb-text-dim)" }}
+          >
+            {showAll ? `Show first ${CHECK_CAP}` : `Show all ${filtered.length} checks`}
+          </button>
+        )}
         {excerpt && (
           <button
             type="button"
@@ -411,6 +572,75 @@ function CheckLine({ check }: { check: CheckRow }) {
   );
 }
 
+const CHECK_CAP = 300;
+
+const TEST_STATUS_LABEL: Record<IndependentTest["status"], string> = {
+  written: "running",
+  ran: "ran",
+  skipped: "skipped",
+  gave_up: "gave up",
+};
+
+/**
+ * The blind test writer's row: a test written from the issue alone, run on
+ * the original and the patched code like any other check.
+ */
+function IndependentTestLine({ test, live }: { test: IndependentTest; live: boolean }) {
+  const known = test.verdict && Object.hasOwn(VERDICT, test.verdict) ? VERDICT[test.verdict as CheckVerdict] : null;
+  const implied = impliedOutcomes(test.verdict);
+  const before = test.before ?? implied.before;
+  const after = test.after ?? implied.after;
+  const verdictText =
+    test.status === "ran"
+      ? (known?.label ?? test.verdict?.replace(/_/g, " ") ?? "ran")
+      : test.status === "written" && !live
+        ? "not run"
+        : TEST_STATUS_LABEL[test.status];
+  const verdictColor = test.status === "ran" && known ? known.color : "var(--vb-text-faint)";
+  const title = [
+    "Independent test, written from the issue without seeing the patch",
+    test.command,
+    test.seconds !== undefined ? `${test.seconds.toFixed(1)}s` : null,
+    test.reason,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    <tr className="border-t align-top" style={{ borderColor: "var(--vb-line-faint)" }} title={title}>
+      <td className="truncate py-[3px] pr-2">
+        <span style={{ color: "var(--vb-text)" }}>independent test</span>
+        {test.command && (
+          <span className="ml-2 font-mono text-[11px]" style={{ color: "var(--vb-text-faint)" }}>
+            {test.command}
+          </span>
+        )}
+      </td>
+      <td className="truncate py-[3px] pr-2 font-mono text-[11px]" style={{ color: "var(--vb-text-dim)" }}>
+        {before || after ? (
+          <>
+            {before ?? "?"} <span style={{ color: "var(--vb-text-faint)" }}>→</span> {after ?? "?"}
+          </>
+        ) : (
+          <span style={{ color: "var(--vb-text-faint)" }}>{test.reason ?? "—"}</span>
+        )}
+        {test.seconds !== undefined && (
+          <span style={{ color: "var(--vb-text-faint)" }}> · {formatDuration(Math.round(test.seconds * 1000))}</span>
+        )}
+      </td>
+      <td className="py-[3px] text-right font-mono" style={{ color: verdictColor }}>
+        {test.status === "written" && live ? (
+          <span className="inline-flex items-center gap-1">
+            <Loader2 className="size-3 animate-spin" />
+            {verdictText}
+          </span>
+        ) : (
+          verdictText
+        )}
+      </td>
+    </tr>
+  );
+}
+
 /* ------------------------------- evidence -------------------------------- */
 
 const OUTCOME: Record<EvidenceOutcome, { label: string; color: string }> = {
@@ -429,6 +659,9 @@ export function EvidenceSummary({ run }: { run: RunState }) {
     e.baseline && e.final ? `${e.baseline.failed} → ${e.final.failed} failing` : null,
     e.final ? `${e.fixes} fixed` : null,
     e.final ? `${e.regressions} regression${e.regressions === 1 ? "" : "s"}` : null,
+    run.independentTest?.status === "ran" && run.independentTest.verdict
+      ? `independent test ${(VERDICT[run.independentTest.verdict as CheckVerdict]?.label ?? run.independentTest.verdict).replace(/_/g, " ")}`
+      : null,
     `${e.filesChanged} file${e.filesChanged === 1 ? "" : "s"}`,
     e.attempts > 1 ? `${e.attempts} attempts` : null,
     e.rejections > 0 ? `${e.rejections} rejected` : null,

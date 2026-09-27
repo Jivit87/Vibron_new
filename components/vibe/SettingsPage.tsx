@@ -9,17 +9,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Eye, EyeOff, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
+import { isMockMode, MOCK_PROVIDER_STATUS } from "@/lib/client/mock-run";
+import {
+  anyProviderReady,
+  normalizeProviderStatus,
+  type ClaudeCliStatus,
+  type KeyProviderStatus,
+} from "@/lib/client/providers";
 import { useViberon, type AppSettings } from "@/store/viberon";
 import { cx, Segmented, SettingRow as Row, Switch } from "@/components/vibe/primitives";
 import { GithubMcpSettings } from "@/components/vibe/GithubMcpSettings";
 
-interface ProviderStatus {
-  provider: "anthropic" | "groq" | "openai" | "nvidia" | "gemini";
-  configured: boolean;
-  masked: string | null;
-  fromEnv: boolean;
-  envVar: string;
-}
+type ProviderStatus = KeyProviderStatus;
 
 const PROVIDER_META: Record<ProviderStatus["provider"], { label: string; blurb: string; url: string; placeholder: string }> = {
   anthropic: {
@@ -27,6 +28,12 @@ const PROVIDER_META: Record<ProviderStatus["provider"], { label: string; blurb: 
     blurb: "Claude models. Recommended for agent runs.",
     url: "https://console.anthropic.com/settings/keys",
     placeholder: "sk-ant-api03-…",
+  },
+  deepseek: {
+    label: "DeepSeek",
+    blurb: "DeepSeek V4 Flash and Pro, with reasoning kept across tool turns.",
+    url: "https://platform.deepseek.com/api_keys",
+    placeholder: "sk-…",
   },
   groq: {
     label: "Groq",
@@ -76,15 +83,21 @@ export function SettingsPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const [providers, setProviders] = useState<ProviderStatus[]>([]);
+  const [cli, setCli] = useState<ClaudeCliStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
-      const response = await fetch("/api/settings/keys");
-      if (!response.ok) return;
-      const body = (await response.json()) as { providers: ProviderStatus[] };
-      setProviders(body.providers);
-      useViberon.getState().setProvidersConfigured(body.providers.some((p) => p.configured));
+      let raw: unknown = MOCK_PROVIDER_STATUS;
+      if (!isMockMode()) {
+        const response = await fetch("/api/settings/keys");
+        if (!response.ok) return;
+        raw = await response.json();
+      }
+      const status = normalizeProviderStatus(raw);
+      setProviders(status.keys);
+      setCli(status.cli);
+      useViberon.getState().setProvidersConfigured(anyProviderReady(status));
     } catch {
       // Server unreachable; rows show as unconfigured.
     } finally {
@@ -163,14 +176,19 @@ export function SettingsPage() {
                   <Loader2 className="size-3.5 animate-spin" />
                   Checking keys
                 </p>
-              ) : providers.length === 0 ? (
+              ) : providers.length === 0 && !cli ? (
                 <p className="py-2 text-[12.5px]" style={{ color: "var(--vb-text-dim)" }}>
                   Could not read provider status.
                 </p>
               ) : (
-                providers.filter((p) => PROVIDER_META[p.provider] && show(`${PROVIDER_META[p.provider].label} api key`)).map((p) => (
-                  <ProviderRow key={p.provider} status={p} onChanged={refresh} />
-                ))
+                <>
+                  {providers
+                    .filter((p) => show(`${PROVIDER_META[p.provider].label} api key`))
+                    .map((p) => (
+                      <ProviderRow key={p.provider} status={p} onChanged={refresh} />
+                    ))}
+                  {cli && show("claude subscription cli login") && <ClaudeCliRow status={cli} />}
+                </>
               )}
             </Section>
 
@@ -347,6 +365,44 @@ function NumberInput({
       }}
       className="vb-input w-20 text-right font-mono"
     />
+  );
+}
+
+/** Read-only: the harness falls back to the logged-in `claude` CLI; nothing to enter here. */
+function ClaudeCliRow({ status }: { status: ClaudeCliStatus }) {
+  const code = (text: string) => (
+    <code className="rounded-[3px] px-1 font-mono text-[11.5px]" style={{ background: "var(--vb-fill)", color: "var(--vb-text-mid)" }}>
+      {text}
+    </code>
+  );
+  return (
+    <div className="flex flex-col gap-2 border-b py-2.5" style={{ borderColor: "var(--vb-line)" }}>
+      <div className="flex flex-col items-start gap-2 @xl:flex-row @xl:items-center @xl:gap-6">
+        <div className="min-w-0 @xl:flex-1">
+          <p className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--vb-text)" }}>
+            Claude subscription (CLI)
+            {status.detail && (
+              <span className="font-mono text-[11.5px]" style={{ color: "var(--vb-text-dim)" }}>
+                {status.detail}
+              </span>
+            )}
+          </p>
+          <p className="mt-0.5 text-[12px]" style={{ color: "var(--vb-text-dim)" }}>
+            Uses your logged-in {code("claude")} CLI when no API key is set. Run {code("claude")} once to log in.
+          </p>
+        </div>
+        <span
+          className="inline-flex h-[20px] shrink-0 items-center gap-1.5 rounded-[3px] border px-1.5 font-mono text-[11px]"
+          style={{ borderColor: "var(--vb-line-strong)", color: status.configured ? "var(--vb-text-mid)" : "var(--vb-text-faint)" }}
+        >
+          <span
+            className="size-[6px] rounded-full"
+            style={{ background: status.configured ? "var(--vb-mint)" : "var(--vb-text-faint)" }}
+          />
+          {status.configured ? "logged in" : "not logged in"}
+        </span>
+      </div>
+    </div>
   );
 }
 

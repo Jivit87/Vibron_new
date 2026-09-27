@@ -223,6 +223,26 @@ export interface Localization {
   snippetReproduced?: boolean;
 }
 
+/** The blind test writer's outcome (`independent_test` events, latest wins). */
+export interface IndependentTest {
+  status: "written" | "ran" | "skipped" | "gave_up";
+  command?: string;
+  /** A `CheckVerdict` when recognised; any other string is kept for display. */
+  verdict?: string;
+  seconds?: number;
+  /** Outcome on the original / patched code, when the producer sends it. */
+  before?: string;
+  after?: string;
+  /** Why it was skipped or given up on, when sent. */
+  reason?: string;
+}
+
+/** Wall time of one harness phase (`phase` events; repeats accumulate). */
+export interface PhaseTiming {
+  name: string;
+  ms: number;
+}
+
 export interface RunState {
   id: string;
   prompt: string;
@@ -264,6 +284,13 @@ export interface RunState {
   gates: GateRecord[];
   recoveries: RecoveryRecord[];
   localization?: Localization;
+  /** Predicted acceptance criteria (`criteria` event). */
+  criteria?: string[];
+  independentTest?: IndependentTest;
+  /** Per-phase wall time, in arrival order. */
+  phaseTimings: PhaseTiming[];
+  /** Server-reported wall time from `run_done.durationMs`. */
+  wallMs?: number;
 }
 
 export function createRun(input: {
@@ -281,6 +308,7 @@ export function createRun(input: {
     verifications: [],
     gates: [],
     recoveries: [],
+    phaseTimings: [],
     prompt: input.prompt,
     mode: input.mode,
     model: input.model,
@@ -397,6 +425,22 @@ export function reduceRun(
   if ((event as { type: string }).type === "localize") {
     const localization = normalizeLocalization(event);
     return localization ? { ...run, localization } : run;
+  }
+  // Round 5 events; read tolerantly whether or not the union has them yet.
+  const loose = (event as { type: string }).type;
+  if (loose === "criteria") {
+    const criteria = normalizeCriteria(event);
+    return criteria ? { ...run, criteria } : run;
+  }
+  if (loose === "independent_test") {
+    const next = normalizeIndependentTest(event);
+    if (!next) return run;
+    // A later status keeps the command an earlier one ("written") named.
+    return { ...run, independentTest: { ...next, command: next.command ?? run.independentTest?.command } };
+  }
+  if (loose === "phase") {
+    const phase = normalizePhase(event);
+    return phase ? { ...run, phaseTimings: addPhase(run.phaseTimings ?? [], phase) } : run;
   }
 
   switch (event.type) {
@@ -841,8 +885,11 @@ export function reduceRun(
 
     case "run_done": {
       const status: RunStatus = event.status ?? (run.status === "failed" ? "failed" : "done");
+      const done = event as typeof event & { metrics?: { phaseMs?: unknown }; phaseMs?: unknown };
       return {
         ...run,
+        phaseTimings: mergePhaseMs(run.phaseTimings ?? [], done.metrics?.phaseMs ?? done.phaseMs),
+        wallMs: typeof event.durationMs === "number" && event.durationMs > 0 ? event.durationMs : run.wallMs,
         status,
         summary: event.summary,
         costUsd: event.costUsd || run.costUsd,
@@ -1037,7 +1084,7 @@ export function evidenceOf(run: RunState): Evidence {
     rejections: run.gates.filter((g) => g.decision === "reject").length,
     tokens: run.tokensIn + run.tokensOut,
     toolCalls: run.agents.reduce((sum, a) => sum + a.tools.length, 0),
-    durationMs: (run.endedAt ?? run.startedAt) - run.startedAt,
+    durationMs: run.wallMs ?? (run.endedAt ?? run.startedAt) - run.startedAt,
   };
 }
 
@@ -1084,4 +1131,133 @@ export function retryReasonOf(run: RunState, attempt: number): string {
   const recovery = run.recoveries[run.recoveries.length - 1];
   if (recovery?.detail) return `${prev} ended without proof after: ${recovery.detail}`;
   return `${prev} ended without proof.`;
+}
+
+/* ------------------- criteria, independent test, phases ------------------- */
+
+/** `{ type: "criteria", items: string[] }`; blank or non-string items are dropped. */
+export function normalizeCriteria(raw: unknown): string[] | null {
+  if (!raw || typeof raw !== "object") return null;
+  const items = (raw as { items?: unknown }).items;
+  if (!Array.isArray(items)) return null;
+  const out = items
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
+  return out.length > 0 ? out : null;
+}
+
+const TEST_STATUSES: readonly IndependentTest["status"][] = ["written", "ran", "skipped", "gave_up"];
+
+/**
+ * `{ type: "independent_test", status, command?, verdict?, seconds? }`.
+ * `status` may arrive as "gave-up"; `before/after` (or `original/patched`)
+ * are read when present, like the gate's per-check rows.
+ */
+export function normalizeIndependentTest(raw: unknown): IndependentTest | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const status = String(r.status ?? "").replace("-", "_") as IndependentTest["status"];
+  if (!TEST_STATUSES.includes(status)) return null;
+  const verdictRaw = typeof r.verdict === "string" ? r.verdict.trim().replace("-", "_") : "";
+  const verdict = verdictRaw === "passes" ? "pass" : verdictRaw || undefined;
+  const seconds =
+    typeof r.seconds === "number" && Number.isFinite(r.seconds) && r.seconds >= 0 ? r.seconds : undefined;
+  const reason = [r.reason, r.detail].find((v): v is string => typeof v === "string" && v.length > 0);
+  return {
+    status,
+    command: typeof r.command === "string" && r.command ? r.command : undefined,
+    verdict,
+    seconds,
+    before: outcomeText(r.before ?? r.original),
+    after: outcomeText(r.after ?? r.patched),
+    reason,
+  };
+}
+
+/** The original / patched outcome a verdict implies, when the producer sent none. */
+export function impliedOutcomes(verdict: string | undefined): { before?: string; after?: string } {
+  switch (verdict) {
+    case "fixes":
+      return { before: "fail", after: "pass" };
+    case "still_failing":
+    case "pre_existing":
+      return { before: "fail", after: "fail" };
+    case "regression":
+      return { before: "pass", after: "fail" };
+    case "pass":
+      return { before: "pass", after: "pass" };
+    default:
+      return {};
+  }
+}
+
+/** `{ type: "phase", name, ms }`; negative or non-finite ms are ignored. */
+export function normalizePhase(raw: unknown): PhaseTiming | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const name = typeof r.name === "string" ? r.name.trim() : "";
+  const ms = typeof r.ms === "number" ? r.ms : Number.NaN;
+  if (!name || !Number.isFinite(ms) || ms < 0) return null;
+  return { name, ms: Math.round(ms) };
+}
+
+function addPhase(list: readonly PhaseTiming[], phase: PhaseTiming): PhaseTiming[] {
+  const i = list.findIndex((p) => p.name === phase.name);
+  if (i === -1) return [...list, phase];
+  const next = list.slice();
+  next[i] = { name: phase.name, ms: next[i].ms + phase.ms };
+  return next;
+}
+
+/** Fill phases the stream never reported from `metrics.phaseMs`; streamed ones win. */
+export function mergePhaseMs(list: readonly PhaseTiming[], phaseMs: unknown): PhaseTiming[] {
+  const out = list.slice();
+  if (!phaseMs || typeof phaseMs !== "object" || Array.isArray(phaseMs)) return out;
+  for (const [name, ms] of Object.entries(phaseMs as Record<string, unknown>)) {
+    if (out.some((p) => p.name === name)) continue;
+    const phase = normalizePhase({ name, ms });
+    if (phase) out.push(phase);
+  }
+  return out;
+}
+
+/** The solve pipeline's order; unknown phases follow in arrival order. */
+export const PHASE_ORDER = ["setup", "localize", "criteria", "loop", "gate", "testWriter", "review", "deliver"] as const;
+
+export interface PhaseStrip {
+  segments: PhaseTiming[];
+  /** Sum of phase ms. Setup phases overlap, so this can exceed the wall time. */
+  sumMs: number;
+  /** Server-reported wall time once done, else elapsed. */
+  wallMs: number;
+  /** Elapsed time no finished phase covers yet, while running. */
+  liveMs: number;
+}
+
+export function phaseStrip(run: RunState, now: number): PhaseStrip {
+  const list = run.phaseTimings ?? [];
+  const rank = (name: string) => {
+    const i = (PHASE_ORDER as readonly string[]).indexOf(name);
+    return i === -1 ? PHASE_ORDER.length + list.findIndex((p) => p.name === name) : i;
+  };
+  const segments = list.filter((p) => p.ms > 0).sort((a, b) => rank(a.name) - rank(b.name));
+  const sumMs = segments.reduce((sum, p) => sum + p.ms, 0);
+  const active = run.status === "planning" || run.status === "running";
+  const elapsed = Math.max(0, (active ? now : (run.endedAt ?? now)) - run.startedAt);
+  const wallMs = !active && run.wallMs ? run.wallMs : elapsed;
+  return { segments, sumMs, wallMs, liveMs: active ? Math.max(0, elapsed - sumMs) : 0 };
+}
+
+/**
+ * Rendering window for a long list: the last `limit` items unless expanded,
+ * so the run view never mounts thousands of rows at once.
+ */
+export function tailWindow<T>(
+  items: readonly T[],
+  limit: number,
+  expanded: boolean,
+): { shown: T[]; hidden: number; offset: number } {
+  if (expanded || items.length <= limit) return { shown: items.slice(), hidden: 0, offset: 0 };
+  const offset = items.length - limit;
+  return { shown: items.slice(offset), hidden: offset, offset };
 }
