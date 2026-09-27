@@ -29,6 +29,7 @@ import type { EventSink, FailureClass, RunStatus } from "@/lib/agents/events";
 import { loadRules } from "@/lib/agents/rules";
 import { runAgent, type AgentRunResult, type RunController } from "@/lib/agents/runner";
 import { ensureModelReady, getModel, type EnrichedTurnResult } from "@/lib/ai";
+import { closeClaudeCliSessions } from "@/lib/ai/claude-cli";
 import { addUsage, EMPTY_USAGE, type AiUsage } from "@/lib/ai/types";
 import { ContextLedger, type EngineInput } from "@/lib/context/engine";
 import { predictCriteria, renderCriteria } from "@/lib/harness/criteria";
@@ -559,7 +560,22 @@ function emptyResult(options: SolveOptions): SolveResult {
 
 /* ------------------------------- solve ----------------------------------- */
 
+/** Solves in flight in this process; CLI sessions are closed when the last one ends. */
+let activeSolves = 0;
+
 export async function solveTask(options: SolveOptions): Promise<SolveResult> {
+  activeSolves += 1;
+  try {
+    return await solveTaskInner(options);
+  } finally {
+    activeSolves -= 1;
+    // Delete Claude CLI session files now rather than at the idle sweep. Only
+    // when no other solve (a batch runs several) could still be using one.
+    if (activeSolves === 0) await closeClaudeCliSessions().catch(() => undefined);
+  }
+}
+
+async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
   const startedAt = Date.now();
   const { emit, handle } = options;
   const result = emptyResult(options);

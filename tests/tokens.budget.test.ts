@@ -21,28 +21,29 @@ import { uninstallFakeProvider } from "./helpers/fake-provider";
 
 // --- Budgets (measured on main 2026-09-27; headroom in parentheses) --------
 
-/** truncate-fix: 5 solver calls + 1 reviewer; measured 19,001 input tokens. */
-const FIX_SMALL_MAX_INPUT = 21_000; // (+10%)
-/** semver-fix: same shape, a bigger rewrite; measured 23,371. */
-const FIX_LARGE_MAX_INPUT = 26_000; // (+11%)
+/** truncate-fix: 5 solver calls + 1 reviewer; measured 17,111 input tokens (19,001 before the token diet). */
+const FIX_SMALL_MAX_INPUT = 19_000; // (+11%)
+/** semver-fix: same shape, a bigger rewrite; measured 21,436 (23,371 before). */
+const FIX_LARGE_MAX_INPUT = 23_600; // (+10%)
 /** A scripted 5-turn fix must not trigger extra model calls (measured 6: 5 solver + 1 review). */
 const FIX_MAX_CALLS = 6;
 /**
- * never-edits: the model only reads/greps. Measured 63 calls: 2 attempts x
- * maxTurns (30) + 1 criteria + 2 blind-writer calls, 290,166 input tokens.
- * This is the "failures loop many turns" cost; an early stop for models that
- * never edit should cut both numbers sharply, then tighten these.
+ * never-edits: the model only reads/greps. Before the give-up rules: 63 calls
+ * (2 attempts x 30 turns + criteria + writer), 290,166 input tokens. Now the
+ * attempt ends with no source edit by turn 12 and attempt 2 is skipped:
+ * measured 12 calls, 38,314 tokens.
  */
-const NEVER_EDITS_MAX_CALLS = 66; // (+3 calls)
-const NEVER_EDITS_MAX_INPUT = 320_000; // (+10%)
+const NEVER_EDITS_MAX_CALLS = 14; // (+2 calls)
+const NEVER_EDITS_MAX_INPUT = 42_000; // (+10%)
 /** System prompt + tool schemas re-sent on every solver call; measured 1,248 + 964. */
 const SOLVER_FIXED_MAX_PER_CALL = 2_450; // (+10%)
 /**
  * Share of input tokens that is new vs the same agent's previous request
- * (i.e. not servable from a prompt cache). Measured 6% for the long loop:
- * a prefix break (compaction, prompt churn) would push this up.
+ * (i.e. not servable from a prompt cache). Measured 11.3% over the now-short
+ * 12-call loop (6% over the old 63-call loop: the fully fresh first call is a
+ * bigger share of fewer calls). A prefix break would push this well up.
  */
-const NEVER_EDITS_MAX_FRESH_RATIO = 0.08;
+const NEVER_EDITS_MAX_FRESH_RATIO = 0.13;
 
 afterEach(() => uninstallFakeProvider());
 
