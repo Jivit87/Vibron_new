@@ -697,3 +697,18 @@ export function scopeUsage(input: {
   const items = [...receiptItems(receipts), ...live(receipts)];
   return items.length ? mergeSummaries(items) : emptySummary();
 }
+
+/** Tokens per minute over the trailing window ending at `now`. */
+export function tokenRate(turns: TurnUsageRecord[], now: number, windowMs = 60_000): number {
+  let sum = 0;
+  let first = now;
+  for (const t of turns) {
+    if (t.at < now - windowMs || t.at > now) continue;
+    sum += t.inputTokens + t.outputTokens + t.cacheReadTokens + t.cacheWriteTokens;
+    first = Math.min(first, t.at);
+  }
+  if (sum === 0) return 0;
+  // A lone burst would read as an absurd rate; floor the span at 10s.
+  const span = Math.max(10_000, now - first);
+  return (sum / span) * 60_000;
+}

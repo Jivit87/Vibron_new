@@ -34,10 +34,13 @@ interface UsageState {
   sessionRuns: StoredRun[];
   scope: UsageScope;
   graphHeat: boolean;
+  /** Live usage panel in the run view is expanded. */
+  liveOpen: boolean;
   /** Fold one orchestration event for the run with this client id. */
   ingest: (runId: string | undefined, event: OrchestrationEvent) => void;
   setScope: (scope: UsageScope) => void;
   setGraphHeat: (on: boolean) => void;
+  setLiveOpen: (open: boolean) => void;
 }
 
 /** Pure: the per-run extra after one event. */
@@ -88,6 +91,7 @@ export const useUsageStore = create<UsageState>((set) => ({
   sessionRuns: [],
   scope: "run",
   graphHeat: false,
+  liveOpen: true,
 
   ingest: (runId, event) => {
     if (!runId) return;
@@ -108,6 +112,7 @@ export const useUsageStore = create<UsageState>((set) => ({
 
   setScope: (scope) => set({ scope }),
   setGraphHeat: (graphHeat) => set({ graphHeat }),
+  setLiveOpen: (liveOpen) => set({ liveOpen }),
 }));
 
 /** Per-call usage for a run, if it ran in this session. */
