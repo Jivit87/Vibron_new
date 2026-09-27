@@ -148,3 +148,4 @@ Status: **built** = merged on main with tests green · **in progress** = an agen
     - scratch scripts could not import the repo;
     - every task ran four agents.
   - Merged the Stop fix and per-task usage (d9), the live usage panel (developer-dd), and delivery hardening (d9: rate limits/ETag, stable issue branches, locks, secret redaction). 882 tests pass; clean build is green.
+- **2026-09-27:** Merged d9 agent C plus a follow-up (79baaac): force-push-safe `--no-tags` base fetch; ephemeral issue-worktree workspaces (memory-only store entries); cached `configuredRemoteUrl`; `repoSnapshot()` (18 → 15 git processes per fix→PR, 707 → 653 ms median); backoff polling in the Deliver bar; Ctrl-C cleanup for `viberon issues --fix`. 894 tests pass; clean build is green.
