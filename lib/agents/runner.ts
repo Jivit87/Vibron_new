@@ -211,6 +211,26 @@ export function truncationHint(call: AiToolCall, cap: number, tools: string[]): 
 }
 
 
+/** Tool outputs shorter than this are always sent in full. */
+const REPEAT_MIN_CHARS = 400;
+/** Calls whose result is a verdict or a side effect: never replaced by a pointer. */
+const NEVER_DEDUPE = new Set([...MUTATING_TOOLS, "finish", "done", "submit_plan", "remember", "describe_file", "todo_write"]);
+
+/**
+ * Failure loops re-run the same command and get the same long output back
+ * (a failing test, a traceback), and every copy is re-sent on every later
+ * turn. When a call repeats an earlier call exactly (same tool, same
+ * arguments) and gets byte-identical output that is still in the
+ * transcript, send a one-line pointer instead. The first line is kept so a
+ * failure still reads as one.
+ */
+export function repeatedOutputNote(output: string, name: string, step: number): string {
+  const nl = output.indexOf("\n");
+  const first = (nl < 0 ? output : output.slice(0, nl)).slice(0, 200);
+  const lines = output.split("\n").length;
+  return `${first}\n[Identical to the output of your same ${name} call at step ${step} (${lines} lines, above); not repeated.]`;
+}
+
 /** Render tool arguments as one readable line for the trace. */
 function formatArgs(args: Record<string, unknown>): string {
   const parts: string[] = [];
@@ -538,6 +558,8 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
   }
   /** Running estimate of the next request's size, corrected every turn. */
   let contextTokens = 0;
+  /** Long tool outputs already in the transcript, by call signature (see repeatedOutputNote). */
+  const seenOutputs = new Map<string, { output: string; step: number }>();
   let finalText = "";
   let error: string | undefined;
 
@@ -559,6 +581,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
         messages = pruned.messages;
         contextTokens = Math.max(0, contextTokens - pruned.removed);
         metrics.compactions += 1;
+      seenOutputs.clear(); // Earlier outputs may be gone: never point at them.
         metrics.tokensElided = (metrics.tokensElided ?? 0) + pruned.removed;
         input.emit({
           type: "compaction",
@@ -577,6 +600,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
       messages = elided.messages;
       contextTokens = Math.max(0, contextTokens - elided.removed);
       metrics.compactions += 1;
+      seenOutputs.clear(); // Earlier outputs may be gone: never point at them.
       metrics.tokensElided = (metrics.tokensElided ?? 0) + elided.removed;
       input.emit({
         type: "compaction",
@@ -601,6 +625,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
     contextTokens =
       estimateTokens(buildSystem()) + estimateTokens(buildTools()) + messageTokens(messages);
     metrics.compactions += 1;
+      seenOutputs.clear(); // Earlier outputs may be gone: never point at them.
     input.emit({
       type: "compaction",
       agentId: input.agentId,
@@ -869,6 +894,15 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
           failed,
           iteration,
         });
+        const full = output;
+        if (output.length >= REPEAT_MIN_CHARS && !NEVER_DEDUPE.has(call.name) && !call.inputError) {
+          const key = `${call.name}\u0000${JSON.stringify(call.input)}`;
+          const prior = seenOutputs.get(key);
+          if (prior && prior.output === output) {
+            output = repeatedOutputNote(output, call.name, prior.step);
+            metrics.tokensElided = (metrics.tokensElided ?? 0) + Math.max(0, estimateTokens(full) - estimateTokens(output));
+          } else seenOutputs.set(key, { output, step: iteration + 1 });
+        }
         if (hint) output = `${output}\n\n${hint}`;
 
         input.emit({
