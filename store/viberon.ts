@@ -174,6 +174,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 };
 
 const SETTINGS_KEY = "viberon.settings.v2";
+const FIX_DEFAULT_MIGRATION_KEY = "viberon.migrated.fixDefault";
 
 function loadSettings(): AppSettings {
   if (typeof window === "undefined") return DEFAULT_SETTINGS;
@@ -181,6 +182,16 @@ function loadSettings(): AppSettings {
     const raw = window.localStorage.getItem(SETTINGS_KEY);
     if (!raw) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
+    // One-time move to Fix as the default mode: settings saved before it
+    // became the default recorded "agent" without the user choosing it.
+    try {
+      if (!window.localStorage.getItem(FIX_DEFAULT_MIGRATION_KEY)) {
+        window.localStorage.setItem(FIX_DEFAULT_MIGRATION_KEY, "1");
+        if (parsed.interaction === "agent") parsed.interaction = "fix";
+      }
+    } catch {
+      // Storage unavailable — keep the saved choice.
+    }
     return clampSettings({ ...DEFAULT_SETTINGS, ...parsed });
   } catch {
     return DEFAULT_SETTINGS;
