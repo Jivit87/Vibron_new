@@ -463,6 +463,8 @@ function batchUsage(raw: unknown): BatchUsageRow | undefined {
 }
 
 function batchFastPath(raw: unknown): BatchFastPath | undefined {
+  // The batch runner reports a boolean (accepted or not) when the one-call fast path ran.
+  if (typeof raw === "boolean") return { used: true, calls: 1, accepted: raw };
   const f = rec(raw);
   if (!f) return undefined;
   return { used: f.used === true, calls: num(f.calls) ?? 0, accepted: f.accepted === true };
@@ -489,10 +491,29 @@ export function normalizeBatchIssueResult(raw: unknown): BatchIssueResult | null
   };
 }
 
+/**
+ * A batch's per-issue rows. The server keeps the live, rich rows in
+ * `task.issueProgress` (status, phase, timing, usage) and the delivery
+ * outcome in `task.issueResults` ({url, fixed, detail}); rows come from the
+ * former when present, with a fixed issue's PR filled in from the task.
+ */
 function taskIssueResults(r: Record<string, unknown>): BatchIssueResult[] | undefined {
-  const list = Array.isArray(r.issueResults) ? r.issueResults : undefined;
+  const progress = Array.isArray(r.issueProgress) ? r.issueProgress : undefined;
+  const outcome = Array.isArray(r.issueResults) ? r.issueResults : undefined;
+  const list = progress ?? outcome;
   if (!list) return undefined;
-  const rows = list.map(normalizeBatchIssueResult).filter((x): x is BatchIssueResult => x !== null);
+  const fixedUrls = new Set(
+    (outcome ?? [])
+      .map((o) => rec(o))
+      .filter((o): o is Record<string, unknown> => Boolean(o) && o!.fixed === true)
+      .map((o) => str(o.url))
+      .filter((u): u is string => Boolean(u)),
+  );
+  const taskPr = str(r.prUrl);
+  const rows = list
+    .map(normalizeBatchIssueResult)
+    .filter((x): x is BatchIssueResult => x !== null)
+    .map((row) => (!row.prUrl && taskPr && fixedUrls.has(row.url) ? { ...row, prUrl: taskPr } : row));
   return rows.length ? rows : undefined;
 }
 

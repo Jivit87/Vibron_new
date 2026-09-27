@@ -339,3 +339,27 @@ describe("batch issue results", () => {
     expect(t.issueResults?.[0].status).toBe("verified");
   });
 });
+
+describe("batch rows from the server's issueProgress", () => {
+  it("reads issueProgress rows, maps boolean fastPath and fills the combined PR for fixed issues", async () => {
+    const { normalizeTask } = await import("@/lib/client/deliver");
+    const row = normalizeTask({
+      id: "t1",
+      kind: "fix",
+      repoKey: "r",
+      state: "done",
+      prUrl: "https://github.com/o/r/pull/9",
+      issueResults: [{ url: "https://github.com/o/r/issues/1", fixed: true }, { url: "https://github.com/o/r/issues/2", fixed: false }],
+      issueProgress: [
+        { url: "https://github.com/o/r/issues/1", number: 1, title: "a", status: "verified", fastPath: true, usage: { input: 1000, output: 200, cached: 0, calls: 1 }, timing: { modelMs: 900, toolsMs: 0, proofMs: 300 } },
+        { url: "https://github.com/o/r/issues/2", number: 2, title: "b", status: "unproven", detail: "gave up" },
+      ],
+    });
+    const rows = row?.issueResults ?? [];
+    expect(rows.map((r) => r.status)).toEqual(["verified", "unproven"]);
+    expect(rows[0]?.fastPath).toEqual({ used: true, calls: 1, accepted: true });
+    expect(rows[0]?.prUrl).toBe("https://github.com/o/r/pull/9");
+    expect(rows[1]?.prUrl).toBeUndefined();
+    expect(rows[0]?.usage?.calls).toBe(1);
+  });
+});
