@@ -20,6 +20,7 @@ import type { SolveOptions, SolveResult } from "@/lib/harness/solve-types";
 import { runHeadless } from "@/lib/headless/run";
 import { execInRepo, which } from "@/lib/verify";
 import { excludeFromGit } from "@/lib/workspace/graph-index";
+import { renderTable, resolveSuite } from "@/eval/suites";
 import { renderMarkdown, summarize, type EvalReport, type EvalRow, type EvalSummary } from "@/eval/score";
 
 export const EVAL_DIR = path.resolve(__dirname);
@@ -100,6 +101,8 @@ export async function gradeTask(spec: EvalTaskSpec, repo: string): Promise<{ res
 
 export interface RunEvalOptions {
   only?: string[];
+  /** `quick` (slugify + semver-js) or `mini` (all, the default); `$VIBERON_EVAL_SUITE` when unset. */
+  suite?: string;
   model?: string;
   maxTurns?: number;
   timeoutMs?: number;
@@ -116,7 +119,8 @@ export async function runEval(options: RunEvalOptions = {}): Promise<EvalSummary
   const log = options.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   const resultsDir = options.resultsDir ?? path.join(EVAL_DIR, "results");
   let tasks = await listTasks(options.tasksDir);
-  if (options.only?.length) tasks = tasks.filter((t) => options.only!.includes(t.name));
+  const picked = resolveSuite(options.suite ?? process.env.VIBERON_EVAL_SUITE, options.only, tasks.map((t) => t.name));
+  tasks = tasks.filter((t) => picked.includes(t.name));
   if (!tasks.length) throw new Error("no eval tasks found");
   const model = options.model ?? process.env.VIBERON_MODEL ?? "claude-opus-5";
   const venv = options.venv !== false && tasks.some((t) => t.language === "python")
@@ -169,7 +173,11 @@ export async function runEval(options: RunEvalOptions = {}): Promise<EvalSummary
 
   const report: EvalReport = { generatedAt: new Date().toISOString(), model, summary: summarize(rows), rows };
   await mkdir(resultsDir, { recursive: true });
-  await writeFile(path.join(resultsDir, "latest.json"), `${JSON.stringify(report, null, 2)}\n`);
+  const json = `${JSON.stringify(report, null, 2)}\n`;
+  await writeFile(path.join(resultsDir, "latest.json"), json);
+  // Pramana keeps every run: a timestamped copy so before/after comparisons survive.
+  await writeFile(path.join(resultsDir, "runs", `eval-${report.generatedAt.replace(/[:.]/g, "-")}.json`), json);
+  log(renderTable(rows));
   await writeFile(path.join(resultsDir, "results.md"), renderMarkdown(report));
   log(`resolved ${report.summary.resolved}/${report.summary.total} → ${path.join(resultsDir, "results.md")}`);
   return report.summary;

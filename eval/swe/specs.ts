@@ -95,16 +95,60 @@ async function downloadRows(file: string, fetchImpl: typeof fetch): Promise<void
   await writeFile(file, `${rows.map((r) => JSON.stringify(r)).join("\n")}\n`);
 }
 
-/** Rows for `ids`, in order. Throws naming any id the source does not have. */
-export async function loadInstances(
-  ids: string[],
-  options: { dataFile?: string; cacheDir: string; fetchImpl?: typeof fetch },
-): Promise<SweInstance[]> {
+type RowsOptions = { dataFile?: string; cacheDir: string; fetchImpl?: typeof fetch };
+
+async function rowsFile(options: RowsOptions): Promise<string> {
   let file = localRowsFile(options.dataFile);
   if (!file) {
     file = path.join(options.cacheDir, "swe-bench-verified.jsonl");
     if (!existsSync(file)) await downloadRows(file, options.fetchImpl ?? fetch);
   }
+  return file;
+}
+
+/** Every row of the source (for `pick`). */
+export async function loadAllInstances(options: RowsOptions): Promise<SweInstance[]> {
+  return parseRows(await readFile(await rowsFile(options), "utf8")).map(normalizeRow);
+}
+
+/**
+ * Pramana `swe_eval.py pick`: a stratified sample of the repos that install
+ * without Docker, reproducible by seed (per repo: sort ids, seeded shuffle, take n).
+ */
+export const PICK_PER_REPO: Record<string, number> = {
+  "psf/requests": 3,
+  "pytest-dev/pytest": 4,
+  "sympy/sympy": 6,
+  "django/django": 9,
+  "pallets/flask": 1,
+  "pylint-dev/pylint": 1,
+};
+
+export function pickIds(rows: Pick<SweInstance, "instance_id" | "repo">[], seed = 0, perRepo = PICK_PER_REPO): string[] {
+  // mulberry32: small, deterministic, good enough for sampling.
+  let a = seed >>> 0;
+  const rand = () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const ids: string[] = [];
+  for (const [repo, n] of Object.entries(perRepo)) {
+    const pool = rows.filter((r) => r.repo === repo).map((r) => r.instance_id).sort();
+    for (let i = pool.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rand() * (i + 1));
+      [pool[i], pool[j]] = [pool[j]!, pool[i]!];
+    }
+    ids.push(...pool.slice(0, n));
+  }
+  return ids;
+}
+
+/** Rows for `ids`, in order. Throws naming any id the source does not have. */
+export async function loadInstances(ids: string[], options: RowsOptions): Promise<SweInstance[]> {
+  const file = await rowsFile(options);
   const rows = new Map(parseRows(await readFile(file, "utf8")).map((r) => [String(r.instance_id), r]));
   return ids.map((id) => {
     const row = rows.get(id);
