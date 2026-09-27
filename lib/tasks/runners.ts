@@ -174,7 +174,7 @@ interface BatchItem {
   finishedAt?: number;
   timing: IssueTiming;
   usage: IssueUsage;
-  /** Tokens this issue has spent (input + output + cache read), for the batch budget. */
+  /** Tokens this issue has spent (input + output), for the batch budget. */
   spent: number;
   /** Its token cap while it runs; unspent cap stays reserved for it. */
   cap: number;
@@ -184,7 +184,8 @@ interface BatchItem {
 
 /**
  * Token ceiling for one task (a single fix, or a whole batch), counted like
- * the solver's own budget: input + output + cache-read tokens. Small repos
+ * the solver's own budget: input + output tokens (cache reads are cheap and
+ * do not count). Small repos
  * should be fixed well inside it; an issue that cannot be proven within its
  * share stops instead of looping. `VIBERON_TASK_TOKEN_BUDGET` overrides it.
  */
@@ -198,7 +199,7 @@ const MIN_ISSUE_BUDGET = 8_000;
 /** Tokens a `turn_usage` event spends against a budget (same count as the solver's). */
 function turnTokens(event: OrchestrationEvent): number {
   if (event.type !== "turn_usage") return 0;
-  return event.inputTokens + event.outputTokens + event.cacheReadTokens;
+  return event.inputTokens + event.outputTokens;
 }
 
 /** Issues solved at once; each in its own worktree. */
