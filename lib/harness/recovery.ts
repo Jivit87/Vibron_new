@@ -108,6 +108,38 @@ const FULL_SUITE_RE =
   /^(python3? -m )?(pytest|py\.test)(\s+(-q|-qq|-x|-v|-vv|-rA|-ra|-s|--tb=\w+))*\s*$|^(npm|yarn|pnpm) (run )?test\s*$|^go test \.\/\.\.\.\s*$|^cargo test\s*$/;
 const STALL_TURNS = 10;
 
+/* ---------------------------- give-up rules ------------------------------ */
+
+/**
+ * The token burners (measured: 4 unproven issues on a 120B model each ran
+ * ~2 attempts x up to 40 turns without ever producing a verified edit).
+ * An attempt ends early instead of spending its whole turn budget.
+ */
+export const GIVE_UP = {
+  /** End the attempt when no source file was edited by this turn. */
+  noEditTurns: 12,
+  /** The same, for the agent that runs after the one-call fast path failed (it has already seen the code). */
+  noEditTurnsAfterFastPath: 6,
+  /** Turn cap for the agent that runs after the one-call fast path failed. */
+  maxTurnsAfterFastPath: 12,
+  /** End the attempt when nothing was verified (finish / compare / checkpoint) by this turn. */
+  noProofTurns: 20,
+};
+
+/** Default per-issue budget, input + output tokens. */
+export const DEFAULT_ISSUE_TOKEN_BUDGET = 150_000;
+
+/** The per-issue token budget: explicit option, then VIBERON_ISSUE_TOKEN_BUDGET, then the default. */
+export function issueTokenBudget(explicit?: number, env: Record<string, string | undefined> = process.env): number {
+  if (explicit && explicit > 0) return explicit;
+  const fromEnv = Number(env.VIBERON_ISSUE_TOKEN_BUDGET);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : DEFAULT_ISSUE_TOKEN_BUDGET;
+}
+
+export function gaveUpAfterTokens(tokens: number): string {
+  return `gave up after ${tokens} tokens without proof`;
+}
+
 /** A command that runs the whole test suite rather than a targeted file. */
 export function isFullSuiteCommand(command: string): boolean {
   return FULL_SUITE_RE.test(command.trim());
@@ -187,6 +219,22 @@ export class TrajectoryGuards {
     if (this.nudged.has(tag)) return false;
     this.nudged.add(tag);
     return true;
+  }
+
+  /**
+   * The no-progress guard's hard stop: after `turns` completed turns, a
+   * reason to END the attempt (no source edit by GIVE_UP.noEditTurns, or no
+   * verification by GIVE_UP.noProofTurns), else null. Only applies when the
+   * attempt has turns left beyond the threshold.
+   */
+  giveUp(turns: number, verified: boolean, noEditTurns = GIVE_UP.noEditTurns): string | null {
+    if (this.edits === 0 && turns >= noEditTurns && this.maxSteps > noEditTurns) {
+      return `no source edit after ${turns} turns`;
+    }
+    if (!verified && turns >= GIVE_UP.noProofTurns && this.maxSteps > GIVE_UP.noProofTurns) {
+      return `no verification after ${turns} turns`;
+    }
+    return null;
   }
 
   /** Notes due after the turn at `step` (1-based). */

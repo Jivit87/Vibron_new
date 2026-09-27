@@ -29,6 +29,7 @@ import type { Graph } from "@/lib/graph";
 import { runRunCommand } from "@/lib/harness/workspace-services";
 import {
   changedFiles,
+  diff,
   listFiles,
   restore,
   SCRATCH_DIR,
@@ -477,14 +478,48 @@ export class Gate {
     return run;
   }
 
-  /** Targeted runs of the existing tests related to the changed files. */
+  /** Related existing tests are a regression net, not the proof: their runs are capped. */
+  private checkTimeout(origin: CheckOrigin): number {
+    return origin === "related-tests" ? Math.min(this.options.timeoutMs, RELATED_TIMEOUT_MS) : this.options.timeoutMs;
+  }
+
+  /**
+   * Targeted runs of the existing tests related to the changed files. For
+   * pytest, only the test functions that reference a changed function or
+   * class (node ids), so a big test module does not run whole on both sides
+   * (measured: 736 s on sympy); whole files only when targeting finds nothing.
+   */
   private async relatedCommands(changed: string[]): Promise<string[]> {
     const test = this.testCommand;
     const template = test?.targetTemplate ?? (test ? FRAMEWORK_TEMPLATES[test.framework] : undefined);
     if (!template?.includes("{files}") || !changed.length) return [];
     const files = await this.services.relatedTestFiles(this.options.root, changed, this.options.graph).catch(() => []);
     const picks = files.filter((f) => !changed.includes(f)).slice(0, 4);
-    return picks.length ? [template.replace("{files}", picks.join(" "))] : [];
+    if (!picks.length) return [];
+    if (test && (test.framework === "pytest" || test.framework === "unittest") && picks.every((f) => f.endsWith(".py"))) {
+      const ids = await this.targetedPythonTests(changed, picks).catch((): string[] => []);
+      if (ids.length) return [template.replace("{files}", ids.join(" "))];
+    }
+    return [template.replace("{files}", picks.join(" "))];
+  }
+
+  private async targetedPythonTests(changed: string[], testFiles: string[]): Promise<string[]> {
+    const { root, baseRef } = this.options;
+    const sources = changed.filter((c) => c.endsWith(".py") && !isTestPath(c));
+    if (!sources.length) return [];
+    const patch = await diff(root, baseRef, { context: 0, paths: sources });
+    const symbols = new Set<string>();
+    for (const file of sources) {
+      const text = (await readText(path.join(root, file))) ?? "";
+      for (const s of changedPythonSymbols(patch, file, text)) symbols.add(s);
+    }
+    if (!symbols.size) return [];
+    const ids: string[] = [];
+    for (const file of testFiles) {
+      const text = await readText(path.join(root, file));
+      if (text) ids.push(...pythonTestIds(file, text, symbols));
+    }
+    return ids.length <= MAX_TARGETED_IDS ? ids : [];
   }
 
   /** The `compare` tool: one command on the original code and on the current code. */
@@ -600,7 +635,9 @@ export class Gate {
     // original side in its own temporary checkout, so they share no files.
     // Each side stays sequential (one side's checks can share caches).
     const patched = (async () => {
-      for (const check of checks) check.after = await this.runOnce(check.command, root, suiteByCommand.get(check.command));
+      for (const check of checks) {
+        check.after = await this.runOnce(check.command, root, suiteByCommand.get(check.command), this.checkTimeout(check.origin));
+      }
     })();
     const original = (async () => {
       try {
@@ -608,7 +645,7 @@ export class Gate {
         if (needBaseline.length) {
           await this.onOriginal(async (dir) => {
             for (const check of needBaseline) {
-              const outcome = this.runOnce(check.command, dir, suiteByCommand.get(check.command));
+              const outcome = this.runOnce(check.command, dir, suiteByCommand.get(check.command), this.checkTimeout(check.origin));
               // Existing tests on the original code never change: cache them.
               if (check.origin !== "agent") this.baselineCache.set(check.command, outcome);
               check.before = await outcome;
@@ -821,6 +858,81 @@ export class Gate {
     });
     return true;
   }
+}
+
+/** Related existing tests on one side of the gate never run longer than this. */
+export const RELATED_TIMEOUT_MS = 120_000;
+/** More matching tests than this: the file-level run is simpler and about as fast. */
+const MAX_TARGETED_IDS = 60;
+
+const PY_DEF = /^(\s*)(?:async\s+)?(def|class)\s+([A-Za-z_]\w*)/;
+const PY_DEFINED = /^[+-]\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)/;
+
+/**
+ * Functions and classes a patch touches in one Python file: names defined on
+ * changed lines, plus the enclosing def/class of every changed line in the
+ * patched text (method and its class).
+ */
+export function changedPythonSymbols(patch: string, file: string, text: string): string[] {
+  const names = new Set<string>();
+  const lines = text.split("\n");
+  let inFile = false;
+  for (const line of patch.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      inFile = line.endsWith(` b/${file}`);
+      continue;
+    }
+    if (!inFile) continue;
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (hunk) {
+      const start = Number(hunk[1]);
+      const count = hunk[2] === undefined ? 1 : Number(hunk[2]);
+      for (let n = Math.max(1, start); n <= Math.max(start, start + count - 1); n += 1) {
+        if (count > 0 && !lines[n - 1]?.trim()) continue; // a blank line belongs to no definition
+        // Walk up to the enclosing definitions (decreasing indentation).
+        let indent = Infinity;
+        for (let i = Math.min(n, lines.length) - 1; i >= 0 && indent > 0; i -= 1) {
+          const m = PY_DEF.exec(lines[i]);
+          if (m && m[1].length < indent) {
+            names.add(m[3]);
+            indent = m[1].length;
+          }
+        }
+      }
+      continue;
+    }
+    const d = PY_DEFINED.exec(line);
+    if (d && !line.startsWith("+++") && !line.startsWith("---")) names.add(d[1]);
+  }
+  for (const generic of ["__init__", "__call__", "__repr__", "__str__", "__eq__", "__hash__"]) names.delete(generic);
+  return [...names];
+}
+
+/** pytest node ids of the tests in `text` whose name or body mentions one of `symbols`. */
+export function pythonTestIds(file: string, text: string, symbols: Set<string>): string[] {
+  const words = [...symbols].filter((s) => s.length >= 3);
+  if (!words.length) return [];
+  const rx = new RegExp(`\\b(${words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\b`);
+  const lines = text.split("\n");
+  const ids: string[] = [];
+  let cls: { name: string; indent: number } | null = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = PY_DEF.exec(lines[i]);
+    if (!m) continue;
+    const indent = m[1].length;
+    if (cls && indent <= cls.indent) cls = null;
+    if (m[2] === "class") {
+      if (indent === 0 && /^Test/.test(m[3])) cls = { name: m[3], indent };
+      continue;
+    }
+    if (!/^test/.test(m[3]) || (indent > 0 && !cls)) continue;
+    let end = i + 1;
+    // The body: every following line that is blank or indented deeper than the def.
+    while (end < lines.length && (!lines[end].trim() || lines[end].length - lines[end].trimStart().length > indent)) end += 1;
+    const body = lines.slice(i, end).join("\n");
+    if (rx.test(body)) ids.push(cls ? `${file}::${cls.name}::${m[3]}` : `${file}::${m[3]}`);
+  }
+  return ids;
 }
 
 export function strengthRank(s: Strength): number {

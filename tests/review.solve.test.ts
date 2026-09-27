@@ -294,7 +294,9 @@ describe("solve-loop reviewer", () => {
   it("escalates when an attempt ends without proof: the retry gets criteria, the blind writer and the reviewer", async () => {
     const fake = installFakeProvider(routed({
       solver: [
-        // Attempt 1 never finishes (no proof).
+        // Attempt 1 edits source but never finishes (no proof). An attempt with
+        // no source edit at all would end the run (give-up rule), not retry.
+        { calls: [{ name: "edit_file", input: { path: "lib.js", find: ORIGINAL, replace: ORIGINAL.replace("/ xs.length", "/ (xs.length)"), summary: "noop" } }] },
         { text: "I think it is fine." },
         { text: "Done." },
         // Attempt 2, fresh context.

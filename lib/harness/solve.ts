@@ -43,7 +43,9 @@ import {
   type GateResult,
   type Outcome,
 } from "@/lib/harness/gate";
-import { NUDGES, TrajectoryGuards } from "@/lib/harness/recovery";
+import { fastLessons, isSourceFile, runFastPath, type FastResult } from "@/lib/harness/fastpath";
+import { GIVE_UP, gaveUpAfterTokens, issueTokenBudget, NUDGES, TrajectoryGuards } from "@/lib/harness/recovery";
+import { triage } from "@/lib/harness/triage";
 import {
   changedFiles,
   diff,
@@ -99,7 +101,10 @@ const DIGEST_README_CHARS = 6_000;
 
 interface AttemptRecord {
   number: number;
-  run: AgentRunResult;
+  /** Absent for the one-call fast path. */
+  run?: AgentRunResult;
+  /** Source files the attempt edited (0 = it never committed to a fix). */
+  sourceEdits: number;
   verification: GateResult | null;
   patch: string;
   tree: string;
@@ -122,6 +127,10 @@ class SolveController implements RunController {
   finishedWithoutGate = false;
   summary = "";
   checkpoints = 0;
+  /** Why the harness ended this attempt early (give-up rules, token budget). */
+  gaveUp: string | null = null;
+  /** Something was verified: finish, compare, or a harness checkpoint. */
+  private verified = false;
   private reprompted = false;
   /** Harness notes that arrived mid-attempt (late criteria); appended, never inserted. */
   private pending: string[] = [];
@@ -141,6 +150,8 @@ class SolveController implements RunController {
       usageBefore: () => AiUsage;
       budget: SolveOptions["budget"];
       startedAt: number;
+      /** Give-up rule: end the attempt with no source edit after this many turns. */
+      noEditTurns?: number;
       /** Wall-time a phase (the gate's rulings). */
       timed: <T>(phase: string, fn: () => Promise<T>) => Promise<T>;
     },
@@ -157,14 +168,34 @@ class SolveController implements RunController {
     this.pending.push(text);
   }
 
-  budgetExceeded({ usage }: { iteration: number; usage: AiUsage }): string | null {
+  budgetExceeded({ iteration, usage }: { iteration: number; usage: AiUsage }): string | null {
     const { budget, startedAt } = this.opts;
     const before = this.opts.usageBefore();
-    const total =
-      before.inputTokens + before.outputTokens + before.cacheReadTokens + usage.inputTokens + usage.outputTokens + usage.cacheReadTokens;
-    if (budget.maxTokens && total >= budget.maxTokens) return "token budget exhausted";
+    // Input + output: cache reads are billed at ~0.1x and would end a cached run early.
+    const total = before.inputTokens + before.outputTokens + usage.inputTokens + usage.outputTokens;
+    if (budget.maxTokens && total >= budget.maxTokens) {
+      if (!this.isDone()) this.stopEarly(gaveUpAfterTokens(total));
+      return "token budget exhausted";
+    }
     if (budget.maxWallMs && Date.now() - startedAt >= budget.maxWallMs) return "time budget exhausted";
+    // The no-progress guard's hard stop: `iteration` turns have completed.
+    const reason = this.isDone() ? null : this.guards.giveUp(iteration, this.verified, this.opts.noEditTurns);
+    if (reason) {
+      this.stopEarly(`gave up: ${reason}`);
+      return reason;
+    }
     return null;
+  }
+
+  private stopEarly(reason: string): void {
+    this.gaveUp = reason;
+    this.opts.emit({
+      type: "recovery",
+      agentId: this.opts.agentId,
+      failureClass: "no_progress",
+      action: "hint",
+      detail: `Ending the attempt: ${reason}.`,
+    });
   }
 
   private recovery(note: { failureClass: FailureClass; action: "hint" | "replan"; text: string }): string {
@@ -186,6 +217,7 @@ class SolveController implements RunController {
     iteration: number;
   }): Promise<string | null> {
     this.step = info.iteration + 1;
+    if (info.name === "compare" || info.name === "finish") this.verified = true;
     if (info.name === "run_command" && typeof info.input.command === "string") this.commands.push(info.input.command);
     const note = this.guards.track(info);
     return note ? this.recovery(note) : null;
@@ -236,6 +268,7 @@ class SolveController implements RunController {
     if (!reproduction) return null;
     this.proofChecks += 1;
     this.lastProofStep = step;
+    this.verified = true;
     const result = await this.opts.gate.verify({ summary: "(harness checkpoint)", reproduction }, { dry: true }).catch(() => null);
     if (result?.strength !== "strong") return null;
     return `HARNESS CHECKPOINT (no action needed if you disagree). Your current change already carries proof: the harness ran your reproduction and the related tests on the original code and on your patched code.\n\n${result.feedback}\n\nIf the task is fully addressed, call \`finish\` NOW with reproduction \`${reproduction}\` instead of exploring further. If something in the task is still unhandled, say what, fix it, and then finish.`;
@@ -530,6 +563,8 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
   const startedAt = Date.now();
   const { emit, handle } = options;
   const result = emptyResult(options);
+  // A per-issue token budget always applies (default, or VIBERON_ISSUE_TOKEN_BUDGET).
+  const budget: SolveOptions["budget"] = { ...options.budget, maxTokens: issueTokenBudget(options.budget.maxTokens) };
   const agentId = "solver";
   let root: string | null = null;
   let baseRef: string | null = null;
@@ -743,22 +778,116 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
     let reviewTitle = "Address review finding";
     let postChecked = false;
     let independentRetryCommand: string | null = null;
+    const spentTokens = () => usage.inputTokens + usage.outputTokens;
     const overBudget = () => {
-      const spent = usage.inputTokens + usage.outputTokens + usage.cacheReadTokens;
-      const { maxTokens, maxWallMs } = options.budget;
-      return Boolean((maxTokens && spent > maxTokens * 0.75) || (maxWallMs && Date.now() - startedAt > maxWallMs * 0.75));
+      const { maxTokens, maxWallMs } = budget;
+      return Boolean((maxTokens && spentTokens() > maxTokens * 0.75) || (maxWallMs && Date.now() - startedAt > maxWallMs * 0.75));
     };
+    /** An attempt ended without proof: switch on the evidence layers for the retry. */
+    const escalate = async (withWriter = true) => {
+      if (escalated) return;
+      escalated = true;
+      if (options.criteria !== false && !criteriaP) await settleCriteria(startCriteria());
+      if (options.independentTest !== false && (withWriter || options.independentTest === true)) {
+        writerOn = true;
+        startDraft();
+      }
+      if (options.review !== false) reviewOn = true;
+    };
+
+    // Fast path (mode "fast"): a zero-token triage, then for a small or medium
+    // issue ONE call that must return the edits and a test that fails on the
+    // original code, proven by the same gate. Unproven: the agent loop starts
+    // with its lessons, escalated.
+    let fastRecord: AttemptRecord | null = null;
+    let fastFailed = false;
+    const sized = triage({ text: options.task, files: loc.files, snippetOutput: loc.snippetRun?.output });
+    const fastOn =
+      !thorough &&
+      options.verify.enabled &&
+      (options.fastPath ?? process.env.VIBERON_FAST_PATH !== "0") &&
+      sized.size !== "large" &&
+      loc.files.length > 0;
+    emit({
+      type: "agent_text",
+      agentId,
+      text: `\n[harness] triage: ${sized.size} (${sized.reasons.join("; ")}): ${fastOn ? "one-shot fix first, full agent only if it can't be proven" : "full agent from the start"}\n`,
+    });
+    if (fastOn && !options.signal?.aborted) {
+      const fast: FastResult = await timed("fastPath", () =>
+        runFastPath({
+          root: workRoot,
+          baseRef: ref,
+          task: options.task,
+          model: options.model,
+          overview,
+          sources: loc.files.slice(0, 4).map((f) => f.path),
+          tests: loc.testFiles.slice(0, 3),
+          testCommand: test?.command ?? null,
+          snippet: loc.snippetRun ? `exit ${loc.snippetRun.exitCode ?? "?"}\n${loc.snippetRun.output}` : undefined,
+          allFiles: () => listFiles(workRoot, ref),
+          gate,
+          emit,
+          agentId,
+          signal: options.signal,
+          onTurn: account,
+        }),
+      );
+      result.metrics.fastPath = { used: true, calls: fast.calls, accepted: fast.ok };
+      if (fast.ok) {
+        const edits = fast.edits.filter((e) => e.path && !e.path.startsWith(`${SCRATCH_DIR}/`));
+        fastRecord = {
+          number: 1,
+          sourceEdits: edits.filter((e) => isSourceFile(e.path)).length,
+          verification: fast.verification,
+          patch: await diff(root, baseRef),
+          tree: await snapshot(root),
+          // New files ARE the fix here, not side effects.
+          created: edits.filter((e) => !e.search.trim()).map((e) => e.path),
+          touched: edits.map((e) => e.path),
+          summary: fast.diagnosis || "Fixed in one call.",
+          stopReason: "fast_path",
+          restoredBest: false,
+        };
+      } else if (!options.signal?.aborted) {
+        if (fast.stage !== "no-reply") lessons = fastLessons(fast);
+        await restore(root, baseRef);
+        fastFailed = true;
+        // A small issue gets the cheap layers only (criteria, reviewer), not the multi-turn blind writer.
+        await escalate(sized.size !== "small");
+        retryReason = `The one-call fast path was not accepted (${fast.stage}): ${fast.reason.slice(0, 200)}`;
+      }
+    }
 
     for (let n = 1; n <= maxAttempts || reviewTask; n += 1) {
       if (options.signal?.aborted) break;
       const reviewPass = reviewTask !== null;
+      const fromFast = n === 1 && fastRecord !== null;
       if (n > 1) {
         // A review pass continues from the accepted change; a retry starts over.
         if (!reviewPass) {
-          if (overBudget()) break;
+          if (overBudget()) {
+            result.metrics.gaveUp = gaveUpAfterTokens(spentTokens());
+            break;
+          }
           await restore(root, baseRef);
         }
         gate.resetAttempt();
+      }
+      let record: AttemptRecord;
+      if (fromFast) {
+        record = fastRecord!;
+        // A small issue proven fail->pass in one call: no reviewer or blind writer on top.
+        if (sized.size === "small" && options.review !== true && options.independentTest !== true) postChecked = true;
+        attempts.push(record);
+        reviewTask = null;
+      } else {
+      // After a failed fast path the agent has seen the code: small caps.
+      const afterFast = fastFailed && !reviewPass;
+      const maxTurns = afterFast ? Math.min(options.budget.maxTurns, GIVE_UP.maxTurnsAfterFastPath) : options.budget.maxTurns;
+      if (spentTokens() >= (budget.maxTokens ?? Infinity)) {
+        result.metrics.gaveUp ??= gaveUpAfterTokens(spentTokens());
+        break;
       }
       const editSession = createEditSession();
       const controller: SolveController = new SolveController({
@@ -767,10 +896,11 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         baseRef,
         emit,
         agentId,
-        maxTurns: options.budget.maxTurns,
+        maxTurns,
+        noEditTurns: afterFast ? GIVE_UP.noEditTurnsAfterFastPath : GIVE_UP.noEditTurns,
         gateEnabled: options.verify.enabled,
         usageBefore: () => usage,
-        budget: options.budget,
+        budget,
         startedAt,
         timed,
       });
@@ -794,7 +924,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         commandPolicy: "auto",
         emit,
         signal: options.signal,
-        maxIterations: options.budget.maxTurns,
+        maxIterations: maxTurns,
         runId: options.runId,
         rules,
         showThinking: false,
@@ -862,9 +992,10 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         });
       }
 
-      const record: AttemptRecord = {
+      record = {
         number: n,
         run,
+        sourceEdits: controller.guards.edits,
         verification,
         patch: await diff(root, baseRef),
         tree: await snapshot(root),
@@ -879,6 +1010,10 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
       attempts.push(record);
       reviewTask = null;
       if (run.error && run.error !== "cancelled" && !record.patch.trim()) result.error = run.error;
+      if (controller.gaveUp) result.metrics.gaveUp = controller.gaveUp;
+      }
+      const verification = record.verification;
+      const runError = record.run?.error;
       if (independentRetryCommand && reviewPass && verification?.strength === "strong") {
         const checked = await gate.compareIndependent(independentRetryCommand).catch(() => null);
         const outcome = checked ? classifyIndependent(independentRetryCommand, checked) : null;
@@ -892,7 +1027,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         !postChecked &&
         !reviewPass &&
         verification?.strength === "strong" &&
-        run.error !== "cancelled"
+        runError !== "cancelled"
       ) {
         postChecked = true;
         if (overBudget()) {
@@ -931,18 +1066,23 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
           }
         }
       }
-      if (reviewPass || !options.verify.enabled || verification?.strength === "strong" || run.error === "cancelled") break;
+      if (reviewPass || !options.verify.enabled || verification?.strength === "strong" || runError === "cancelled") break;
+      // Give-up rule: an attempt that never edited a source file will not be
+      // rescued by a second one from the same starting point.
+      if (n < maxAttempts && record.sourceEdits === 0 && !record.patch.trim()) {
+        result.metrics.gaveUp ??= `attempt ${n} made no source edit; skipping further attempts`;
+        emit({
+          type: "recovery",
+          agentId,
+          failureClass: "no_progress",
+          action: "hint",
+          detail: `Attempt ${n} made no source edit; not starting another attempt.`,
+        });
+        break;
+      }
       lessons = lessonsFrom(record);
       // Fast path missed: switch on the evidence layers for the retry.
-      if (!escalated && n < maxAttempts) {
-        escalated = true;
-        if (options.criteria !== false && !criteriaP) await settleCriteria(startCriteria());
-        if (options.independentTest !== false) {
-          writerOn = true;
-          startDraft();
-        }
-        if (options.review !== false) reviewOn = true;
-      }
+      if (n < maxAttempts) await escalate();
       retryReason = `Attempt ${n} ended without proof (${verification ? `gate: ${verification.decision}` : record.stopReason}); retrying from a fresh context with its diff as a rejected alternative.`;
     }
 
@@ -1000,6 +1140,9 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
     else if (v?.decision === "accept_unverified") result.status = "unverified";
     else result.status = "incomplete";
     if (options.signal?.aborted && result.status !== "resolved") result.status = "incomplete";
+    // A give-up reason only explains a run that ended without proof.
+    if (result.status === "resolved") delete result.metrics.gaveUp;
+    else if (result.metrics.gaveUp) result.gate.reason = `${result.metrics.gaveUp}${v ? ` (${result.gate.reason})` : ""}`;
 
     const summaryText = best?.summary.trim() || attempts.at(-1)?.summary || "";
     result.summary =

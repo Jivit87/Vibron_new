@@ -57,6 +57,12 @@ export interface SolveOptions {
    * Explicit `criteria` / `independentTest` / `review` values override both.
    */
   mode?: "fast" | "thorough";
+  /**
+   * Mode "fast" only: for an issue triaged small or medium, try ONE model call
+   * (edits + a test that fails on the original code) through the gate before
+   * the agent loop. Default: on (VIBERON_FAST_PATH=0 turns the default off).
+   */
+  fastPath?: boolean;
   onSolved?: (result: SolveResult) => void | Promise<void>;
 }
 
@@ -114,6 +120,10 @@ export interface SolveResult {
     durationMs: number;
     /** Wall time per harness phase: setup, localize, criteria, loop, gate, testWriter, review. */
     phaseMs?: Record<string, number>;
+    /** The one-call fast path: whether it ran, its model calls, and whether its proof was accepted. */
+    fastPath?: { used: boolean; calls: number; accepted: boolean };
+    /** Why the harness stopped spending on an unproven run (give-up rules, token budget). */
+    gaveUp?: string;
   };
   /** Acceptance criteria predicted from the task (empty when skipped). */
   criteria?: string[];
