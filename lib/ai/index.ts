@@ -220,6 +220,15 @@ export async function availableModels(): Promise<
   });
 }
 
+/**
+ * A Claude CLI login is a personal subscription: runs on it are the user's
+ * explicit choice (a claude-cli:* model), never an automatic fallback when
+ * API keys are missing. VIBERON_CLAUDE_CLI_AUTO=1 opts automatic picks in.
+ */
+export function cliAutoOptIn(): boolean {
+  return process.env.VIBERON_CLAUDE_CLI_AUTO === "1";
+}
+
 const PROVIDER_PREFERENCE: ProviderId[] = ["anthropic", "deepseek", "gemini", "nvidia", "openai", "groq", "claude-cli"];
 
 /**
@@ -234,16 +243,20 @@ export async function resolveModel(
   if (getModel(preferred)?.provider === "claude-cli" && (override !== null || (await claudeCliReady()))) return preferred;
   const models = await availableModels();
   const usable = models.filter(
-    ({ spec, available }) => available && (!opts.agenticOnly || spec.agentic),
+    ({ spec, available }) =>
+      available && (!opts.agenticOnly || spec.agentic) && (spec.provider !== "claude-cli" || cliAutoOptIn()),
   );
   if (usable.length === 0) {
     // Distinguish "no credentials at all" from "the configured provider has
     // no model good enough for this job" — they need different fixes.
-    const anyConfigured = models.some((m) => m.available);
+    const anyConfigured = models.some((m) => m.available && m.spec.provider !== "claude-cli");
+    const cliReady = models.some((m) => m.available && m.spec.provider === "claude-cli");
     throw new Error(
       anyConfigured
         ? "No configured model is reliable enough for agentic tool loops. Add an Anthropic key in Settings → Providers, or pick a different model."
-        : "No API key configured. Add one in Settings → Providers to start building.",
+        : cliReady
+          ? "No API key configured. Add one in Settings → Providers, or pick a \"Claude subscription (CLI)\" model in the model menu to run on your Claude login."
+          : "No API key configured. Add one in Settings → Providers to start building.",
     );
   }
 

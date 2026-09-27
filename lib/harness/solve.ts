@@ -28,7 +28,7 @@ import path from "node:path";
 import type { EventSink, FailureClass, RunStatus } from "@/lib/agents/events";
 import { loadRules } from "@/lib/agents/rules";
 import { runAgent, type AgentRunResult, type RunController } from "@/lib/agents/runner";
-import { ensureModelReady, type EnrichedTurnResult } from "@/lib/ai";
+import { ensureModelReady, getModel, type EnrichedTurnResult } from "@/lib/ai";
 import { addUsage, EMPTY_USAGE, type AiUsage } from "@/lib/ai/types";
 import { ContextLedger, type EngineInput } from "@/lib/context/engine";
 import { predictCriteria, renderCriteria } from "@/lib/harness/criteria";
@@ -574,10 +574,14 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
     // snapshot because its snippet runs execute in the tree.
     const setupStarted = Date.now();
     const thorough = options.mode === "thorough";
+    // Side calls (criteria, reviewer) follow a run the user put on the Claude
+    // CLI onto its cheapest model; they never pick the CLI on their own.
+    const sideModel =
+      options.reviewModel ?? (getModel(options.model)?.provider === "claude-cli" ? "claude-cli:haiku" : undefined);
     let criteriaP: Promise<string[]> | null = null;
     const startCriteria = (): Promise<string[]> =>
       (criteriaP ??= timed("criteria", () =>
-        predictCriteria({ task: options.task, model: options.reviewModel, signal: options.signal, onTurn: account }),
+        predictCriteria({ task: options.task, model: sideModel, signal: options.signal, onTurn: account }),
       ).catch((): string[] => []));
     if (options.criteria ?? thorough) startCriteria();
     const baseRefP = ensureScratch(workRoot).then(() => snapshot(workRoot));
@@ -667,7 +671,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         const review = await reviewDiff({
           diff: wide.trim() && wide.length < 80_000 ? wide : record.patch,
           task: options.task,
-          model: options.reviewModel,
+          model: sideModel,
           signal: options.signal,
           root: workRoot,
           verified: { evidence: renderChecks(v.checks), criteria },
@@ -698,7 +702,7 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
                 ...(criteria.length ? {} : { lateCriteria: criteriaReady }),
                 summary: overview,
                 relatedTests: loc.testFiles,
-                model: options.reviewModel ?? options.model,
+                model: sideModel ?? options.model,
                 open: async (dir) => {
                   const scratchHandle = await openWorkspace((await registerLocalWorkspace(dir)).repoKey);
                   return { handle: scratchHandle, engine: await prepareEngine({ ...options, handle: scratchHandle }) };

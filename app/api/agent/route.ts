@@ -83,10 +83,13 @@ export async function POST(request: Request) {
     );
   }
 
+  // `mode: "fix"` is a common mix-up for `interaction: "fix"`; honour it rather than silently build.
   const interaction: Interaction =
     body.interaction === "plan" || body.interaction === "ask" || body.interaction === "fix"
       ? body.interaction
-      : "agent";
+      : body.mode === "fix"
+        ? "fix"
+        : "agent";
   const plan = interaction === "agent" ? parsePlan(body.plan) : undefined;
   const mode =
     body.mode === "single" || body.mode === "orchestrated" ? body.mode : "auto";

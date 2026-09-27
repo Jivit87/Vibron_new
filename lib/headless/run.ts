@@ -306,6 +306,11 @@ export async function runHeadless(options: HeadlessOptions, deps: HeadlessDeps =
       log(`worktree: ${workRoot}`);
     }
 
+    // Fail fast on an unknown model or a missing key, before indexing the repo.
+    if (!deps.solve) {
+      const { ensureModelReady } = await import("@/lib/ai");
+      await ensureModelReady(model);
+    }
     log("indexing workspace…");
     const meta = await registerLocalWorkspace(workRoot);
     const handle = await openWorkspace(meta.repoKey);

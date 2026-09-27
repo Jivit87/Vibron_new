@@ -6,7 +6,7 @@
  * picks the default model for the review tools.
  */
 
-import { availableModels, runTurn as defaultRunTurn, type AiTurnRequest, type AiUsage } from "@/lib/ai";
+import { availableModels, cliAutoOptIn, runTurn as defaultRunTurn, type AiTurnRequest, type AiUsage } from "@/lib/ai";
 
 export interface TurnOutcome {
   text: string;
@@ -95,7 +95,8 @@ const RANK: Record<string, number> = { fast: 0, balanced: 1, frontier: 2 };
  */
 export async function reviewModel(preferred?: string): Promise<string> {
   if (preferred && preferred !== "auto") return preferred;
-  const models = (await availableModels()).filter((m) => m.spec.agentic);
+  // Never an implicit Claude CLI (subscription) pick; callers on the CLI pass it explicitly.
+  const models = (await availableModels()).filter((m) => m.spec.agentic && (m.spec.provider !== "claude-cli" || cliAutoOptIn()));
   const pick = (list: typeof models) =>
     [...list].sort(
       (a, b) => RANK[a.spec.tier] - RANK[b.spec.tier] || a.spec.pricing.input - b.spec.pricing.input,

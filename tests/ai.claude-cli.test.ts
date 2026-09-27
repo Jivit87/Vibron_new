@@ -174,8 +174,12 @@ describe("Claude CLI provider", () => {
     await expect(claudeCliProvider.runTurn(request())).rejects.toThrow(/Claude CLI/);
   });
 
-  it("auto uses the CLI only when no API-key provider is configured", async () => {
+  it("auto never lands on the CLI (a subscription) unless the user opts in; naming it works", async () => {
+    // No API keys: selectable in the picker, but auto refuses rather than spend the subscription.
+    await expect(resolveModel("auto", { agenticOnly: true })).rejects.toThrow(/Claude subscription \(CLI\)/);
+    process.env.VIBERON_CLAUDE_CLI_AUTO = "1";
     expect(await resolveModel("auto", { agenticOnly: true })).toBe("claude-cli:opus");
+    delete process.env.VIBERON_CLAUDE_CLI_AUTO;
     const cli = (await availableModels()).filter((m) => m.spec.provider === "claude-cli");
     expect(cli.map((m) => [m.spec.id, m.available])).toEqual([
       ["claude-cli:opus", true],
