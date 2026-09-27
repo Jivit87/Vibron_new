@@ -32,13 +32,15 @@ import type { PlanStep, RunPlan, TodoItem } from "@/lib/agents/events";
 import { answerApproval, refreshWorkspace, runPlan } from "@/lib/client/agent-stream";
 import { diffLines, withContext } from "@/lib/client/line-diff";
 import { addStep, moveStep, removeStep, updateStep } from "@/lib/client/plan-edit";
-import { activeTodos, type FeedItem } from "@/lib/client/run-reducer";
+import { activeTodos, tailWindow, type FeedItem } from "@/lib/client/run-reducer";
 import {
   AttemptSeparator,
+  CriteriaBlock,
   EvidenceSummary,
   FixPhases,
   GateRow,
   LocalizationBlock,
+  PhaseTimingStrip,
   RecoveryRow,
   VerificationBlock,
   VerificationRow,
@@ -81,7 +83,11 @@ export function AgentRunView({ run }: { run: RunState }) {
 
       {fix && <FixPhases run={run} />}
 
+      {fix && <PhaseTimingStrip run={run} />}
+
       {fix && <LocalizationBlock run={run} />}
+
+      {fix && <CriteriaBlock run={run} />}
 
       {todos.length > 0 && <TodoList items={todos} />}
 
@@ -154,7 +160,8 @@ const STATUS_LABEL: Record<RunState["status"], string> = {
 };
 
 function RunHeader({ run }: { run: RunState }) {
-  const elapsed = (run.endedAt ?? Date.now()) - run.startedAt;
+  // The server's wall time wins once the run is over (a reattached task started before this view).
+  const elapsed = run.endedAt && run.wallMs ? run.wallMs : (run.endedAt ?? Date.now()) - run.startedAt;
   const label = run.planAwaitingApproval && run.status === "done" ? "Plan ready" : STATUS_LABEL[run.status];
   const rulesTitle = run.rules.map((r) => `${r.path} (${r.tokens} tok)`).join("\n");
   return (
@@ -211,7 +218,7 @@ function TodoList({ items }: { items: TodoItem[] }) {
           {done}/{items.length}
         </span>
       </div>
-      {items.map((item) => (
+      {items.slice(0, LIST_CAP).map((item) => (
         <div key={item.id} className="flex min-h-[22px] items-center gap-2 text-[12.5px]">
           {item.status === "completed" ? (
             <SquareCheck className="size-3.5 shrink-0" style={{ color: "var(--vb-text-dim)" }} />
@@ -541,19 +548,35 @@ function LaneSection({ lane, run }: { lane: AgentLane; run: RunState }) {
   );
 }
 
+const FEED_WINDOW = 250;
+const LIST_CAP = 300;
+
 /** One agent's work, in the order it happened. */
 function Feed({ lane, run }: { lane: AgentLane; run: RunState }) {
   const showThinking = useViberon((s) => s.settings.showThinking);
   const running = lane.status === "running";
+  const [expanded, setExpanded] = useState(false);
+  // Long runs produce thousands of rows; mount only the recent tail by default.
+  const { shown, hidden, offset } = tailWindow(lane.feed, FEED_WINDOW, expanded);
   return (
     <div className="flex flex-col gap-0.5 py-0.5">
-      {lane.feed.map((item, index) => (
+      {hidden > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="flex h-[22px] items-center self-start text-[11.5px] hover:text-[var(--vb-text)]"
+          style={{ color: "var(--vb-text-dim)" }}
+        >
+          Show {hidden} earlier row{hidden === 1 ? "" : "s"}
+        </button>
+      )}
+      {shown.map((item, i) => (
         <FeedRow
-          key={index}
+          key={offset + i}
           item={item}
           lane={lane}
           run={run}
-          last={index === lane.feed.length - 1}
+          last={offset + i === lane.feed.length - 1}
           live={running}
           showThinking={showThinking}
         />
@@ -933,6 +956,7 @@ function ChangeList({ run }: { run: RunState }) {
   const repoKey = useViberon((s) => s.repoKey);
   const decisions = useViberon((s) => s.reviewDecisions);
   const streaming = useViberon((s) => s.streaming);
+  const [showAll, setShowAll] = useState(false);
 
   const rows = useMemo(() => {
     const byPath = new Map<string, FileChangeRecord & { count: number }>();
@@ -999,7 +1023,7 @@ function ChangeList({ run }: { run: RunState }) {
           </button>
         )}
       </div>
-      {rows.map((row) => {
+      {(showAll ? rows : rows.slice(0, LIST_CAP)).map((row) => {
         const { name, dir } = splitPath(row.path);
         return (
           <button
@@ -1027,6 +1051,16 @@ function ChangeList({ run }: { run: RunState }) {
           </button>
         );
       })}
+      {rows.length > LIST_CAP && (
+        <button
+          type="button"
+          onClick={() => setShowAll((v) => !v)}
+          className="flex h-[22px] items-center self-start px-1 text-[11.5px] hover:text-[var(--vb-text)]"
+          style={{ color: "var(--vb-text-dim)" }}
+        >
+          {showAll ? `Show first ${LIST_CAP}` : `Show all ${rows.length} files`}
+        </button>
+      )}
     </div>
   );
 }

@@ -414,6 +414,8 @@ export interface ViberonState {
     interaction?: Interaction;
   }) => void;
   applyEvent: (event: OrchestrationEvent) => void;
+  /** Fold a frame's worth of events in one store write (one render). */
+  applyEvents: (events: readonly OrchestrationEvent[]) => void;
   endRun: (status: RunState["status"]) => void;
   markChangeReverted: (changeId: string) => void;
   dismissApproval: (approvalId: string) => void;
@@ -806,6 +808,23 @@ export const useViberon = create<ViberonState>((set) => ({
       // Mirror into any open tab so the editor shows the change live.
       const tabs = state.tabs.map((tab) =>
         tab.path === event.path ? { ...tab, source: event.after, dirty: false } : tab,
+      );
+      return { run, tabs };
+    }),
+
+  applyEvents: (events) =>
+    set((state) => {
+      if (!state.run || events.length === 0) return state;
+      const now = Date.now();
+      let run = state.run;
+      const written = new Map<string, string | null>();
+      for (const event of events) {
+        run = reduceRun(run, event, { now, nextId });
+        if (event.type === "file_change") written.set(event.path, event.after);
+      }
+      if (written.size === 0) return { run };
+      const tabs = state.tabs.map((tab) =>
+        written.has(tab.path) ? { ...tab, source: written.get(tab.path) ?? null, dirty: false } : tab,
       );
       return { run, tabs };
     }),

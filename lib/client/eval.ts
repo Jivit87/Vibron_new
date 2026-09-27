@@ -15,6 +15,8 @@ export interface EvalRow {
   gate: string;
   tokens: number;
   durationMs: number;
+  /** `SolveResult.metrics.phaseMs`, when the result carries it. */
+  phaseMs?: Record<string, number>;
 }
 
 export interface EvalTable {
@@ -56,7 +58,18 @@ export function normalizeEvalRow(raw: unknown): EvalRow | null {
     num(metrics.inputTokens) + num(metrics.outputTokens) ||
     num(r.inputTokens) + num(r.outputTokens);
   const durationMs = num(r.durationMs) || num(metrics.durationMs) || num(r.timeMs);
-  return { task, category: str(r.category), resolved, status, gate, tokens, durationMs };
+  const phaseMs = readPhaseMs(metrics.phaseMs ?? r.phaseMs);
+  return { task, category: str(r.category), resolved, status, gate, tokens, durationMs, ...(phaseMs ? { phaseMs } : {}) };
+}
+
+/** `metrics.phaseMs`: finite, non-negative numbers only; null when nothing usable. */
+export function readPhaseMs(raw: unknown): Record<string, number> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out: Record<string, number> = {};
+  for (const [name, ms] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof ms === "number" && Number.isFinite(ms) && ms >= 0) out[name] = Math.round(ms);
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 export function normalizeEval(body: unknown): EvalTable {

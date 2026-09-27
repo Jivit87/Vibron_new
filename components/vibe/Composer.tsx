@@ -9,14 +9,7 @@
  * travel as structured attachments rather than pasted text.
  */
 
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type FormEvent,
-  type KeyboardEvent,
-} from "react";
+import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowUp, CircleDot, FileText, Folder, Loader2, Square, X } from "lucide-react";
 import { toast } from "sonner";
@@ -43,16 +36,8 @@ import {
   type IssueRef,
 } from "@/store/viberon";
 import { cx, MenuItem, Popover, Segmented } from "@/components/vibe/primitives";
+import { ModelPicker, type ModelOption } from "@/components/vibe/ModelPicker";
 
-interface ModelOption {
-  id: string;
-  label: string;
-  blurb: string;
-  tier: string;
-  provider: string;
-  available: boolean;
-  agentic: boolean;
-}
 
 const INTERACTIONS: { value: Interaction; label: string; title: string }[] = [
   { value: "agent", label: "Agent", title: "Make changes to the workspace" },
@@ -142,20 +127,26 @@ export function Composer({
     });
   }
 
-  useEffect(() => {
-    let cancelled = false;
+  // Loaded on mount and again whenever the picker opens: keys get added,
+  // and the server marks models unavailable (retired, no quota) as it learns.
+  const loadModels = useCallback((isCancelled: () => boolean = () => false) => {
     void fetch("/api/models")
       .then((r) => (r.ok ? r.json() : null))
       .then((body: { models?: ModelOption[]; anyConfigured?: boolean } | null) => {
-        if (cancelled || !body) return;
+        if (isCancelled() || !body) return;
         setModels(body.models ?? []);
         useViberon.getState().setProvidersConfigured(body.anyConfigured !== false);
       })
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadModels(() => cancelled);
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadModels]);
 
   useEffect(() => {
     function focus() {
@@ -516,7 +507,12 @@ export function Composer({
         {settings.interaction !== "ask" && !fixMode && (
           <Segmented value={settings.agentMode} options={MODES} onChange={(agentMode) => setSettings({ agentMode })} />
         )}
-        <ModelPicker value={settings.model} models={models} onChange={(model) => setSettings({ model })} />
+        <ModelPicker
+          value={settings.model}
+          models={models}
+          onChange={(model) => setSettings({ model })}
+          onOpen={() => loadModels()}
+        />
         {rootPath && (settings.interaction === "agent" || fixMode) && (
           <PolicyPicker
             command={settings.commandPolicy}
@@ -556,67 +552,6 @@ function issueRefLabel(url: string): string {
 }
 
 /* ------------------------------ controls --------------------------------- */
-
-function ModelPicker({
-  value,
-  models,
-  onChange,
-}: {
-  value: string;
-  models: ModelOption[];
-  onChange: (model: string) => void;
-}) {
-  const current = models.find((m) => m.id === value);
-  const label = value === "auto" ? "Auto model" : (current?.label ?? value);
-
-  return (
-    <Popover label={label} title="Model" width={290}>
-      {(close) => (
-        <>
-          <MenuItem
-            active={value === "auto"}
-            onClick={() => {
-              onChange("auto");
-              close();
-            }}
-            title="Auto"
-            hint="Best available model for each role"
-          />
-          <div className="my-1 h-px" style={{ background: "var(--vb-line)" }} />
-          {models.length === 0 && (
-            <p className="px-2.5 py-1 text-[12px]" style={{ color: "var(--vb-text-dim)" }}>
-              No models loaded
-            </p>
-          )}
-          {models.map((model) => (
-            <MenuItem
-              key={model.id}
-              active={value === model.id}
-              disabled={!model.available}
-              onClick={() => {
-                onChange(model.id);
-                close();
-              }}
-              title={model.label}
-              hint={model.available ? model.blurb : `Needs a ${model.provider} key`}
-              trailing={
-                !model.agentic ? (
-                  <span
-                    className="text-[10.5px]"
-                    style={{ color: "var(--vb-text-faint)" }}
-                    title="Less reliable at long multi-step tool loops"
-                  >
-                    basic
-                  </span>
-                ) : undefined
-              }
-            />
-          ))}
-        </>
-      )}
-    </Popover>
-  );
-}
 
 function PolicyPicker({
   command,
