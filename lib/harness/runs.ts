@@ -91,6 +91,39 @@ export function getRun(runId: string): RunRecord | undefined {
   return registry.runs.get(runId);
 }
 
+/** One run as `listRuns` reports it: the fields a history row needs, nothing internal. */
+export interface RunListItem {
+  id: string;
+  runId: string;
+  repoKey: string;
+  /** Lifecycle: a run leaves the registry once it finishes, so only these two occur. */
+  status: "running" | "cancelling";
+  startedAt: number;
+  /** Always null: a finished run is removed from the registry (see `finishRun`). */
+  finishedAt: number | null;
+  controller: AbortController;
+}
+
+/**
+ * List live runs (optionally filtered to one repo), newest fields first for
+ * history rows: id, status, repoKey, startedAt and finishedAt where known.
+ * Runs that have finished are no longer in the registry, so `finishedAt` is
+ * always null here.
+ */
+export function listRuns(repoKey?: string): RunListItem[] {
+  const runs = [...registry.runs.values()];
+  const filtered = repoKey ? runs.filter((r) => r.repoKey === repoKey) : runs;
+  return filtered.map((r) => ({
+    id: r.runId,
+    runId: r.runId,
+    repoKey: r.repoKey,
+    status: r.signal.aborted ? "cancelling" : "running",
+    startedAt: r.startedAt,
+    finishedAt: null,
+    controller: r.controller,
+  }));
+}
+
 /** Point a run's events at a new sink (the stream opens after the run exists). */
 export function setRunSink(runId: string, emit: EventSink): void {
   const run = registry.runs.get(runId);
