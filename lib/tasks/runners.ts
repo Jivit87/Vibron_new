@@ -24,7 +24,19 @@ import { parsePrUrl } from "@/lib/github-api";
 import { recordFixNote, relevantLessons } from "@/lib/memory/graph";
 import { fetchIssueTask } from "@/lib/issues";
 import { registerLocalWorkspace } from "@/lib/local-disk-workspace";
-import { addUsage, usageFromResult, type Task, type TaskOutcome, type TaskRunner, type TaskUsage } from "@/lib/tasks";
+import {
+  addUsage,
+  usageFromResult,
+  type IssueProgress,
+  type IssueRunStatus,
+  type IssueTiming,
+  type IssueUsage,
+  type Task,
+  type TaskOutcome,
+  type TaskRunner,
+  type TaskUsage,
+} from "@/lib/tasks";
+import { RateLimiter } from "@/lib/tasks/ratelimit";
 import { diffForTarget, reviewDiff, reviewModel } from "@/lib/review";
 import { detectVerifyCommands, runVerification } from "@/lib/verify";
 import { openWorkspace } from "@/lib/workspace";
@@ -98,7 +110,7 @@ async function fixIn(
     emit: ctx.emit,
     signal: ctx.signal,
     runId: task.id,
-    budget: { maxTurns: 40 },
+    budget: { maxTurns: SINGLE_MAX_TURNS, maxTokens: TASK_TOKEN_BUDGET },
     verify: { enabled: true, commands, timeoutMs: 300_000, baseline: true },
     useRepoRules: true,
     onSolved: (solved) => {
@@ -157,6 +169,36 @@ interface BatchItem {
   /** The proven fix, committed on a detached HEAD (kept alive by a ref). */
   commit?: string;
   files?: string[];
+  phase?: string;
+  startedAt?: number;
+  finishedAt?: number;
+  timing: IssueTiming;
+  usage: IssueUsage;
+  /** Tokens this issue has spent (input + output + cache read), for the batch budget. */
+  spent: number;
+  /** Its token cap while it runs; unspent cap stays reserved for it. */
+  cap: number;
+  unproven?: boolean;
+  fastPath?: boolean;
+}
+
+/**
+ * Token ceiling for one task (a single fix, or a whole batch), counted like
+ * the solver's own budget: input + output + cache-read tokens. Small repos
+ * should be fixed well inside it; an issue that cannot be proven within its
+ * share stops instead of looping. `VIBERON_TASK_TOKEN_BUDGET` overrides it.
+ */
+export const TASK_TOKEN_BUDGET = Math.max(10_000, Number(process.env.VIBERON_TASK_TOKEN_BUDGET) || 100_000);
+/** Agent turns for one solve: the fast path needs 1–2, a real fix rarely more than a dozen. */
+const SINGLE_MAX_TURNS = 15;
+const BATCH_MAX_TURNS = 12;
+/** A batch issue is not started with less than this much budget left. */
+const MIN_ISSUE_BUDGET = 8_000;
+
+/** Tokens a `turn_usage` event spends against a budget (same count as the solver's). */
+function turnTokens(event: OrchestrationEvent): number {
+  if (event.type !== "turn_usage") return 0;
+  return event.inputTokens + event.outputTokens + event.cacheReadTokens;
 }
 
 /** Issues solved at once; each in its own worktree. */
@@ -185,7 +227,36 @@ async function fixIssueBatch(
     number: Number(/\/issues\/(\d+)/.exec(url)?.[1] ?? 0),
     title: task.issueTitles?.[index] ?? "Issue",
     state: "pending",
+    timing: { modelMs: 0, toolsMs: 0, proofMs: 0 },
+    usage: { input: 0, output: 0, cached: 0, calls: 0 },
+    spent: 0,
+    cap: 0,
   }));
+  const status = (i: BatchItem): IssueRunStatus =>
+    i.state === "resolved"
+      ? "verified"
+      : i.state === "running"
+        ? "running"
+        : i.state === "cancelled"
+          ? "cancelled"
+          : i.state === "failed"
+            ? i.unproven ? "unproven" : "failed"
+            : "queued";
+  const progressItems = (): IssueProgress[] =>
+    items.map((i) => ({
+      url: i.url,
+      number: i.number,
+      title: i.title,
+      status: status(i),
+      ...(i.phase ? { phase: i.phase } : {}),
+      ...(i.startedAt ? { startedAt: i.startedAt } : {}),
+      ...(i.finishedAt ? { finishedAt: i.finishedAt } : {}),
+      timing: { ...i.timing },
+      usage: { ...i.usage },
+      ...(i.fastPath !== undefined ? { fastPath: i.fastPath } : {}),
+      ...(i.detail ? { detail: i.detail } : {}),
+    }));
+  const progress = () => ctx.emit({ type: "issue_progress", items: progressItems() } as unknown as OrchestrationEvent);
   const issueSteps = items.map((item) => ({
     id: `issue-${item.number}`,
     title: `Fix #${item.number}: ${item.title}`,
@@ -210,7 +281,11 @@ async function fixIssueBatch(
     waves: [issueSteps.map((step) => step.id), ["deliver"]],
   };
   const mark = (i: BatchItem) => (i.state === "resolved" ? "✓" : i.state === "failed" ? "✗" : "");
-  const checklist = () =>
+  const checklist = () => {
+    progress();
+    emitTodos();
+  };
+  const emitTodos = () =>
     ctx.emit({
       type: "todos",
       agentId: "issues",
@@ -243,7 +318,9 @@ async function fixIssueBatch(
   ctx.emit({ type: "run_start", runId: task.id, mode: "single", model, at: startedAt });
   ctx.emit({ type: "plan", plan, awaitingApproval: false });
   checklist();
-  say(`Solving ${items.length} issues with ${model}, ${BATCH_CONCURRENCY} at a time.`);
+  say(`Solving ${items.length} issues with ${model}, ${BATCH_CONCURRENCY} at a time, within ${Math.round(TASK_TOKEN_BUDGET / 1000)}k tokens.`);
+  const limiter = new RateLimiter(BATCH_CONCURRENCY);
+  let batchSpent = 0;
 
   // A setup problem (no usable model, no credentials) fails every issue the
   // same way: stop at the first one instead of burning through the rest.
@@ -258,9 +335,28 @@ async function fixIssueBatch(
 
   async function solveOne(item: BatchItem): Promise<void> {
     if (fatal || ctx.signal.aborted) return;
+    // The batch shares one token budget: each issue gets an even share of
+    // what is left, and none starts once too little remains.
+    // Running issues keep what is left of their own caps reserved.
+    const reserved = items
+      .filter((i) => i.state === "running")
+      .reduce((sum, i) => sum + Math.max(0, i.cap - i.spent), 0);
+    const left = TASK_TOKEN_BUDGET - batchSpent - reserved;
+    const waiting = items.filter((i) => i.state === "pending").length || 1;
+    const share = Math.floor(left / waiting);
+    if (share < MIN_ISSUE_BUDGET) {
+      Object.assign(item, { state: "failed", unproven: true, detail: `skipped: token budget (${Math.round(TASK_TOKEN_BUDGET / 1000)}k) used up`, finishedAt: Date.now() });
+      checklist();
+      return;
+    }
     item.state = "running";
+    item.cap = share;
+    item.startedAt = Date.now();
+    item.phase = "reading issue";
     checklist();
     const began = Date.now();
+    const toolStarts = new Map<string, number>();
+    let lastProgress = 0;
     const stopped = () => {
       if (ctx.signal.aborted) throw new Error("cancelled");
     };
@@ -269,6 +365,7 @@ async function fixIssueBatch(
       stopped();
       item.title = issue.title;
       if (issue.state !== "open") throw new Error("issue is closed");
+      item.phase = "indexing";
       checklist();
       const tree = await issueTree();
       try {
@@ -276,6 +373,8 @@ async function fixIssueBatch(
         // The signal also stops the worktree's scan and index midway.
         const handle = await openWorkspace((await registerLocalWorkspace(tree.dir, {}, { signal: ctx.signal })).repoKey);
         stopped();
+        item.phase = "solving";
+        progress();
         const result = await solveTask({
           handle,
           task: withProjectLessons(home, task.instructions
@@ -286,21 +385,52 @@ async function fixIssueBatch(
           // one line per issue are the batch's view. Only token use goes
           // through, so the task shows what the whole batch costs.
           emit: (event) => {
-            if (event.type === "turn_usage") ctx.emit(event);
+            if (event.type === "turn_usage") {
+              const spent = turnTokens(event);
+              item.spent += spent;
+              batchSpent += spent;
+              item.usage.input += event.inputTokens;
+              item.usage.output += event.outputTokens;
+              item.usage.cached += event.cacheReadTokens;
+              item.usage.calls += 1;
+              ctx.emit(event);
+            } else if (event.type === "agent_tool") {
+              const key = event.callId ?? `${event.agentId}:${event.tool}`;
+              if (event.phase === "start") toolStarts.set(key, Date.now());
+              else {
+                const at = toolStarts.get(key);
+                if (at) item.timing.toolsMs += Date.now() - at;
+                toolStarts.delete(key);
+              }
+            } else if (event.type === "verification") {
+              item.timing.proofMs += event.durationMs;
+              item.phase = "verifying";
+            } else if (event.type === "agent_retry") {
+              limiter.reportRateLimited();
+            }
+            // Model time is what is left of the wall clock once tools and proof are counted.
+            item.timing.modelMs = Math.max(0, Date.now() - began - item.timing.toolsMs - item.timing.proofMs);
+            if (Date.now() - lastProgress > 1_000) {
+              lastProgress = Date.now();
+              progress();
+            }
           },
           signal: ctx.signal,
           runId: `${task.id}-${item.number}`,
-          budget: { maxTurns: 30, maxWallMs: 8 * 60_000 },
+          budget: { maxTurns: BATCH_MAX_TURNS, maxTokens: share, maxWallMs: 8 * 60_000 },
           verify: { enabled: true, commands: await detectVerifyCommands(tree.dir).catch(() => []), timeoutMs: 180_000, baseline: true },
           useRepoRules: true,
         });
         batchUsage = addUsage(batchUsage, usageFromResult(result));
+        const fp = (result.metrics as { fastPath?: { used?: boolean; accepted?: boolean } }).fastPath;
+        if (fp?.used) item.fastPath = Boolean(fp.accepted);
         stopped();
         if (result.status === "error" || (result.metrics.modelCalls === 0 && result.error)) {
           fatal = result.error ?? "the solver could not start";
           throw new Error(fatal);
         }
         if (result.status !== "resolved" || !result.filesChanged.length) {
+          item.unproven = true;
           throw new Error(`no proof (${result.status}${result.gate.reason ? `: ${result.gate.reason.slice(0, 80)}` : ""})`);
         }
         await runGit(tree.dir, ["add", "-A", "--", ...result.filesChanged]);
@@ -310,6 +440,7 @@ async function fixIssueBatch(
         await runGit(home, ["update-ref", `refs/viberon/batch/${task.id}/${item.number}`, item.commit]);
         item.files = result.filesChanged;
         item.state = "resolved";
+        limiter.reportSuccess();
         recordFixNote(home, { issue: `#${item.number} ${issue.title}`, files: result.filesChanged, rootCause: result.summary, verified: true });
         say(`✓ #${item.number} fixed in ${Math.round((Date.now() - began) / 1000)}s: ${result.filesChanged.join(", ")}`);
       } finally {
@@ -324,16 +455,15 @@ async function fixIssueBatch(
         say(`✗ #${item.number} not fixed: ${item.detail}`);
       }
     }
+    item.finishedAt = Date.now();
+    item.phase = undefined;
+    item.timing.modelMs = Math.max(0, item.finishedAt - began - item.timing.toolsMs - item.timing.proofMs);
     checklist();
   }
 
-  // A small worker pool over the issues, in order; Stop ends it between issues.
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.min(BATCH_CONCURRENCY, items.length) }, async () => {
-      while (next < items.length && !ctx.signal.aborted) await solveOne(items[next++]!);
-    }),
-  );
+  // Issues run in parallel under one shared limiter (slots + a backoff every
+  // start shares after a 429 burst); Stop rejects every queued start at once.
+  await Promise.all(items.map((item) => limiter.run(() => solveOne(item), ctx.signal).catch(() => undefined)));
   ctx.signal.removeEventListener("abort", cancelOpen);
   if (ctx.signal.aborted) {
     cancelOpen();
@@ -433,6 +563,7 @@ async function fixIssueBatch(
     fixed: i.state === "resolved" && Boolean(outcome.prUrl),
     ...(i.detail ? { detail: i.detail } : {}),
   }));
+  outcome.issueProgress = progressItems();
   if (batchUsage) outcome.usage = batchUsage;
   return outcome;
 }

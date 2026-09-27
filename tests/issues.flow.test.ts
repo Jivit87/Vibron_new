@@ -626,6 +626,52 @@ describe("Stop", () => {
   });
 });
 
+describe("batch token budget and per-issue progress", () => {
+  it("gives each issue a share of one 100k budget, stops starting issues once it is spent, and reports per-issue progress", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    let spentBig: () => void = () => undefined;
+    const bigSpent = new Promise<void>((resolve) => (spentBig = resolve));
+    hooks.beforeSolve = async (options) => {
+      const usage = (tokens: number) =>
+        options.emit({ type: "turn_usage", agentId: "solver", model: "m", inputTokens: tokens, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, contextTokens: tokens } as unknown as OrchestrationEvent);
+      if (options.runId.endsWith("-7")) {
+        usage(95_000);
+        spentBig();
+      } else {
+        // The others finish only after #7 has spent most of the budget.
+        await Promise.race([bigSpent, new Promise((r) => setTimeout(r, 2_000))]);
+        usage(1_000);
+      }
+    };
+    const { tasks } = await fixIssues({ repoKey, numbers: [7, 9, 10, 11], combined: true, deliver: false });
+    await getTaskQueue().idle();
+    const done = await getTaskQueue().get(tasks[0]!.id);
+    hooks.beforeSolve = null;
+
+    // Every started solve got a hard token cap (a share of what was left)
+    // and few turns; unspent caps of finished issues return to the pool.
+    for (const options of solved) {
+      expect(options.budget.maxTokens).toBeGreaterThan(0);
+      expect(options.budget.maxTokens).toBeLessThanOrEqual(100_000);
+      expect(options.budget.maxTurns).toBeLessThanOrEqual(12);
+    }
+    const progress = done?.issueProgress ?? [];
+    expect(progress.map((p) => p.number)).toEqual([7, 9, 10, 11]);
+    const byNumber = Object.fromEntries(progress.map((p) => [p.number, p]));
+    expect(byNumber[7]?.status).toBe("verified");
+    expect(byNumber[7]?.usage).toMatchObject({ input: 95_000, calls: 1 });
+    expect(byNumber[7]?.startedAt).toBeGreaterThan(0);
+    expect(byNumber[7]?.finishedAt).toBeGreaterThanOrEqual(byNumber[7]!.startedAt!);
+    expect(byNumber[7]?.timing).toBeDefined();
+    // The 4th issue would start with ~2k tokens left: skipped, never solved.
+    expect(byNumber[11]?.status).toBe("unproven");
+    expect(byNumber[11]?.detail).toMatch(/token budget/);
+    expect(solved.some((o) => o.runId.endsWith("-11"))).toBe(false);
+  });
+});
+
 describe("viberon issues --fix, Ctrl-C", () => {
   it("cancels queued and running fixes, removes their worktrees, and exits 130", async () => {
     const { main } = await import("@/cli/viberon");
