@@ -7,7 +7,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   cancelRun,
   createRun,
+  finishRun,
   getRun,
+  listRuns,
   requestApproval,
   resetRunsForTests,
   resolveApproval,
@@ -74,6 +76,37 @@ describe("run approvals", () => {
     // A different command still asks.
     void requestApproval(run.runId, "x", { ...ask, title: "rm -rf build" });
     expect(log.of("approval_request")).toHaveLength(2);
+  });
+});
+
+describe("listRuns", () => {
+  it("lists running runs with id, status, repoKey and startedAt, filtered by repo", async () => {
+    const a = createRun("repo-a", () => {});
+    const b = createRun("repo-b", () => {});
+
+    const all = listRuns();
+    expect(all.map((r) => r.id).sort()).toEqual([a.runId, b.runId].sort());
+    const itemA = all.find((r) => r.id === a.runId)!;
+    expect(itemA).toMatchObject({
+      id: a.runId,
+      runId: a.runId,
+      repoKey: "repo-a",
+      status: "running",
+      startedAt: a.startedAt,
+      finishedAt: null,
+    });
+
+    expect(listRuns("repo-a")).toEqual([itemA]);
+    expect(listRuns("no-such-repo")).toEqual([]);
+  });
+
+  it("reports a cancelled run as cancelling until it is finished, then drops it", async () => {
+    const run = createRun("repo", () => {});
+    cancelRun(run.runId);
+    expect(listRuns().find((r) => r.id === run.runId)).toMatchObject({ status: "cancelling" });
+
+    finishRun(run.runId);
+    expect(listRuns().find((r) => r.id === run.runId)).toBeUndefined();
   });
 });
 
