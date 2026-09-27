@@ -7,6 +7,7 @@ dist/
 .viberon-dev-store.json.bak*
 .viberon-store/
 .env*
+!.env.example
 .DS_Store
 .playwright-mcp/
 .claude/worktrees/
