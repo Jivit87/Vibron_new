@@ -220,6 +220,9 @@ export async function fullReindex(
  * Refresh derived memory without a full graph re-parse. Cheap enough to run
  * at the end of every agent turn.
  */
+/** What `deriveMemory` last saw per workspace: skip the (≈180 ms) re-derive when nothing changed. */
+const derivedFrom = new Map<string, string>();
+
 export async function refreshMemory(
   handle: WorkspaceHandle,
 ): Promise<ProjectMemory> {
@@ -228,8 +231,14 @@ export async function refreshMemory(
     getGraph(handle.repoKey),
     loadMemory(handle.repoKey),
   ]);
+  // Inputs: the file set (paths + sizes), the graph version and the memory's own last write.
+  let size = 0;
+  for (const f of files) size += f.source.length + f.path.length;
+  const key = `${files.length}:${size}:${graph?.meta.parsedAt ?? 0}:${memory.updatedAt}`;
+  if (derivedFrom.get(handle.repoKey) === key) return memory;
   deriveMemory(memory, files, graph);
   await saveMemory(memory);
+  derivedFrom.set(handle.repoKey, `${files.length}:${size}:${graph?.meta.parsedAt ?? 0}:${memory.updatedAt}`);
   return memory;
 }
 
