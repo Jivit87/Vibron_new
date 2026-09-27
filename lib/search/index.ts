@@ -117,7 +117,10 @@ function buildMatcher(options: SearchOptions): RegExp {
     return new RegExp(source, options.caseSensitive ? "g" : "gi");
   } catch (error) {
     throw new SearchInputError(
-      `Invalid regular expression: ${error instanceof Error ? error.message : String(error)}`,
+      // V8 already says "Invalid regular expression: /…/: reason".
+      error instanceof Error && error.message.startsWith("Invalid regular expression")
+        ? error.message
+        : `Invalid regular expression: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }

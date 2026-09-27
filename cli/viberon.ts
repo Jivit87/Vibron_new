@@ -49,6 +49,7 @@ export const USAGE = `Usage:
       --gold applies the official patch instead of running the agent (validates the environment)
   viberon arena report <results.jsonl> [--json]
       compares harnesses on tasks completed by every harness; ranks by fixes, tokens, then time
+  viberon --version
 
 Exit codes (run): 0 resolved/unverified, 1 failed/incomplete, 2 error (delivery never changes them).
 Exit codes (review): 0 reviewed, 2 error.
@@ -133,7 +134,16 @@ export interface SweArgs {
   gold: boolean;
 }
 
-export type CliArgs = RunArgs | ReviewArgs | IssuesArgs | CloneArgs | EvalArgs | SweArgs | ArenaArgs | { command: "help" };
+export type CliArgs =
+  | RunArgs
+  | ReviewArgs
+  | IssuesArgs
+  | CloneArgs
+  | EvalArgs
+  | SweArgs
+  | ArenaArgs
+  | { command: "help" }
+  | { command: "version" };
 
 export class CliError extends Error {}
 
@@ -196,6 +206,7 @@ const KNOWN: Record<string, Set<string>> = {
 export function parseCliArgs(argv: string[]): CliArgs {
   const [command, ...rest] = argv;
   if (!command || command === "help" || command === "--help" || command === "-h") return { command: "help" };
+  if (command === "version" || command === "--version" || command === "-v") return { command: "version" };
   if (!(command in KNOWN)) throw new CliError(`Unknown command: ${command}`);
   const { flags, positionals } = splitFlags(rest);
   if (flags.has("help")) return { command: "help" };
@@ -333,6 +344,11 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
+  if (args.command === "version") {
+    process.stdout.write(`viberon ${await cliVersion()}\n`);
+    return 0;
+  }
+
   if (args.command === "arena") {
     try {
       const [{ readFile }, { parseArenaJsonl, summarizeArena, renderArenaMarkdown }] = await Promise.all([
@@ -349,8 +365,17 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (args.command === "run") {
+    // With --out the run writes an error result.json itself; without it the
+    // bundle would go inside the missing repo, so explain instead of crashing.
+    const repoProblem = args.out ? null : await checkRepoDir(args.repo);
+    if (repoProblem) {
+      log(`run: ${repoProblem}`);
+      return 2;
+    }
     const { runHeadless } = await import("@/lib/headless/run");
-    const outcome = await runHeadless({
+    let outcome: Awaited<ReturnType<typeof runHeadless>>;
+    try {
+      outcome = await runHeadless({
       repo: args.repo,
       task: args.task,
       taskFile: args.taskFile,
@@ -370,7 +395,11 @@ export async function main(argv: string[]): Promise<number> {
       thorough: args.thorough,
       reviewModel: args.reviewModel,
       independentTest: args.independentTest,
-    });
+      });
+    } catch (error) {
+      log(`run failed: ${error instanceof Error ? error.message : String(error)}`);
+      return 2;
+    }
     if (args.json) process.stdout.write(`${JSON.stringify(outcome.result, null, 2)}\n`);
     else {
       const r = outcome.result;
@@ -483,7 +512,7 @@ export async function main(argv: string[]): Promise<number> {
         depth: args.depth,
         setup: args.setup,
         allowLocal: true,
-        onProgress: log,
+        onProgress: throttledProgress(log),
       });
       if (args.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       else {
@@ -518,15 +547,69 @@ export async function main(argv: string[]): Promise<number> {
     }
   }
 
-  const { runEval } = await import("@/eval/run");
-  const summary = await runEval({
-    only: args.only,
-    model: args.model,
-    maxTurns: args.maxTurns,
-    timeoutMs: args.timeoutSec ? args.timeoutSec * 1000 : undefined,
-    log,
-  });
-  return summary.resolved === summary.total ? 0 : 1;
+  try {
+    const { listTasks, runEval } = await import("@/eval/run");
+    if (args.only?.length) {
+      const known = (await listTasks()).map((t) => t.name);
+      const unknown = args.only.filter((name) => !known.includes(name));
+      if (unknown.length) {
+        log(`eval: unknown task${unknown.length === 1 ? "" : "s"} ${unknown.join(", ")}. Available: ${known.join(", ") || "(none)"}`);
+        return 2;
+      }
+    }
+    const summary = await runEval({
+      only: args.only,
+      model: args.model,
+      maxTurns: args.maxTurns,
+      timeoutMs: args.timeoutSec ? args.timeoutSec * 1000 : undefined,
+      log,
+    });
+    return summary.resolved === summary.total ? 0 : 1;
+  } catch (error) {
+    log(`eval failed: ${error instanceof Error ? error.message : String(error)}`);
+    return 2;
+  }
+}
+
+/** Why `repo` cannot be run against, or null when it is an existing directory. */
+export async function checkRepoDir(repo: string): Promise<string | null> {
+  const [{ stat }, path] = await Promise.all([import("node:fs/promises"), import("node:path")]);
+  const resolved = path.resolve(repo);
+  try {
+    const info = await stat(resolved);
+    return info.isDirectory() ? null : `${resolved} is not a directory`;
+  } catch {
+    return `repository not found: ${resolved}`;
+  }
+}
+
+async function cliVersion(): Promise<string> {
+  const [{ readFile }, path] = await Promise.all([import("node:fs/promises"), import("node:path")]);
+  try {
+    const pkg = JSON.parse(await readFile(path.resolve(__dirname, "..", "package.json"), "utf8")) as { version?: string };
+    return pkg.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * Clone progress arrives as one line per percent. Keep the first line of
+ * each phase and its final ("done") line; drop the redraws in between.
+ */
+export function throttledProgress(log: (line: string) => void): (line: string) => void {
+  let phase = "";
+  return (line: string) => {
+    const progress = /^([A-Za-z][\w ]*?):\s+\d+% \(\d+\/\d+\)/.exec(line);
+    if (!progress) {
+      phase = "";
+      log(line);
+      return;
+    }
+    const done = /\bdone\.?\s*$/.test(line);
+    if (done || progress[1] !== phase) log(line);
+    phase = done ? "" : progress[1]!;
+  };
 }
 
 /**

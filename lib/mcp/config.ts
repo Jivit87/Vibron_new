@@ -285,6 +285,22 @@ export function redactRecord(record: Record<string, string>): Record<string, str
   );
 }
 
+/**
+ * An edited config comes back from the browser with the redacted values it
+ * was shown. Keep the stored secret for every value still in redacted form.
+ */
+export function keepRedactedSecrets(
+  next: Record<string, string> | undefined,
+  previous: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!next) return next;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(next)) {
+    out[key] = value.includes("••••") && previous?.[key] !== undefined ? previous[key]! : value;
+  }
+  return out;
+}
+
 /* --------------------------------- disk ----------------------------------- */
 
 export interface WorkspaceConfigRead {

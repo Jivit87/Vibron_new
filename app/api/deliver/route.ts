@@ -1,7 +1,8 @@
 /**
  * POST /api/deliver
- *   { repoKey, title, body?, draft? = true, baseBranch?, branch?, expectedFiles?: string[], allowWorkflowChanges? }
+ *   { repoKey, title, body?, draft? = true, baseBranch?, branch?, expectedFiles?: string[], allowWorkflowChanges?, pushOnly? }
  *   → 200 { branch, commit, prUrl, prNumber, created }
+ *   → 200 { branch, commit, prUrl: "", prNumber: 0, pushedOnly: true }   (pushOnly, remote not on GitHub)
  *   → 4xx/5xx { error, code?, branch?, commit? }   (a failed push keeps its local branch + commit)
  *
  * Branch → commit → push → open/update a draft PR. Refuses changes outside
@@ -38,6 +39,7 @@ export async function POST(request: Request) {
         branch: str(body.branch) || undefined,
         expectedFiles: body.expectedFiles as string[] | undefined,
         allowWorkflowChanges: body.allowWorkflowChanges === true,
+        pushOnly: body.pushOnly === true,
       }),
     );
   } catch (error) {

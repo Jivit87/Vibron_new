@@ -243,12 +243,25 @@ export function deriveMemory(
       // Malformed package.json — leave stack detection to file extensions.
     }
   }
-  if (byPath.has("requirements.txt") || byPath.has("pyproject.toml")) {
+  if (
+    byPath.has("requirements.txt") ||
+    byPath.has("pyproject.toml") ||
+    byPath.has("setup.py") ||
+    byPath.has("setup.cfg")
+  ) {
     stack.add("Python");
   }
   if (byPath.has("Cargo.toml")) stack.add("Rust");
   if (byPath.has("go.mod")) stack.add("Go");
-  if (files.some((f) => f.path.endsWith(".tsx"))) stack.add("TypeScript");
+  if (byPath.has("pom.xml") || byPath.has("build.gradle") || byPath.has("build.gradle.kts")) {
+    stack.add("Java");
+  }
+  if (
+    byPath.has("tsconfig.json") ||
+    files.some((f) => /\.(tsx|[cm]?ts)$/.test(f.path) && !f.path.endsWith(".d.ts"))
+  ) {
+    stack.add("TypeScript");
+  }
   if (
     files.some((f) => f.path.endsWith(".html")) &&
     !stack.has("Next.js") &&
@@ -256,6 +269,8 @@ export function deriveMemory(
   ) {
     stack.add("Static HTML/CSS/JS");
   }
+  // A package.json with no recognised framework is still a Node.js project.
+  if (pkgFile && stack.size === 0) stack.add("Node.js");
   memory.stack = [...stack].sort();
 
   // --- entry points ------------------------------------------------------
@@ -311,8 +326,8 @@ function synthesizeOverview(memory: ProjectMemory, fileCount: number): string {
   if (fileCount === 0) {
     return "Empty workspace. No files yet — this is a blank slate ready for a new project.";
   }
-  const stack = memory.stack.length ? memory.stack.join(", ") : "unknown stack";
-  return `A ${stack} project with ${fileCount} tracked files. Entry points: ${
+  const subject = memory.stack.length ? `A ${memory.stack.join(", ")} project` : "A project";
+  return `${subject} with ${fileCount} tracked file${fileCount === 1 ? "" : "s"}. Entry points: ${
     memory.entryPoints.join(", ") || "not yet identified"
   }.`;
 }

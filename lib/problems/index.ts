@@ -1,6 +1,7 @@
 /**
- * Run the workspace's own checkers — `tsc --noEmit` and ESLint — and parse
- * their output into Problems.
+ * Run the workspace's own checkers — `tsc --noEmit` and ESLint, plus the
+ * repo's detected test command on request — and parse their output into
+ * Problems.
  *
  * Only the workspace's locally installed binaries are used (no global
  * installs, no `npx` downloads), and they run via `execFile(node, [script])`
@@ -15,10 +16,12 @@ import path from "node:path";
 import {
   parseEslintJson,
   parseTscOutput,
+  testFailureProblems,
   type CheckerRun,
   type Problem,
 } from "@/lib/problems/parse";
 import { scrubEnv } from "@/lib/terminal/safety";
+import { detectVerifyCommands, runVerification } from "@/lib/verify";
 
 export type { CheckerRun };
 
@@ -203,6 +206,48 @@ export interface RunChecksOptions {
   files?: string[];
   /** Per-checker timeout. Default 180s. */
   timeoutMs?: number;
+  /**
+   * Also run the repo's detected test command (the one the Fix gate uses)
+   * and list failing tests. Ignored for focused (`files`) runs. Without it,
+   * the last test results stay in the cache.
+   */
+  tests?: boolean;
+}
+
+/** Run the detected test command and turn failing tests into Problems. */
+export async function runTests(
+  root: string,
+  timeoutMs: number,
+): Promise<{ run: CheckerRun; problems: Problem[] }> {
+  const started = Date.now();
+  const commands = await detectVerifyCommands(root).catch(() => []);
+  const cmd = commands.find((c) => c.kind === "test");
+  if (!cmd) {
+    return {
+      run: { checker: "tests", ran: false, note: "No test command detected", durationMs: 0, count: 0 },
+      problems: [],
+    };
+  }
+  const report = await runVerification(root, cmd, { timeoutMs });
+  const failed = report.timedOut || (report.exitCode ?? 1) !== 0;
+  const problems = testFailureProblems({
+    command: report.command,
+    tests: report.tests,
+    failed,
+    timedOut: report.timedOut,
+    excerpt: report.failureExcerpt,
+  });
+  const { passed, failed: failedCount, errors } = report.counts;
+  return {
+    run: {
+      checker: "tests",
+      ran: true,
+      note: `${report.command}: ${passed} passed, ${failedCount + errors} failed${report.timedOut ? " (timed out)" : ""}`,
+      durationMs: Date.now() - started,
+      count: problems.length,
+    },
+    problems,
+  };
 }
 
 const LINTABLE = /\.(m|c)?(j|t)sx?$/i;
@@ -264,7 +309,8 @@ export function runChecks(
   const root = path.resolve(rootPath);
   const files = options.files ? sanitizeFiles(root, options.files) : null;
   const timeoutMs = Math.max(1000, options.timeoutMs ?? 180_000);
-  const key = `${root}\0${files ? files.join("\0") : "*"}`;
+  const withTests = options.tests === true && !files;
+  const key = `${root}\0${files ? files.join("\0") : "*"}${withTests ? "\0+tests" : ""}`;
   const pending = state.inflight.get(key);
   if (pending) return pending;
 
@@ -272,7 +318,7 @@ export function runChecks(
   entry.running++;
   const promise = (async (): Promise<ProblemsResult> => {
     const lintFiles = files ? files.filter((f) => LINTABLE.test(f)) : null;
-    const [tsc, eslint] = await Promise.all([
+    const [tsc, eslint, tests] = await Promise.all([
       runTsc(root, timeoutMs),
       lintFiles && lintFiles.length === 0
         ? Promise.resolve({
@@ -280,11 +326,12 @@ export function runChecks(
             problems: [] as Problem[],
           })
         : runEslint(root, timeoutMs, lintFiles),
+      withTests ? runTests(root, Math.max(timeoutMs, 300_000)) : Promise.resolve(null),
     ]);
     // Checkers report real paths; the root may be reached through a symlink
     // (e.g. macOS /var → /private/var), so strip either prefix.
     const real = await realpath(root).catch(() => root);
-    let problems = [...tsc.problems, ...eslint.problems].map((p) =>
+    let problems = [...tsc.problems, ...eslint.problems, ...(tests?.problems ?? [])].map((p) =>
       real !== root && p.file.startsWith(`${real}/`)
         ? { ...p, file: p.file.slice(real.length + 1) }
         : p,
@@ -293,20 +340,29 @@ export function runChecks(
       const wanted = new Set(files);
       problems = problems.filter((p) => p.file === "" || wanted.has(p.file));
     }
+    // A run without tests keeps the last test results.
+    const previous = entry.result;
+    const previousTests = previous?.checkers.find((c) => c.checker === "tests");
+    if (!tests && previousTests && !files) {
+      problems = [...problems, ...previous!.problems.filter((p) => p.source === "tests")];
+    }
     const result: ProblemsResult = {
       problems,
-      checkers: [tsc.run, eslint.run],
+      checkers: [tsc.run, eslint.run, ...(tests ? [tests.run] : previousTests && !files ? [previousTests] : [])],
       finishedAt: Date.now(),
     };
 
     // Merge a focused run into the cache instead of replacing it.
-    const previous = entry.result;
     if (files && previous) {
       const touched = new Set(files);
       entry.result = {
         ...result,
+        // Tests were not rerun: keep their last results.
+        checkers: previousTests ? [...result.checkers, previousTests] : result.checkers,
         problems: [
-          ...previous.problems.filter((p) => p.file !== "" && !touched.has(p.file)),
+          ...previous.problems.filter(
+            (p) => p.source === "tests" || (p.file !== "" && !touched.has(p.file)),
+          ),
           ...problems,
         ],
       };

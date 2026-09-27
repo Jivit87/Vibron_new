@@ -5,7 +5,9 @@
  *   GET  /api/mcp?repoKey=…&logs=<name>      → captured stderr + lifecycle log
  *   POST /api/mcp { action, repoKey, name, … }
  *
- * Actions: add, remove, enable, disable, trust, untrust, restart, test.
+ * Actions: add, update, remove, enable, disable, trust, untrust, restart, test.
+ * `update` replaces a server's config ({ name, config }); env/header values
+ * sent back still redacted keep their stored secret.
  *
  * Secrets in `env` / `headers` are redacted before anything is returned —
  * the same rule as provider keys: the browser only sees fingerprints.
@@ -14,6 +16,7 @@
 import { qualifiedToolName } from "@/lib/mcp/bridge";
 import {
   configFingerprint,
+  keepRedactedSecrets,
   parseServerEntry,
   redactRecord,
   type McpServerConfig,
@@ -148,6 +151,10 @@ export async function POST(request: Request) {
     const where = body.scope === "workspace" ? "workspace" : "global";
     if (where === "workspace") {
       if (!rootPath) return bad("This workspace has no folder on disk; add the server to user settings instead.");
+      const existing = (await resolveServers(scope, rootPath)).servers.find(
+        (s) => s.name === name && s.source === "viberon",
+      );
+      if (existing) return bad(`A server named "${name}" already exists in .viberon/mcp.json.`);
       await setWorkspaceEntry(rootPath, name, raw);
       // The user added it themselves, so it does not need the
       // project-file opt-in.
@@ -165,6 +172,32 @@ export async function POST(request: Request) {
   if (!config) return bad(`Unknown server "${name}"`, 404);
 
   switch (action) {
+    case "update": {
+      if (config.source !== "global" && config.source !== "viberon") {
+        return bad(`"${name}" is defined in ${SOURCE_LABEL[config.source]}; edit it in that file.`);
+      }
+      if (!body.config || typeof body.config !== "object") return bad("config is required");
+      const incoming = body.config as RawServerEntry;
+      const raw: RawServerEntry = {
+        ...incoming,
+        env: keepRedactedSecrets(incoming.env, config.raw.env),
+        headers: keepRedactedSecrets(incoming.headers, config.raw.headers),
+      };
+      if (!raw.env) delete raw.env;
+      if (!raw.headers) delete raw.headers;
+      const parsed = parseServerEntry(name, raw, config.source);
+      if (typeof parsed === "string") return bad(parsed);
+      if (config.source === "global") {
+        // Keep the switches the settings UI owns.
+        await setGlobalEntry(name, { ...raw, disabled: config.raw.disabled, trusted: config.raw.trusted });
+      } else if (rootPath) {
+        await setWorkspaceEntry(rootPath, name, raw);
+        // An edit the user made is as good as the opt-in they gave before.
+        await setOverride(scope, name, { enabled: config.enabled, fingerprint: configFingerprint(parsed) });
+      }
+      await disconnectServer(scope, name, true);
+      return Response.json({ ok: true });
+    }
     case "remove": {
       if (config.source === "global") {
         await setGlobalEntry(name, null);

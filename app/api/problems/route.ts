@@ -2,7 +2,8 @@
  * Problems API.
  *
  *   GET  /api/problems?repoKey=…          → last cached result (no run)
- *   POST /api/problems { repoKey, files? } → run tsc + ESLint (single-flight)
+ *   POST /api/problems { repoKey, files?, tests? } → run tsc + ESLint (single-flight);
+ *        `tests: true` also runs the repo's detected test command (whole-repo runs only)
  *
  * Both answer `{ virtual, problems, checkers, finishedAt, running }`.
  * Virtual (no folder on disk) workspaces answer `virtual: true` so the panel
@@ -34,7 +35,7 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
-  let body: { repoKey?: unknown; files?: unknown };
+  let body: { repoKey?: unknown; files?: unknown; tests?: unknown };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -53,7 +54,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = await runChecks(root, { files });
+    const result = await runChecks(root, { files, tests: body.tests === true });
     // A focused run is merged into the cache; answer with the whole list so
     // the panel can replace its state wholesale.
     const cached = cachedProblems(root);

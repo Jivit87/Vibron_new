@@ -24,6 +24,8 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import path from "node:path";
 
 import { LineTracker, OutputBuffer, detectLocalUrl } from "./output";
 import { classifyCommand, scrubEnv } from "./safety";
@@ -477,6 +479,36 @@ export function subscribe(
 }
 
 /** Drop finished sessions older than an hour so the map cannot grow forever. */
+/** Forget a finished session (the terminal tab's close button). Running sessions stay. */
+export function removeSession(id: string): boolean {
+  const session = sessions.get(id);
+  if (!session || session.status === "running") return false;
+  return sessions.delete(id);
+}
+
+/**
+ * Where a user command runs: the workspace root, or a directory inside it
+ * given relative to the root. Returns an error string for anything that
+ * escapes the root or is not a directory.
+ */
+export function resolveSessionCwd(rootPath: string, cwd: unknown): { cwd: string } | { error: string } {
+  const root = path.resolve(rootPath);
+  if (cwd === undefined || cwd === null || cwd === "" || cwd === ".") return { cwd: root };
+  if (typeof cwd !== "string" || cwd.includes("\0") || path.isAbsolute(cwd)) {
+    return { error: "cwd must be a path relative to the workspace root" };
+  }
+  const resolved = path.resolve(root, cwd);
+  if (resolved !== root && !resolved.startsWith(`${root}${path.sep}`)) {
+    return { error: "cwd escapes the workspace" };
+  }
+  try {
+    if (!statSync(resolved).isDirectory()) return { error: `cwd is not a directory: ${cwd}` };
+  } catch {
+    return { error: `cwd does not exist: ${cwd}` };
+  }
+  return { cwd: resolved };
+}
+
 export function pruneSessions(): void {
   const cutoff = Date.now() - 60 * 60 * 1000;
   for (const [id, session] of sessions) {

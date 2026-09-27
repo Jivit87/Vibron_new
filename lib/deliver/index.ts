@@ -237,6 +237,12 @@ export interface DeliverOptions {
   fork?: "auto" | "never";
   token?: string | null;
   fetchImpl?: typeof fetch;
+  /**
+   * When the remote is not on GitHub (GitLab, a local bare repo, …): still
+   * branch, commit and push, and return without a pull request instead of
+   * refusing with `not_github`.
+   */
+  pushOnly?: boolean;
 }
 
 export interface DeliverResult {
@@ -248,6 +254,8 @@ export interface DeliverResult {
   created: boolean;
   /** `owner/name` of the fork the branch was pushed to, when not the repo itself. */
   fork?: string;
+  /** `pushOnly` to a non-GitHub remote: the branch was pushed, no PR exists (`prUrl` is ""). */
+  pushedOnly?: boolean;
 }
 
 export interface DeliveryTarget {
@@ -324,7 +332,14 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   const upstreamUrl = options.remote || options.repo ? null : await configuredRemoteUrl(root, "upstream");
   const upstream = upstreamUrl ? parseRemote(upstreamUrl) : null;
   const target = deliveryTarget(pushRepo, upstream, options.repo);
-  if (!target) throw new DeliverError(`The remote "${remote}" is not a GitHub repository.`, "not_github", 400);
+  if (!target) {
+    if (options.pushOnly) return pushBranchOnly(options, { title, remote, current, onDeliveryBranch, changed });
+    throw new DeliverError(
+      `The remote "${remote}" is not a GitHub repository, so no pull request can be opened. Deliver with pushOnly to push the branch without one.`,
+      "not_github",
+      400,
+    );
+  }
   const { repo, originIsFork } = target;
   const token = options.token === undefined ? await resolveGithubToken() : options.token;
   if (!token) {
@@ -435,6 +450,50 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
     created,
     ...(fork ? { fork: `${fork.owner}/${fork.repo}` } : {}),
   };
+}
+
+/**
+ * Branch → commit → push to a remote that is not on GitHub. No token, no
+ * API: the credentials are whatever git already uses for that remote.
+ */
+async function pushBranchOnly(
+  options: DeliverOptions,
+  state: { title: string; remote: string; current: string; onDeliveryBranch: boolean; changed: string[] },
+): Promise<DeliverResult> {
+  const { root } = options;
+  const { title, remote, current, onDeliveryBranch, changed } = state;
+  let branch: string;
+  if (options.branch) {
+    branch = options.branch.trim();
+    const valid = await runGit(root, ["check-ref-format", "--branch", branch], { allowFailure: true });
+    if (branch.startsWith("-") || valid.code !== 0) throw new DeliverError(`Invalid branch name: ${branch}`, "invalid_input", 400);
+    if (
+      branch !== current &&
+      (await runGit(root, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFailure: true })).code === 0
+    ) {
+      throw new DeliverError(`Branch ${branch} already exists; pick another name.`, "branch_exists", 409);
+    }
+  } else {
+    branch = onDeliveryBranch ? current : branchName(title, await existingBranches(root, remote, {}));
+  }
+  if (branch !== current) await runGit(root, ["switch", "-c", branch]);
+  if (changed.length) {
+    await runGit(root, ["add", "-A", "--", ...changed]);
+    const message = `${title}\n\nFiles changed:\n${changed.map((p) => `- ${p}`).join("\n")}\n\nDelivered by Viberon.`;
+    await runGit(root, ["commit", "-q", "-m", message]);
+  }
+  const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+  const push = await gitWithAuth(root, ["push", remote, `HEAD:refs/heads/${branch}`], {});
+  if (push.code !== 0) {
+    const reason = explainPushFailure(push.output).message;
+    throw new DeliverError(
+      `Push to ${remote} failed: ${reason || `exit ${push.code}`}. Commit ${commit.slice(0, 12)} is on local branch ${branch}; fix the cause and deliver again.`,
+      "push_failed",
+      502,
+      { branch, commit },
+    );
+  }
+  return { branch, commit, prUrl: "", prNumber: 0, created: false, pushedOnly: true };
 }
 
 /* --------------------------- isolated issue work --------------------------- */

@@ -23,7 +23,7 @@ export interface Problem {
 }
 
 export interface CheckerRun {
-  checker: "tsc" | "eslint";
+  checker: "tsc" | "eslint" | "tests";
   ran: boolean;
   /** Why it did not run, or what went wrong. */
   note?: string;
@@ -215,4 +215,67 @@ export function groupProblems(problems: Problem[]): ProblemGroup[] {
     (a, b) =>
       Number(b.errors > 0) - Number(a.errors > 0) || a.file.localeCompare(b.file),
   );
+}
+
+/* --------------------------------- tests ---------------------------------- */
+
+/** The file part of a test id: `a/test_x.py::t`, `tests/a.test.ts > s > t`. */
+export function testIdFile(id: string): string {
+  const pytest = /^([^\s:]+\.py)::/.exec(id);
+  if (pytest) return normalizePath(pytest[1]);
+  const js = /^(\S+\.[cm]?[jt]sx?) > /.exec(id);
+  if (js) return normalizePath(js[1]);
+  return "";
+}
+
+/**
+ * Failing tests from a verification run as Problems. The line is taken
+ * from a `file:line` mention in the failure excerpt when there is one.
+ * A failed run with no attributable test becomes one project-wide entry.
+ */
+export function testFailureProblems(input: {
+  command: string;
+  tests: Record<string, "pass" | "fail" | "error" | "skip">;
+  failed: boolean;
+  timedOut?: boolean;
+  excerpt: string;
+}): Problem[] {
+  const problems: Problem[] = [];
+  const excerptLine = (file: string): number => {
+    if (!file) return 1;
+    const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = new RegExp(`${escaped}:(\\d+)`).exec(input.excerpt);
+    return match ? Number(match[1]) : 1;
+  };
+  for (const [id, outcome] of Object.entries(input.tests)) {
+    if (outcome !== "fail" && outcome !== "error") continue;
+    const file = testIdFile(id);
+    problems.push({
+      file,
+      line: excerptLine(file),
+      col: 1,
+      severity: "error",
+      message: `${outcome === "error" ? "Test error" : "Test failed"}: ${id}`,
+      source: "tests",
+    });
+  }
+  if (input.failed && problems.length === 0) {
+    // Skip npm's "> pkg@1.0.0 test" banner lines; prefer the line that says what broke.
+    const lines = input.excerpt
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith(">"));
+    const first = lines.find((l) => /error|fail|not found|cannot|exception|panic/i.test(l)) ?? lines[0];
+    problems.push({
+      file: "",
+      line: 1,
+      col: 1,
+      severity: "error",
+      message: input.timedOut
+        ? `\`${input.command}\` timed out`
+        : `\`${input.command}\` failed${first ? `: ${first.slice(0, 300)}` : ""}`,
+      source: "tests",
+    });
+  }
+  return problems;
 }

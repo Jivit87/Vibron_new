@@ -5,7 +5,9 @@
  *          entries are the graph-anchored notes ({id, kind, text, anchors, stale});
  *          reading imports any edits made in the Obsidian vault.
  *   PATCH  /api/memory            → user edits (overview, entries, tasks)
- *   DELETE /api/memory?repoKey=…&entryId=… → forget one entry
+ *          `note: {text, kind?, anchors?}` records a graph-anchored note
+ *          (kind defaults to "note"; anchors are paths or node ids)
+ *   DELETE /api/memory?repoKey=…&entryId=… → forget one entry (legacy or anchored)
  *
  * Memory is the project's durable brain, so it is directly inspectable and
  * editable by the user — an agent that learned something wrong should be
@@ -22,7 +24,11 @@ import {
   upsertTask,
   type MemoryEntryKind,
 } from "@/lib/memory";
+import { addEntry, removeEntry, type AnchoredKind } from "@/lib/memory/graph";
 import { openWorkspace, refreshMemory, writeMemoryMirror } from "@/lib/workspace";
+
+const ENTRY_KINDS: MemoryEntryKind[] = ["decision", "fact", "convention", "suggestion"];
+const NOTE_KINDS: AnchoredKind[] = [...ENTRY_KINDS, "note"];
 
 export const runtime = "nodejs";
 
@@ -66,6 +72,7 @@ export async function PATCH(request: Request) {
     overview?: unknown;
     entry?: unknown;
     task?: unknown;
+    note?: unknown;
     resolveEntryId?: unknown;
   };
   try {
@@ -77,6 +84,43 @@ export async function PATCH(request: Request) {
   const repoKey = typeof body.repoKey === "string" ? body.repoKey : "";
   if (!repoKey) {
     return Response.json({ error: "repoKey is required" }, { status: 400 });
+  }
+
+  // Reject what would otherwise be dropped silently.
+  if (body.entry !== undefined) {
+    const entry = (body.entry ?? {}) as { kind?: unknown; text?: unknown };
+    if (!ENTRY_KINDS.includes(entry.kind as MemoryEntryKind)) {
+      return Response.json({ error: `entry.kind must be one of ${ENTRY_KINDS.join(", ")}` }, { status: 400 });
+    }
+    if (typeof entry.text !== "string" || !entry.text.trim()) {
+      return Response.json({ error: "entry.text is required" }, { status: 400 });
+    }
+  }
+
+  if (body.note !== undefined) {
+    const note = (body.note ?? {}) as { kind?: unknown; text?: unknown; anchors?: unknown };
+    const kind = (note.kind ?? "note") as AnchoredKind;
+    if (!NOTE_KINDS.includes(kind)) {
+      return Response.json({ error: `note.kind must be one of ${NOTE_KINDS.join(", ")}` }, { status: 400 });
+    }
+    if (typeof note.text !== "string" || !note.text.trim()) {
+      return Response.json({ error: "note.text is required" }, { status: 400 });
+    }
+    if (note.anchors !== undefined && (!Array.isArray(note.anchors) || note.anchors.some((a) => typeof a !== "string"))) {
+      return Response.json({ error: "note.anchors must be an array of paths or node ids" }, { status: 400 });
+    }
+    const handle = await openWorkspace(repoKey);
+    if (!handle.rootPath) {
+      return Response.json({ error: "Anchored notes need a workspace on disk." }, { status: 400 });
+    }
+    const entry = addEntry(handle.rootPath, {
+      kind,
+      text: note.text.slice(0, 4000),
+      anchors: ((note.anchors as string[] | undefined) ?? []).slice(0, 20),
+    });
+    return Response.json({
+      entry: { id: entry.id, kind: entry.kind, text: entry.text, anchors: entry.anchors.map((a) => a.ref), stale: entry.stale },
+    });
   }
 
   const memory = await mutateMemory(repoKey, (draft) => {
@@ -91,15 +135,9 @@ export async function PATCH(request: Request) {
         why?: string;
         files?: string[];
       };
-      const kinds: MemoryEntryKind[] = [
-        "decision",
-        "fact",
-        "convention",
-        "suggestion",
-      ];
       if (
         entry.text?.trim() &&
-        kinds.includes(entry.kind as MemoryEntryKind)
+        ENTRY_KINDS.includes(entry.kind as MemoryEntryKind)
       ) {
         recordEntry(draft, entry.kind as MemoryEntryKind, {
           text: entry.text,
@@ -144,6 +182,12 @@ export async function DELETE(request: Request) {
     return Response.json({ error: "repoKey is required" }, { status: 400 });
   }
 
+  let removedAnchored = false;
+  if (entryId) {
+    const handle = await openWorkspace(repoKey);
+    if (handle.rootPath) removedAnchored = removeEntry(handle.rootPath, entryId);
+  }
+
   const memory = await mutateMemory(repoKey, (draft) => {
     if (entryId) {
       draft.decisions = draft.decisions.filter((e) => e.id !== entryId);
@@ -156,5 +200,5 @@ export async function DELETE(request: Request) {
     }
   });
 
-  return Response.json({ memory });
+  return Response.json({ memory, removedAnchored });
 }

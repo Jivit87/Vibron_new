@@ -4,7 +4,9 @@
  *   GET  /api/terminal?repoKey=…            → list sessions
  *   GET  /api/terminal?sessionId=…&stream=1 → SSE-stream one session's output
  *   POST /api/terminal                      → start a command
- *   DELETE /api/terminal?sessionId=…        → kill a running session
+ *        { repoKey, command, cwd? }           cwd: relative to the workspace root
+ *   DELETE /api/terminal?sessionId=…        → kill a running session; a finished
+ *                                             one is removed from the list
  *   POST /api/terminal/input                → write to a session's stdin
  */
 
@@ -15,6 +17,8 @@ import {
   killSession,
   listSessions,
   pruneSessions,
+  removeSession,
+  resolveSessionCwd,
   serializeSession,
   startCommand,
   subscribe,
@@ -157,10 +161,15 @@ export async function POST(request: Request) {
     );
   }
 
+  const where = resolveSessionCwd(handle.rootPath, body.cwd);
+  if ("error" in where) {
+    return Response.json({ error: where.error }, { status: 400 });
+  }
+
   const session = startCommand({
     repoKey,
     command,
-    cwd: handle.rootPath,
+    cwd: where.cwd,
     origin: "user",
   });
 
@@ -173,6 +182,12 @@ export async function DELETE(request: Request) {
   if (!sessionId) {
     return Response.json({ error: "sessionId is required" }, { status: 400 });
   }
-  const killed = killSession(sessionId);
-  return Response.json({ ok: killed });
+  const session = getSession(sessionId);
+  if (!session) {
+    return Response.json({ ok: false, error: "Session not found" }, { status: 404 });
+  }
+  if (session.status === "running") {
+    return Response.json({ ok: killSession(sessionId), removed: false });
+  }
+  return Response.json({ ok: removeSession(sessionId), removed: true });
 }
