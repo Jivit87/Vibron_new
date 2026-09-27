@@ -62,11 +62,26 @@ export async function setWatch(
   return next;
 }
 
-/** One poll of one repo. Exported for tests and for "check now". */
-export async function checkRepo(repoKey: string, now = Date.now()): Promise<WatchConfig> {
+const IN_FLIGHT = ((globalThis as { __viberonWatchPolls?: Map<string, Promise<WatchConfig>> }).__viberonWatchPolls ??= new Map());
+
+/**
+ * One poll of one repo. Exported for tests and for "check now". A poll that
+ * starts while another for the same repo is running joins it instead of
+ * racing it (both would read the same handled list and queue the same issues).
+ */
+export function checkRepo(repoKey: string, now = Date.now()): Promise<WatchConfig> {
+  const running = IN_FLIGHT.get(repoKey);
+  if (running) return running;
+  const poll = pollRepo(repoKey, now).finally(() => IN_FLIGHT.delete(repoKey));
+  IN_FLIGHT.set(repoKey, poll);
+  return poll;
+}
+
+async function pollRepo(repoKey: string, now: number): Promise<WatchConfig> {
   const { setValueRaw } = await store();
   const config = await getWatch(repoKey);
   const next: WatchConfig = { ...config, lastCheckedAt: now };
+  delete next.lastError;
   try {
     const { repo } = await workspaceRepo(repoKey);
     const issues = await listIssues(repo, { labels: [config.label], limit: 30 });
@@ -74,10 +89,15 @@ export async function checkRepo(repoKey: string, now = Date.now()): Promise<Watc
     if (fresh.length) {
       const { tasks, skipped } = await fixIssues({ repoKey, numbers: fresh, deliver: true, source: "issue" });
       const queued = tasks.map((t) => Number(t.issueUrl?.split("/").pop()));
-      // Skipped ones are handled too: already in flight, already fixed, or closed.
-      next.handledIssues = [...config.handledIssues, ...queued, ...skipped.map((s) => s.number)].slice(-500);
+      // Skipped ones are handled too (already in flight, already fixed, or
+      // closed), except those GitHub could not answer for: retried next poll.
+      const settled = skipped.filter((s) => !s.transient).map((s) => s.number);
+      const retry = skipped.filter((s) => s.transient);
+      next.handledIssues = [...config.handledIssues, ...queued, ...settled].slice(-500);
+      if (retry.length) {
+        next.lastError = `Will retry ${retry.map((s) => `#${s.number}`).join(", ")}: ${retry[0]!.reason}`.slice(0, 300);
+      }
     }
-    delete next.lastError;
   } catch (error) {
     next.lastError = (error instanceof Error ? error.message : String(error)).slice(0, 300);
   }
@@ -85,7 +105,20 @@ export async function checkRepo(repoKey: string, now = Date.now()): Promise<Watc
   return next;
 }
 
+let ticking = false;
+
 async function tick(): Promise<void> {
+  // A slow poll (big repo, slow GitHub) must not stack up behind the timer.
+  if (ticking) return;
+  ticking = true;
+  try {
+    await tickOnce();
+  } finally {
+    ticking = false;
+  }
+}
+
+async function tickOnce(): Promise<void> {
   const { getValueRaw } = await store();
   for (const repoKey of (await getValueRaw<string[]>(INDEX_KEY)) ?? []) {
     const config = await getWatch(repoKey);

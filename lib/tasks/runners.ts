@@ -11,6 +11,8 @@ import { runGit } from "@/lib/git";
 import {
   branchName,
   createIssueWorktree,
+  existingIssueBranch,
+  issueBranchName,
   deliver,
   evidenceFromResult,
   removeIssueWorktree,
@@ -47,11 +49,14 @@ export const runFixTask: TaskRunner = async (task, { emit, signal }) => {
   const tree = await createIssueWorktree(home);
   try {
     const meta = await registerLocalWorkspace(tree.dir);
+    // One branch (and PR) per issue: a rerun replaces it rather than opening another.
+    const branch = (await existingIssueBranch(home, issue.number)) ?? issueBranchName(issue.number, issue.title);
     return await fixIn({ ...task, repoKey: meta.repoKey }, tree.dir, home, text, {
       emit,
       signal,
       title: `Fix #${issue.number}: ${issue.title}`,
       baseBranch: tree.base,
+      branch,
     });
   } finally {
     await removeIssueWorktree(home, tree.dir);
@@ -64,7 +69,7 @@ async function fixIn(
   root: string,
   memoryRoot: string,
   text: string,
-  ctx: { emit: (event: OrchestrationEvent) => void; signal: AbortSignal; title?: string; baseBranch?: string },
+  ctx: { emit: (event: OrchestrationEvent) => void; signal: AbortSignal; title?: string; baseBranch?: string; branch?: string },
 ): Promise<TaskOutcome> {
   const handle = await openWorkspace(task.repoKey);
   const { solveTask } = await import("@/lib/harness/solve");
@@ -110,6 +115,7 @@ async function fixIn(
       body: renderPrBody({ summary: result.summary, evidence, issueUrl: task.issueUrl }),
       expectedFiles: result.filesChanged,
       ...(ctx.baseBranch ? { baseBranch: ctx.baseBranch } : {}),
+      ...(ctx.branch ? { branch: ctx.branch, replaceBranch: true } : {}),
     });
     outcome.prUrl = pr.prUrl;
   } catch (error) {

@@ -37,7 +37,7 @@ vi.mock("@/lib/harness/solve", () => ({
         metrics: { modelCalls: 2 } as SolveResult["metrics"],
       };
     }
-    writeFileSync(path.join(options.handle.rootPath!, "calc.py"), "def add(a, b):\n    return a + b\n");
+    writeFileSync(path.join(options.handle.rootPath!, "calc.py"), `def add(a, b):\n    return a + b\n# attempt ${solved.length}\n`);
     return {
       status: "resolved",
       summary: "add() subtracted; it now adds.",
@@ -63,6 +63,10 @@ vi.mock("@/lib/harness/solve", () => ({
 let repo: TmpRepo;
 let bare: string;
 const posted: { method: string; url: string; body: unknown }[] = [];
+/** Open PRs by head branch; the fake remembers what it opened. */
+const openPrs = new Map<string, { number: number; html_url: string }>();
+/** Knobs for failure scenarios. */
+const gh = { issueStatus: 200, createConflict: false };
 
 function fakeGithub(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const url = String(input);
@@ -78,6 +82,7 @@ function fakeGithub(input: string | URL | Request, init?: RequestInit): Promise<
     ]);
   }
   if (url.endsWith("/repos/o/r/issues/7")) {
+    if (gh.issueStatus !== 200) return json({ message: "Server Error" }, gh.issueStatus);
     return json({
       number: 7,
       title: "add() subtracts",
@@ -100,9 +105,22 @@ function fakeGithub(input: string | URL | Request, init?: RequestInit): Promise<
       ? json([])
       : json({ number: n, title: `issue ${n}`, body: "b", html_url: `https://github.com/o/r/issues/${n}`, state: "open", labels: [], user: null, comments: 0, created_at: "", updated_at: "" });
   }
-  if (url.includes("/pulls?state=open")) return json([]);
+  if (url.includes("/pulls?state=open")) {
+    const head = decodeURIComponent(/head=([^&]+)/.exec(url)?.[1] ?? "").split(":")[1] ?? "";
+    const pr = openPrs.get(head);
+    return json(pr ? [pr] : []);
+  }
   if (url.endsWith("/repos/o/r/pulls") && method === "POST") {
+    if (openPrs.has(body.head) || gh.createConflict) {
+      gh.createConflict = false;
+      openPrs.set(body.head, { number: 12, html_url: "https://github.com/o/r/pull/12" });
+      return json({ message: "Validation Failed", errors: [{ message: `A pull request already exists for o:${body.head}.` }] }, 422);
+    }
+    openPrs.set(body.head, { number: 12, html_url: "https://github.com/o/r/pull/12" });
     return json({ number: 12, title: body.title, body: body.body, html_url: "https://github.com/o/r/pull/12", state: "open", head: { ref: body.head, sha: "x" }, base: { ref: "main" } }, 201);
+  }
+  if (url.endsWith("/repos/o/r/pulls/12") && method === "PATCH") {
+    return json({ number: 12, html_url: "https://github.com/o/r/pull/12", state: "open", head: { ref: "", sha: "x" }, base: { ref: "main" } });
   }
   if (url.endsWith("/issues/7/comments") && method === "POST") return json({ html_url: "https://github.com/o/r/issues/7#c1", id: 1 }, 201);
   return json({ message: `unexpected ${method} ${url}` }, 404);
@@ -113,6 +131,8 @@ beforeEach(() => {
   solved.length = 0;
   hooks.beforeSolve = null;
   posted.length = 0;
+  openPrs.clear();
+  Object.assign(gh, { issueStatus: 200, createConflict: false });
   process.env.GITHUB_TOKEN = "ghp_test";
   // Model resolution needs a configured provider; the stubbed solver never calls it.
   vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
@@ -206,7 +226,111 @@ describe("issue → fix → pull request", () => {
   });
 });
 
+describe("rerunning the same issue", () => {
+  const issueTask = (repoKey: string, id: string): Task => ({
+    id,
+    kind: "fix",
+    repoKey,
+    task: "#7 add() subtracts",
+    source: "issue",
+    state: "running",
+    createdAt: Date.now(),
+    issueUrl: "https://github.com/o/r/issues/7",
+    deliver: true,
+    model: "claude-opus-5",
+  });
+
+  it("reuses viberon/issue-<N>-<slug>, force-pushes with a lease, and updates the open PR", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { runFixTask } = await import("@/lib/tasks/runners");
+    const run = (id: string) => runFixTask(issueTask(repoKey, id), { emit: () => undefined, signal: new AbortController().signal });
+
+    const first = await run("r1");
+    expect(first.error).toBeUndefined();
+    const branch = "viberon/issue-7-add-subtracts";
+    const firstHead = execFileSync("git", ["--git-dir", bare, "rev-parse", branch], { encoding: "utf8" }).trim();
+
+    const second = await run("r2");
+    expect(second.error).toBeUndefined();
+    expect(second.prUrl).toBe("https://github.com/o/r/pull/12");
+    const secondHead = execFileSync("git", ["--git-dir", bare, "rev-parse", branch], { encoding: "utf8" }).trim();
+    // The rerun's commit replaced the first (not stacked on it): both start from main.
+    expect(secondHead).not.toBe(firstHead);
+    expect(execFileSync("git", ["--git-dir", bare, "rev-parse", `${branch}~1`], { encoding: "utf8" }).trim()).toBe(
+      execFileSync("git", ["--git-dir", bare, "rev-parse", "main"], { encoding: "utf8" }).trim(),
+    );
+    expect(posted.filter((p) => p.method === "POST" && p.url.endsWith("/pulls"))).toHaveLength(1);
+    expect(posted.filter((p) => p.method === "PATCH" && p.url.endsWith("/pulls/12"))).toHaveLength(1);
+    expect(execFileSync("git", ["--git-dir", bare, "for-each-ref", "--format=%(refname)", "refs/heads/viberon"], { encoding: "utf8" }).trim()).toBe(
+      `refs/heads/${branch}`,
+    );
+  });
+
+  it("a 422 'already exists' on create looks the PR up and updates it", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { runFixTask } = await import("@/lib/tasks/runners");
+    gh.createConflict = true;
+    const outcome = await runFixTask(issueTask(repoKey, "r3"), { emit: () => undefined, signal: new AbortController().signal });
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.prUrl).toBe("https://github.com/o/r/pull/12");
+    expect(posted.filter((p) => p.method === "PATCH" && p.url.endsWith("/pulls/12"))).toHaveLength(1);
+  });
+});
+
+describe("duplicate queueing", () => {
+  it("a double click (or UI + watcher at once) queues an issue once", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const [a, b, c] = await Promise.all([
+      fixIssues({ repoKey, numbers: [7], deliver: false, source: "ui" }),
+      fixIssues({ repoKey, numbers: [7], deliver: false, source: "ui" }),
+      fixIssues({ repoKey, numbers: [7], deliver: true, source: "issue" }),
+    ]);
+    expect(a.tasks.length + b.tasks.length + c.tasks.length).toBe(1);
+    expect([...a.skipped, ...b.skipped, ...c.skipped].map((s) => s.reason)).toEqual([
+      expect.stringMatching(/^already (queued|running)$/),
+      expect.stringMatching(/^already (queued|running)$/),
+    ]);
+    const tasks = await getTaskQueue().list(repoKey);
+    expect(tasks.filter((t) => t.issueUrl?.endsWith("/issues/7"))).toHaveLength(1);
+    await getTaskQueue().idle();
+  });
+});
+
 describe("auto-fix watcher", () => {
+  it("does not mark an issue handled when GitHub failed transiently, and retries it next poll", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { checkRepo, setWatch } = await import("@/lib/issues/watch");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    await setWatch(repoKey, { enabled: false, label: "viberon", intervalMinutes: 5 });
+    gh.issueStatus = 502;
+    const { fixIssues } = await import("@/lib/issues");
+    const direct = await fixIssues({ repoKey, numbers: [7], deliver: false, source: "issue" });
+    expect(direct.skipped).toEqual([expect.objectContaining({ number: 7, transient: true })]);
+
+    const failed = await checkRepo(repoKey);
+    expect(failed.handledIssues).toEqual([]);
+    expect(failed.lastError).toMatch(/Will retry #7/);
+
+    gh.issueStatus = 200;
+    const ok = await checkRepo(repoKey);
+    expect(ok.handledIssues).toEqual([7]);
+    expect(ok.lastError).toBeUndefined();
+    await getTaskQueue().idle();
+  });
+
+  it("overlapping polls of one repo join instead of racing", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { checkRepo, setWatch } = await import("@/lib/issues/watch");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    await setWatch(repoKey, { enabled: false, label: "viberon", intervalMinutes: 5 });
+    const [a, b] = await Promise.all([checkRepo(repoKey), checkRepo(repoKey)]);
+    expect(a).toBe(b);
+    expect(vi.mocked(fetch).mock.calls.filter((c) => String(c[0]).includes("/issues?"))).toHaveLength(1);
+    await getTaskQueue().idle();
+  });
+
   it("queues labeled issues once, never pull requests, and never twice", async () => {
     const { repoKey } = await registerLocalWorkspace(repo.root);
     const { checkRepo, setWatch } = await import("@/lib/issues/watch");
