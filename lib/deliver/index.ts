@@ -28,7 +28,9 @@ import {
   ensureFork,
   findOpenPullRequest,
   getDefaultBranch,
+  GitHubApiError,
   parseRemote,
+  redactSecret,
   updatePullRequest,
   type ApiOptions,
   type RepoId,
@@ -63,6 +65,42 @@ export function branchName(title: string, existing: Iterable<string> = []): stri
   }
 }
 
+/**
+ * `viberon/issue-<N>-<slug>`: the one branch an issue's fixes live on, so a
+ * rerun of the same issue replaces its branch and updates its PR instead of
+ * opening a second one. At most 48 chars.
+ */
+export function issueBranchName(number: number, title: string): string {
+  const prefix = `${BRANCH_PREFIX}issue-${number}-`;
+  const slug =
+    title
+      .toLowerCase()
+      .normalize("NFKD")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, Math.max(1, MAX_BRANCH_LENGTH - prefix.length))
+      .replace(/-+$/, "") || "fix";
+  return `${prefix}${slug}`;
+}
+
+/**
+ * The branch an earlier run used for issue `number` (local, or known from a
+ * remote), so a retitled issue keeps its branch and PR. Null when none.
+ */
+export async function existingIssueBranch(root: string, number: number): Promise<string | null> {
+  const prefix = `${BRANCH_PREFIX}issue-${number}-`;
+  const refs = await runGit(
+    root,
+    ["for-each-ref", "--sort=-committerdate", "--format=%(refname)", `refs/heads/${prefix}*`, `refs/remotes/*/${prefix}*`],
+    { allowFailure: true },
+  );
+  for (const ref of refs.stdout.split("\n")) {
+    const at = ref.indexOf(prefix);
+    if (at >= 0) return ref.slice(at).trim();
+  }
+  return null;
+}
+
 /** Paths git reports as changed (staged, unstaged or untracked); both sides of a rename. */
 export async function changedPaths(root: string): Promise<string[]> {
   const { stdout } = await runGit(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
@@ -81,8 +119,33 @@ function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
-function redact(text: string, token: string | null): string {
-  return token ? text.split(token).join("***") : text;
+const redact = redactSecret;
+
+/**
+ * A failed push's git output in plain language: why it failed and what to
+ * do, for the cases people hit (the remote moved, the token was refused, the
+ * branch is protected); otherwise git's own last lines.
+ */
+export function explainPushFailure(output: string): { reason: "non_fast_forward" | "auth" | "protected" | "other"; message: string } {
+  if (/protected branch|GH006|push declined due to repository rule|GH013/i.test(output)) {
+    return {
+      reason: "protected",
+      message: "the branch is protected on GitHub and does not accept direct pushes; deliver to a new branch and open a pull request instead",
+    };
+  }
+  if (/non-fast-forward|\(fetch first\)|Updates were rejected because the (?:remote contains|tip of)/i.test(output)) {
+    return {
+      reason: "non_fast_forward",
+      message: "the remote branch has new commits that are not in your local branch; pull or rebase onto it, then deliver again",
+    };
+  }
+  if (/Authentication failed|could not read Username|Invalid username or password|Permission to \S+ denied|returned error: 40[13]|Write access to repository not granted|terminal prompts disabled/i.test(output)) {
+    return {
+      reason: "auth",
+      message: "GitHub rejected the token (it may be expired, revoked, or lack write access to this repository); reconnect GitHub in Settings → Integrations",
+    };
+  }
+  return { reason: "other", message: output.split("\n").slice(-4).join(" ").slice(0, 500) };
 }
 
 /** git with the token in env config only; the rest of the environment is scrubbed. */
@@ -156,6 +219,13 @@ export interface DeliverOptions {
   allowWorkflowChanges?: boolean;
   /** Branch to use (validated); default: the current `viberon/*` branch, else `branchName(title)`. */
   branch?: string;
+  /**
+   * `branch` is Viberon's own (an issue's stable branch): an existing local
+   * copy is reset to the new commit and the push replaces the remote branch
+   * with `--force-with-lease`, so a rerun updates the same PR. The lease
+   * refuses the push if someone else pushed to the branch meanwhile.
+   */
+  replaceBranch?: boolean;
   /** Remote name or URL to push to. Default "origin". */
   remote?: string;
   /** The GitHub repo for the PR; default: parsed from the remote URL. */
@@ -276,7 +346,11 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
     branch = options.branch.trim();
     const valid = await runGit(root, ["check-ref-format", "--branch", branch], { allowFailure: true });
     if (branch.startsWith("-") || valid.code !== 0) throw new DeliverError(`Invalid branch name: ${branch}`, "invalid_input", 400);
-    if (branch !== current && (await runGit(root, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFailure: true })).code === 0) {
+    if (
+      !options.replaceBranch &&
+      branch !== current &&
+      (await runGit(root, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFailure: true })).code === 0
+    ) {
       throw new DeliverError(`Branch ${branch} already exists; pick another name.`, "branch_exists", 409);
     }
   } else {
@@ -285,7 +359,7 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   const base = options.baseBranch?.trim() || (await getDefaultBranch(repo, api));
 
   // 3. Branch and commit locally.
-  if (branch !== current) await runGit(root, ["switch", "-c", branch]);
+  if (branch !== current) await runGit(root, ["switch", options.replaceBranch ? "-C" : "-c", branch]);
   if (changed.length) {
     await runGit(root, ["add", "-A", "--", ...changed]);
     const message = `${title}\n\nFiles changed:\n${changed.map((p) => `- ${p}`).join("\n")}\n\nDelivered by Viberon.`;
@@ -294,9 +368,25 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
 
   // 4. Push; on failure the local branch and commit stay.
-  const push = await gitWithAuth(root, ["push", pushRemote, `HEAD:refs/heads/${branch}`], auth);
+  const refspec = `HEAD:refs/heads/${branch}`;
+  let push = await gitWithAuth(root, options.replaceBranch ? ["push", "--force-with-lease", pushRemote, refspec] : ["push", pushRemote, refspec], auth);
+  if (
+    push.code !== 0 &&
+    options.replaceBranch &&
+    /stale info/i.test(push.output) &&
+    (!/^[\w.-]+$/.test(pushRemote) ||
+      (await runGit(root, ["rev-parse", "--verify", "-q", `refs/remotes/${pushRemote}/${branch}`], { allowFailure: true })).code !== 0)
+  ) {
+    // No remote-tracking ref to lease against (e.g. pushing to a fork URL),
+    // so git assumed the branch was new: lease against its current remote
+    // head instead. With a tracking ref, "stale info" means someone else
+    // pushed to the branch, and the refusal stands.
+    const remoteHead = await gitWithAuth(root, ["ls-remote", pushRemote, `refs/heads/${branch}`], auth);
+    const sha = remoteHead.code === 0 ? /^([0-9a-f]{40,64})\s/m.exec(remoteHead.output)?.[1] : undefined;
+    if (sha) push = await gitWithAuth(root, ["push", `--force-with-lease=refs/heads/${branch}:${sha}`, pushRemote, refspec], auth);
+  }
   if (push.code !== 0) {
-    const reason = redact(push.output, token).split("\n").slice(-4).join(" ").slice(0, 500);
+    const reason = explainPushFailure(redact(push.output, token)).message;
     throw new DeliverError(
       `Push to ${fork ? `${fork.owner}/${fork.repo}` : remote} failed: ${reason || `exit ${push.code}`}. Commit ${commit.slice(0, 12)} is on local branch ${branch}; fix the cause and deliver again.`,
       "push_failed",
@@ -307,10 +397,15 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
 
   // 5. Open or update the PR.
   const headOwner = fork?.owner ?? repo.owner;
+  const update = (number: number) => updatePullRequest({ ...repo, number }, { title, body: options.body }, api);
   const existing = await findOpenPullRequest(repo, branch, api, headOwner);
-  const pr = existing
-    ? await updatePullRequest({ ...repo, number: existing.number }, { title, body: options.body }, api)
-    : await createPullRequest(
+  let created = false;
+  let pr;
+  if (existing) {
+    pr = await update(existing.number);
+  } else {
+    try {
+      pr = await createPullRequest(
         repo,
         {
           title,
@@ -322,12 +417,22 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
         },
         api,
       );
+      created = true;
+    } catch (error) {
+      // 422 "A pull request already exists" (opened meanwhile, or not yet
+      // visible to the lookup): update that PR instead of failing.
+      if (!(error instanceof GitHubApiError && error.status === 422)) throw error;
+      const raced = await findOpenPullRequest(repo, branch, api, headOwner);
+      if (!raced) throw error;
+      pr = await update(raced.number);
+    }
+  }
   return {
     branch,
     commit,
     prUrl: pr.html_url,
     prNumber: pr.number,
-    created: !existing,
+    created,
     ...(fork ? { fork: `${fork.owner}/${fork.repo}` } : {}),
   };
 }

@@ -119,4 +119,19 @@ describe("rerunFlaky", () => {
     );
     expect(codes).toEqual(["not_failed", "not_actions", "not_found"]);
   });
+
+  it(`never exceeds ${MAX_RERUNS_PER_HEAD} re-runs when requests race on one head sha`, async () => {
+    const gh = fakeGitHub({ sha: "race", checks: [check(2, "test", "completed", "failure")] });
+    const outcomes = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        rerunFlaky({ prUrl: PR, checkName: "test", evidence }, gh.opts).then(
+          (r) => r.attempt,
+          (e: unknown) => (e as DeliverError).code,
+        ),
+      ),
+    );
+    expect(outcomes.filter((o) => typeof o === "number").sort()).toEqual([1, 2, 3]);
+    expect(outcomes.filter((o) => o === "rerun_limit")).toHaveLength(5);
+    expect(gh.calls.filter((c) => c.url.endsWith("/actions/jobs/2/rerun"))).toHaveLength(MAX_RERUNS_PER_HEAD);
+  });
 });

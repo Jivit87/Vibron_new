@@ -50,6 +50,152 @@ export interface ApiOptions {
   signal?: AbortSignal;
 }
 
+/* ------------------------- secrets, limits, caching ------------------------ */
+
+/**
+ * `text` with `token` removed in every form it can take in git or HTTP
+ * output: raw, URL-encoded, base64 of `x-access-token:<token>` (what
+ * `gitAuthEnv` sends) and of `<token>` alone, and any credentials embedded in
+ * a URL (`https://user:secret@host`).
+ */
+export function redactSecret(text: string, token: string | null | undefined): string {
+  let out = text
+    .replace(/(\b[a-z][\w+.-]*:\/\/)([^\s/@:]*):[^\s/@]+@/gi, "$1$2:***@")
+    // Anything shaped like a GitHub token, whoever's it is.
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})\b/g, "***");
+  if (!token) return out;
+  const forms = new Set<string>();
+  for (const form of [
+    token,
+    encodeURIComponent(token),
+    Buffer.from(`x-access-token:${token}`).toString("base64"),
+    Buffer.from(token).toString("base64"),
+  ]) {
+    forms.add(form);
+    // base64 without its padding, as some tools print it.
+    if (/=+$/.test(form)) forms.add(form.replace(/=+$/, ""));
+  }
+  for (const form of [...forms].sort((a, b) => b.length - a.length)) {
+    if (form.length >= 4) out = out.split(form).join("***");
+  }
+  return out;
+}
+
+/** GitHub's limit on a PR body or comment, in UTF-16 code units. */
+export const GITHUB_BODY_LIMIT = 65_536;
+
+/**
+ * `text` cut to at most `max` UTF-16 units: the head and tail are kept with a
+ * "…truncated N chars…" note between them, never splitting a surrogate pair.
+ */
+export function truncateBody(text: string, max = GITHUB_BODY_LIMIT): string {
+  if (text.length <= max) return text;
+  const noteFor = (n: number) => `\n\n…truncated ${n} chars…\n\n`;
+  // The note's own length depends on N; size it for the largest possible N.
+  const room = Math.max(0, max - noteFor(text.length).length);
+  let headEnd = Math.ceil(room * 0.7);
+  let tailStart = text.length - (room - headEnd);
+  const isHigh = (c: number) => c >= 0xd800 && c <= 0xdbff;
+  const isLow = (c: number) => c >= 0xdc00 && c <= 0xdfff;
+  if (headEnd > 0 && isHigh(text.charCodeAt(headEnd - 1))) headEnd -= 1;
+  if (tailStart < text.length && isLow(text.charCodeAt(tailStart))) tailStart += 1;
+  return `${text.slice(0, headEnd)}${noteFor(tailStart - headEnd)}${text.slice(tailStart)}`;
+}
+
+/** At most this many retries after a rate-limited response, waiting at most this long in all. */
+const MAX_RETRIES = 3;
+const MAX_TOTAL_WAIT_MS = 90_000;
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+interface RawResponse {
+  status: number;
+  headers: Headers;
+  text: string;
+}
+
+/**
+ * How long to wait before retrying a rate-limited response, or null when it
+ * is not one. Secondary limits: 403/429 with `retry-after`, or a "secondary
+ * rate limit" message (exponential backoff); primary: `x-ratelimit-remaining: 0`
+ * with its reset time.
+ */
+export function rateLimitWait(res: RawResponse, attempt: number, now = Date.now()): number | null {
+  if (res.status !== 403 && res.status !== 429) return null;
+  const retryAfter = res.headers.get("retry-after")?.trim();
+  if (retryAfter && /^\d+$/.test(retryAfter)) return Number(retryAfter) * 1000;
+  const reset = res.headers.get("x-ratelimit-reset")?.trim();
+  if (res.headers.get("x-ratelimit-remaining") === "0" && reset && /^\d+$/.test(reset)) {
+    return Math.max(0, Number(reset) * 1000 - now) + 1000;
+  }
+  if (res.status === 429 || /secondary rate limit/i.test(res.text)) return Math.min(60_000, 15_000 * 2 ** attempt);
+  return null;
+}
+
+/** Per-process LRU of ETag'd GET responses: a 304 answers from here and costs no rate limit. */
+const ETAG_CACHE_SIZE = 200;
+const etagCache = new Map<string, { etag: string; text: string; status: number }>();
+/** Identical GETs on the wire, per fetch implementation. */
+const inflight = new WeakMap<typeof fetch, Map<string, Promise<RawResponse>>>();
+
+/** Forget every cached GET (tests; after switching tokens). */
+export function clearGitHubCache(): void {
+  etagCache.clear();
+}
+
+type ErrorEntry = string | { message?: string; field?: string; code?: string; resource?: string };
+
+function errorMessage(detail: string, status: number): string {
+  try {
+    const parsed = JSON.parse(detail) as { message?: string; errors?: ErrorEntry[] };
+    const base = parsed.message ?? detail;
+    if (status !== 422 || !Array.isArray(parsed.errors)) return base;
+    const errors = parsed.errors
+      .map((e) => (typeof e === "string" ? e : (e.message ?? [e.resource, e.field, e.code].filter(Boolean).join(" "))))
+      .filter(Boolean);
+    return errors.length ? `${base}: ${errors.join("; ")}` : base;
+  } catch {
+    return detail;
+  }
+}
+
+async function send(
+  method: string,
+  url: string,
+  headers: Record<string, string>,
+  body: string | undefined,
+  opts: ApiOptions,
+): Promise<RawResponse> {
+  let waited = 0;
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await (opts.fetchImpl ?? fetch)(url, {
+      method,
+      headers,
+      body,
+      signal: opts.signal ?? AbortSignal.timeout(30_000),
+      redirect: "follow",
+    });
+    const res: RawResponse = { status: response.status, headers: response.headers, text: await response.text().catch(() => "") };
+    const wait = rateLimitWait(res, attempt);
+    if (wait === null || attempt >= MAX_RETRIES || waited + wait > MAX_TOTAL_WAIT_MS) return res;
+    waited += wait;
+    await sleep(wait, opts.signal);
+  }
+}
+
 async function call<T>(
   method: string,
   pathname: string,
@@ -57,45 +203,72 @@ async function call<T>(
   opts: ApiOptions & { accept?: string; raw?: boolean } = {},
 ): Promise<T> {
   const token = opts.token === undefined ? await resolveGithubToken() : opts.token;
+  const accept = opts.accept ?? "application/vnd.github+json";
   const headers: Record<string, string> = {
-    Accept: opts.accept ?? "application/vnd.github+json",
+    Accept: accept,
     "User-Agent": "Viberon",
     "X-GitHub-Api-Version": "2022-11-28",
   };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  const response = await (opts.fetchImpl ?? fetch)(`${API}${pathname}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: opts.signal ?? AbortSignal.timeout(30_000),
-    redirect: "follow",
-  });
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
-    const message = (() => {
-      try {
-        return (JSON.parse(detail) as { message?: string }).message ?? detail;
-      } catch {
-        return detail;
+  const url = `${API}${pathname}`;
+
+  let res: RawResponse;
+  if (method === "GET") {
+    // Keyed by token so one user's cached answer never serves another.
+    const key = `${token ?? ""}\n${accept}\n${url}`;
+    const run = async (): Promise<RawResponse> => {
+      const cached = etagCache.get(key);
+      const r = await send(method, url, cached ? { ...headers, "If-None-Match": cached.etag } : headers, undefined, opts);
+      if (r.status === 304 && cached) {
+        etagCache.delete(key);
+        etagCache.set(key, cached);
+        return { status: cached.status, headers: r.headers, text: cached.text };
       }
-    })();
+      const etag = r.headers.get("etag");
+      if (r.status >= 200 && r.status < 300 && etag) {
+        etagCache.delete(key);
+        etagCache.set(key, { etag, text: r.text, status: r.status });
+        while (etagCache.size > ETAG_CACHE_SIZE) etagCache.delete(etagCache.keys().next().value!);
+      }
+      return r;
+    };
+    if (opts.signal) {
+      // A caller with its own abort signal gets its own request.
+      res = await run();
+    } else {
+      const impl = opts.fetchImpl ?? fetch;
+      let flights = inflight.get(impl);
+      if (!flights) inflight.set(impl, (flights = new Map()));
+      let pending = flights.get(key);
+      if (!pending) {
+        const map = flights;
+        pending = run().finally(() => map.delete(key));
+        map.set(key, pending);
+      }
+      res = await pending;
+    }
+  } else {
+    res = await send(method, url, headers, body === undefined ? undefined : JSON.stringify(body), opts);
+  }
+
+  if (res.status < 200 || res.status >= 300) {
+    const message = redactSecret(errorMessage(res.text, res.status), token);
     const hint =
-      response.status === 401
+      res.status === 401
         ? " Check the GitHub token in Settings → Integrations."
-        : /rate limit/i.test(message)
+        : /rate limit/i.test(message) || rateLimitWait(res, MAX_RETRIES) !== null
           ? token
             ? " GitHub's rate limit for this token is used up; wait for it to reset."
             : " Add a GitHub token in Settings → Integrations (or set GITHUB_TOKEN) for a higher limit."
-          : response.status === 403 || response.status === 404
+          : res.status === 403 || res.status === 404
           ? " The token may lack access to this repository."
           : "";
-    throw new GitHubApiError(`GitHub ${method} ${pathname} → ${response.status}: ${message.slice(0, 300)}${hint}`, response.status);
+    throw new GitHubApiError(`GitHub ${method} ${pathname} → ${res.status}: ${message.slice(0, 500)}${hint}`, res.status);
   }
-  if (opts.raw) return (await response.text()) as T;
+  if (opts.raw) return res.text as T;
   // 204, and 201 with no body (e.g. a job re-run), carry nothing to parse.
-  const text = await response.text();
-  return (text ? JSON.parse(text) : undefined) as T;
+  return (res.text ? JSON.parse(res.text) : undefined) as T;
 }
 
 /* ------------------------------ pull requests ----------------------------- */
@@ -144,7 +317,7 @@ export function createPullRequest(
   input: { title: string; body: string; head: string; base: string; draft?: boolean; maintainer_can_modify?: boolean },
   opts?: ApiOptions,
 ): Promise<PullRequest> {
-  return call("POST", `/repos/${repo.owner}/${repo.repo}/pulls`, input, opts);
+  return call("POST", `/repos/${repo.owner}/${repo.repo}/pulls`, { ...input, body: truncateBody(input.body) }, opts);
 }
 
 export function updatePullRequest(
@@ -152,7 +325,8 @@ export function updatePullRequest(
   input: { title?: string; body?: string },
   opts?: ApiOptions,
 ): Promise<PullRequest> {
-  return call("PATCH", `/repos/${pr.owner}/${pr.repo}/pulls/${pr.number}`, input, opts);
+  const body = input.body === undefined ? {} : { body: truncateBody(input.body) };
+  return call("PATCH", `/repos/${pr.owner}/${pr.repo}/pulls/${pr.number}`, { ...input, ...body }, opts);
 }
 
 /** False only when GitHub says the token's user cannot push to `repo` (→ deliver through a fork). */
@@ -214,7 +388,7 @@ export function createIssueComment(
   body: string,
   opts?: ApiOptions,
 ): Promise<{ html_url: string; id: number }> {
-  return call("POST", `/repos/${issue.owner}/${issue.repo}/issues/${issue.number}/comments`, { body }, opts);
+  return call("POST", `/repos/${issue.owner}/${issue.repo}/issues/${issue.number}/comments`, { body: truncateBody(body) }, opts);
 }
 
 /* ----------------------------------- CI ----------------------------------- */

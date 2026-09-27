@@ -7,6 +7,7 @@
 
 import { configuredRemoteUrl, projectRemote } from "@/lib/git";
 import {
+  GitHubApiError,
   getIssue,
   listIssueComments,
   listIssues,
@@ -17,6 +18,7 @@ import {
   type RepoId,
 } from "@/lib/github-api";
 import { enqueue, getTaskQueue, type Task } from "@/lib/tasks";
+import { withLock } from "@/lib/tasks/lock";
 import { openWorkspace } from "@/lib/workspace";
 
 export class IssuesError extends Error {
@@ -80,13 +82,17 @@ export async function fetchIssueTask(url: string, opts?: ApiOptions): Promise<{ 
   return { text: issueTaskText(issue, comments), issue };
 }
 
-/** The most relevant task for each issue URL: an active one, else the newest. */
+/** Issue URLs compare case-insensitively (GitHub owner/repo names do), ignoring a trailing slash. */
+const issueKey = (url: string) => url.trim().replace(/\/+$/, "").toLowerCase();
+
+/** The most relevant task for each issue URL (keyed by `issueKey`): an active one, else the newest. */
 function tasksByIssue(tasks: Task[]): Map<string, Task> {
   const out = new Map<string, Task>();
   const active = (t: Task) => t.state === "queued" || t.state === "running";
   for (const t of tasks) {
     // A batch task covers every issue it lists.
-    for (const url of t.issueUrls ?? (t.issueUrl ? [t.issueUrl] : [])) {
+    for (const raw of t.issueUrls ?? (t.issueUrl ? [t.issueUrl] : [])) {
+      const url = issueKey(raw);
       const prev = out.get(url);
       if (!prev || (active(t) && !active(prev)) || (active(t) === active(prev) && t.createdAt > prev.createdAt)) {
         out.set(url, forIssue(t, url));
@@ -138,7 +144,7 @@ export async function issueRows(repoKey: string, labels: string[] = [], opts?: A
   return {
     repo,
     issues: issues.map((i) => {
-      const t = byIssue.get(i.html_url) ?? byIssue.get(issueUrl(repo, i.number));
+      const t = byIssue.get(issueKey(i.html_url)) ?? byIssue.get(issueKey(issueUrl(repo, i.number)));
       return {
         number: i.number,
         title: i.title,
@@ -151,6 +157,18 @@ export async function issueRows(repoKey: string, labels: string[] = [], opts?: A
       };
     }),
   };
+}
+
+export interface SkippedIssue {
+  number: number;
+  reason: string;
+  /** The issue could not be read (network, rate limit, 5xx): worth trying again later. */
+  transient?: true;
+}
+
+/** A failed issue read that says nothing about the issue itself. */
+function isTransient(error: unknown): boolean {
+  return !(error instanceof GitHubApiError && [404, 410].includes(error.status));
 }
 
 /**
@@ -170,7 +188,7 @@ export async function fixIssues(
     source?: "ui" | "api" | "cli" | "issue";
   },
   opts?: ApiOptions,
-): Promise<{ tasks: Task[]; skipped: { number: number; reason: string }[] }> {
+): Promise<{ tasks: Task[]; skipped: SkippedIssue[] }> {
   const { repo } = await workspaceRepo(input.repoKey);
   const listedIssues = input.all ? await listIssues(repo, { limit: 500 }, opts) : [];
   const listedByNumber = new Map(listedIssues.map((issue) => [issue.number, issue]));
@@ -179,19 +197,35 @@ export async function fixIssues(
   if (!numbers.length) {
     throw new IssuesError(input.all ? "This repository has no open issues." : "numbers must list at least one issue number.", "invalid_input");
   }
+  // Check-then-enqueue is one critical section per repo: a double click, or
+  // the UI and the watcher at once, must not queue the same issue twice.
+  return withLock(`fix-issues:${input.repoKey}`, () => enqueueIssues(input, repo, numbers, listedByNumber, opts));
+}
+
+async function enqueueIssues(
+  input: Parameters<typeof fixIssues>[0],
+  repo: RepoId,
+  numbers: number[],
+  listedByNumber: Map<number, IssueSummary>,
+  opts?: ApiOptions,
+): Promise<{ tasks: Task[]; skipped: SkippedIssue[] }> {
   const byIssue = tasksByIssue(await getTaskQueue().list(input.repoKey));
   const tasks: Task[] = [];
   const batch: IssueSummary[] = [];
-  const skipped: { number: number; reason: string }[] = [];
+  const skipped: SkippedIssue[] = [];
   for (const number of numbers) {
-    const url = issueUrl(repo, number);
+    const url = issueKey(issueUrl(repo, number));
     const reason = skipReason(byIssue.get(url));
     if (reason) {
       skipped.push({ number, reason });
       continue;
     }
     const issue = await Promise.resolve(listedByNumber.get(number) ?? getIssue({ ...repo, number }, opts)).catch((error: unknown) => {
-      skipped.push({ number, reason: error instanceof Error ? error.message : String(error) });
+      skipped.push({
+        number,
+        reason: error instanceof Error ? error.message : String(error),
+        ...(isTransient(error) ? { transient: true as const } : {}),
+      });
       return null;
     });
     if (!issue) continue;

@@ -15,6 +15,8 @@ import {
   DeliverError,
   deliveryTarget,
   evidenceFromResult,
+  explainPushFailure,
+  issueBranchName,
   MAX_BRANCH_LENGTH,
   renderPrBody,
   reportOnIssue,
@@ -192,6 +194,70 @@ describe("deliver", () => {
     expect((noToken as DeliverError).status).toBe(401);
   });
 
+  it("replaceBranch: a rerun resets the stable branch, force-pushes with a lease, and updates the open PR", async () => {
+    const branch = issueBranchName(5, "Parser crashes on None!");
+    expect(branch).toBe("viberon/issue-5-parser-crashes-on-none");
+    expect(issueBranchName(123, "x".repeat(80)).length).toBeLessThanOrEqual(MAX_BRANCH_LENGTH);
+    const main = repo.git("rev-parse", "HEAD").trim();
+    repo.write("a.txt", "one\n");
+    const first = await deliver({ ...base(fakeGitHub()), title: "Fix #5", body: "", branch, replaceBranch: true });
+    expect(first.created).toBe(true);
+
+    // The next attempt starts from main again, with the old branch still around locally.
+    repo.git("switch", "-q", "--detach", main);
+    repo.write("a.txt", "two\n");
+    const gh = fakeGitHub({ openPr: 7 });
+    const second = await deliver({ ...base(gh), title: "Fix #5", body: "v2", branch, replaceBranch: true });
+    expect(second).toMatchObject({ branch, created: false, prNumber: 7 });
+    expect(remoteRef(`refs/heads/${branch}`)).toBe(second.commit);
+    expect(remoteRef(`refs/heads/${branch}~1`)).toBe(main);
+    expect(gh.calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("replaceBranch: the lease refuses to overwrite someone else's push, and keeps branch and commit", async () => {
+    const branch = issueBranchName(6, "Other");
+    const main = repo.git("rev-parse", "HEAD").trim();
+    repo.write("a.txt", "one\n");
+    await deliver({ ...base(fakeGitHub()), title: "Fix #6", body: "", branch, replaceBranch: true });
+    // A maintainer pushes to the branch from elsewhere (our tracking ref does not see it).
+    const other = makeTmpRepo({ "c.txt": "theirs\n" });
+    try {
+      other.git("push", "-q", "--force", bare, `HEAD:refs/heads/${branch}`);
+    } finally {
+      other.cleanup();
+    }
+    const theirs = remoteRef(`refs/heads/${branch}`);
+    repo.git("switch", "-q", "--detach", main);
+    repo.write("a.txt", "two\n");
+    const error = (await deliver({ ...base(fakeGitHub()), title: "Fix #6", body: "", branch, replaceBranch: true }).catch((e: unknown) => e)) as DeliverError;
+    expect(error.code).toBe("push_failed");
+    expect(remoteRef(`refs/heads/${branch}`)).toBe(theirs);
+    expect(repo.git("rev-parse", branch).trim()).toBe(error.partial?.commit);
+  });
+
+  it("a 422 on PR create (one already exists) looks it up and updates it", async () => {
+    const calls: string[] = [];
+    let created = false;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      calls.push(`${method} ${url}`);
+      const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
+      if (method === "GET" && url.endsWith("/repos/o/r")) return json({ default_branch: "main" });
+      if (method === "GET" && url.includes("/pulls?state=open")) return json(created ? [{ number: 9, html_url: "https://github.com/o/r/pull/9" }] : []);
+      if (method === "POST" && url.endsWith("/pulls")) {
+        created = true; // opened meanwhile by another run
+        return json({ message: "Validation Failed", errors: [{ message: "A pull request already exists for o:x." }] }, 422);
+      }
+      if (method === "PATCH" && url.endsWith("/pulls/9")) return json({ number: 9, html_url: "https://github.com/o/r/pull/9" });
+      return json({ message: "Not Found" }, 404);
+    }) as unknown as typeof fetch;
+    repo.write("a.txt", "fixed\n");
+    const out = await deliver({ root: repo.root, repo: REPO, token: TOKEN, fetchImpl, title: "Fix it", body: "b" });
+    expect(out).toMatchObject({ prNumber: 9, created: false });
+    expect(calls.filter((c) => c.startsWith("PATCH"))).toHaveLength(1);
+  });
+
   it("keeps the local branch and commit when the push fails, and says why", async () => {
     const gh = fakeGitHub();
     repo.write("a.txt", "fixed\n");
@@ -203,6 +269,33 @@ describe("deliver", () => {
     expect(error.partial?.branch).toBe("viberon/fix-it");
     expect(repo.git("rev-parse", "viberon/fix-it").trim()).toBe(error.partial?.commit);
     expect(gh.calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("explains a non-fast-forward push in plain language and keeps the branch and commit", async () => {
+    // The remote branch has a commit the local one does not.
+    repo.git("switch", "-q", "-c", "elsewhere");
+    repo.write("b.txt", "theirs\n");
+    repo.git("commit", "-qam", "theirs");
+    repo.git("push", "-q", "origin", "HEAD:refs/heads/viberon/moved");
+    repo.git("switch", "-q", "-");
+    repo.git("branch", "-q", "-D", "elsewhere");
+    const gh = fakeGitHub();
+    repo.write("a.txt", "fixed\n");
+    const error = (await deliver({ ...base(gh), branch: "viberon/moved", title: "Fix it", body: "" }).catch((e: unknown) => e)) as DeliverError;
+    expect(error.code).toBe("push_failed");
+    expect(error.message).toMatch(/the remote branch has new commits/);
+    expect(error.message).toContain("local branch viberon/moved");
+    expect(repo.git("rev-parse", "viberon/moved").trim()).toBe(error.partial?.commit);
+  });
+});
+
+describe("explainPushFailure", () => {
+  it("names auth failures, protected branches and non-fast-forwards", () => {
+    expect(explainPushFailure("remote: Invalid username or password.\nfatal: Authentication failed for 'https://github.com/o/r.git/'").message).toMatch(/GitHub rejected the token/);
+    expect(explainPushFailure("remote: Permission to o/r.git denied to someone.\nfatal: unable to access: The requested URL returned error: 403").reason).toBe("auth");
+    expect(explainPushFailure("remote: error: GH006: Protected branch update failed for refs/heads/main.").reason).toBe("protected");
+    expect(explainPushFailure(" ! [rejected]        HEAD -> x (fetch first)\nhint: Updates were rejected because the remote contains work").reason).toBe("non_fast_forward");
+    expect(explainPushFailure("fatal: something odd").message).toBe("fatal: something odd");
   });
 });
 

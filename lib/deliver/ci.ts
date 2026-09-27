@@ -18,6 +18,7 @@ import {
   type PrRef,
 } from "@/lib/github-api";
 import { getValueRaw, setValueRaw } from "@/lib/store";
+import { withLock } from "@/lib/tasks/lock";
 import { extractFailures } from "@/lib/verify/extract";
 
 export const MAX_RERUNS_PER_HEAD = 3;
@@ -113,23 +114,27 @@ export async function rerunFlaky(
   }
   const head = (await getPullRequest(pr, opts)).head.sha;
   const key = ledgerKey(pr, head);
-  const ledger = (await getValueRaw<RerunLedger>(key)) ?? { count: 0, reruns: [] };
-  if (ledger.count >= MAX_RERUNS_PER_HEAD) {
-    throw new DeliverError(
-      `Flaky re-run limit reached: ${MAX_RERUNS_PER_HEAD} re-runs already for head ${head.slice(0, 12)}. Fix the failure instead.`,
-      "rerun_limit",
-      429,
-    );
-  }
-  const run = (await listCheckRuns(pr, head, opts)).find((r) => r.name === checkName);
-  if (!run) throw new DeliverError(`No check named "${checkName}" on head ${head.slice(0, 12)}.`, "not_found", 404);
-  if (run.status !== "completed" || !run.conclusion || !FAILED.has(run.conclusion)) {
-    throw new DeliverError(`Check "${checkName}" has not failed; nothing to re-run.`, "not_failed", 409);
-  }
-  const job = actionsJobId(run);
-  if (job === null) throw new DeliverError(`Check "${checkName}" is not a GitHub Actions job; re-run it in its own CI.`, "not_actions", 400);
-  await rerunJob(pr, job, opts);
-  const next: RerunLedger = { count: ledger.count + 1, reruns: [...ledger.reruns, { checkName, evidence, at: Date.now() }] };
-  await setValueRaw(key, next, 30 * 24 * 3600);
-  return { ok: true, attempt: next.count, remaining: MAX_RERUNS_PER_HEAD - next.count };
+  // read → rerun → write is one critical section per head sha, so concurrent
+  // requests cannot all see count < 3 and exceed the cap together.
+  return withLock(key, async () => {
+    const ledger = (await getValueRaw<RerunLedger>(key)) ?? { count: 0, reruns: [] };
+    if (ledger.count >= MAX_RERUNS_PER_HEAD) {
+      throw new DeliverError(
+        `Flaky re-run limit reached: ${MAX_RERUNS_PER_HEAD} re-runs already for head ${head.slice(0, 12)}. Fix the failure instead.`,
+        "rerun_limit",
+        429,
+      );
+    }
+    const run = (await listCheckRuns(pr, head, opts)).find((r) => r.name === checkName);
+    if (!run) throw new DeliverError(`No check named "${checkName}" on head ${head.slice(0, 12)}.`, "not_found", 404);
+    if (run.status !== "completed" || !run.conclusion || !FAILED.has(run.conclusion)) {
+      throw new DeliverError(`Check "${checkName}" has not failed; nothing to re-run.`, "not_failed", 409);
+    }
+    const job = actionsJobId(run);
+    if (job === null) throw new DeliverError(`Check "${checkName}" is not a GitHub Actions job; re-run it in its own CI.`, "not_actions", 400);
+    await rerunJob(pr, job, opts);
+    const next: RerunLedger = { count: ledger.count + 1, reruns: [...ledger.reruns, { checkName, evidence, at: Date.now() }] };
+    await setValueRaw(key, next, 30 * 24 * 3600);
+    return { ok: true as const, attempt: next.count, remaining: MAX_RERUNS_PER_HEAD - next.count };
+  });
 }
