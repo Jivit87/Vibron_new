@@ -14,6 +14,7 @@
  */
 
 import type { ProviderId } from "@/lib/ai/types";
+import { isAmbiguousSkKey, probeSkKeyOwner } from "@/lib/ai/deepseek";
 import { detectProvider } from "@/lib/ai/provider-config";
 
 const KEY_PREFIX = "credential:";
@@ -25,27 +26,41 @@ const ENV_VAR: Record<ProviderId, string> = {
   openai: "OPENAI_API_KEY",
   nvidia: "NVIDIA_API_KEY",
   gemini: "GEMINI_API_KEY",
+  deepseek: "DEEPSEEK_API_KEY",
+  // The Claude CLI uses the machine's `claude` login, never a key.
+  "claude-cli": "",
 };
+
+/** Providers that take an API key (everything but the Claude CLI). */
+export const KEY_PROVIDERS: ProviderId[] = ["anthropic", "groq", "openai", "nvidia", "gemini", "deepseek"];
 
 /**
  * The evaluation's single credential, `AI_API_KEY`, routed by its prefix:
  * `sk-ant-` feeds the Anthropic adapter, `gsk_` Groq (unless a base URL
  * names another endpoint), and anything else the OpenAI-compatible adapter.
+ * An `sk-` + 32 hex key is DeepSeek's or OpenAI's: with no base URL naming
+ * the endpoint, one probe of each vendor's `/models` decides (cached).
  */
-function genericEnvKey(provider: ProviderId): string | null {
+async function genericEnvKey(provider: ProviderId): Promise<string | null> {
   const key = (process.env.AI_API_KEY ?? "").trim();
-  if (!key) return null;
+  if (!key || provider === "claude-cli") return null;
   const detected = detectProvider(key);
-  const groqNative = detected === "groq" && !process.env.AI_BASE_URL;
+  const baseUrl = (process.env.AI_BASE_URL ?? "").trim();
+  const groqNative = detected === "groq" && !baseUrl;
   if (provider === "anthropic") return detected === "anthropic" ? key : null;
   if (provider === "groq") return groqNative ? key : null;
   if (provider === "nvidia") return detected === "nvidia" ? key : null;
   if (provider === "gemini") return detected === "gemini" ? key : null;
-  return detected === "anthropic" || groqNative ? null : key;
+  const namedDeepseek =
+    (process.env.AI_PROVIDER ?? "").trim().toLowerCase() === "deepseek" || /api\.deepseek\.com/i.test(baseUrl);
+  const owner = !baseUrl && isAmbiguousSkKey(key) ? await probeSkKeyOwner(key) : null;
+  if (provider === "deepseek") return detected === "openai" && (namedDeepseek || owner === "deepseek") ? key : null;
+  return detected === "anthropic" || groqNative || owner === "deepseek" ? null : key;
 }
 
-function envKey(provider: ProviderId): string | null {
-  const direct = process.env[ENV_VAR[provider]]?.trim();
+async function envKey(provider: ProviderId): Promise<string | null> {
+  const name = ENV_VAR[provider];
+  const direct = name ? process.env[name]?.trim() : undefined;
   return direct || genericEnvKey(provider);
 }
 
@@ -70,6 +85,7 @@ const cache = new Map<ProviderId, string | null>();
 
 export async function getApiKey(provider: ProviderId): Promise<string | null> {
   if (cache.has(provider)) return cache.get(provider) ?? null;
+  if (provider === "claude-cli") return null;
 
   let saved: string | null = null;
   try {
@@ -79,7 +95,7 @@ export async function getApiKey(provider: ProviderId): Promise<string | null> {
     // Store unavailable (e.g. read-only fs) — fall through to env.
   }
 
-  const env = envKey(provider);
+  const env = await envKey(provider);
   const key = (saved && saved.trim()) || env || null;
   cache.set(provider, key);
   return key;
@@ -124,7 +140,7 @@ export async function credentialStatus(
   } catch {
     saved = null;
   }
-  const env = envKey(provider);
+  const env = await envKey(provider);
   const key = (saved && saved.trim()) || env || null;
   return {
     provider,
@@ -137,6 +153,6 @@ export async function credentialStatus(
 
 export async function allCredentialStatus(): Promise<CredentialStatus[]> {
   return Promise.all(
-    (["anthropic", "groq", "openai", "nvidia", "gemini"] as ProviderId[]).map(credentialStatus),
+    KEY_PROVIDERS.map(credentialStatus),
   );
 }

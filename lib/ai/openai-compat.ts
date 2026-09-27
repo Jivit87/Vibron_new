@@ -23,6 +23,7 @@
 
 import { getApiKey } from "@/lib/ai/credentials";
 import { getModel, outputCap } from "@/lib/ai/models";
+import { deepseekBaseUrl } from "@/lib/ai/deepseek";
 import { geminiOpenAiBase, markGeminiUnavailable } from "@/lib/ai/gemini-catalog";
 import { markNvidiaUnavailable, ModelUnavailableError, nvidiaBaseUrl } from "@/lib/ai/nvidia-catalog";
 import { toOpenAiMessages } from "@/lib/ai/openai-messages";
@@ -76,6 +77,8 @@ interface ModelState {
   dropped: Set<string>;
   toolMode: "auto" | "native" | "text";
   reasoningWindow: number;
+  /** DeepSeek: passed-back reasoning is mandatory, so a 400 never turns it off. */
+  reasoningRequired: boolean;
 }
 
 const states = new Map<string, ModelState>();
@@ -89,6 +92,7 @@ function stateFor(model: string, provider = "openai"): ModelState {
       dropped: new Set(),
       toolMode: mode === "text" || mode === "native" ? mode : "auto",
       reasoningWindow: provider === "deepseek" || /deepseek/i.test(model) ? Infinity : /gpt-oss/i.test(model) ? 6 : 0,
+      reasoningRequired: provider === "deepseek",
     };
     states.set(key, state);
   }
@@ -105,8 +109,8 @@ export const openAiCompatTesting = {
   reset() {
     states.clear();
   },
-  state(model: string) {
-    return stateFor(model);
+  state(model: string, provider?: string) {
+    return stateFor(model, provider);
   },
 };
 
@@ -133,7 +137,7 @@ export function negotiateParams(
 ): boolean {
   const low = errorText.toLowerCase();
   let changed = false;
-  if (low.includes("reasoning") && state.reasoningWindow && !low.includes("reasoning_effort")) {
+  if (low.includes("reasoning") && state.reasoningWindow && !state.reasoningRequired && !low.includes("reasoning_effort")) {
     state.reasoningWindow = 0; // The endpoint rejects passed-back reasoning.
     changed = true;
   }
@@ -209,6 +213,16 @@ async function endpoint(model: string): Promise<Endpoint> {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
       provider: "gemini",
       wireModel: model.replace(/^gemini:/, ""),
+    };
+  }
+  if (getModel(model)?.provider === "deepseek") {
+    const key = await getApiKey("deepseek");
+    if (!key) throw new MissingCredentialError("deepseek");
+    return {
+      url: `${deepseekBaseUrl()}/chat/completions`,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      provider: "deepseek",
+      wireModel: model.replace(/^deepseek:/, ""),
     };
   }
   const cfg = resolveOpenAiCompatEnv();
@@ -532,5 +546,14 @@ export const geminiProvider: AiProvider = {
   id: "gemini",
   isConfigured(): boolean {
     return Boolean(process.env.GEMINI_API_KEY || process.env.AI_API_KEY?.startsWith("AIza"));
+  },
+};
+
+/** The same adapter bound to DeepSeek's own API (`DEEPSEEK_API_KEY`). */
+export const deepseekProvider: AiProvider = {
+  ...openaiCompatProvider,
+  id: "deepseek",
+  isConfigured(): boolean {
+    return Boolean(process.env.DEEPSEEK_API_KEY);
   },
 };

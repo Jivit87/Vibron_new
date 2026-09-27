@@ -10,7 +10,9 @@
  * typo surfaces immediately instead of at the start of an expensive run.
  */
 
-import { allCredentialStatus, setApiKey } from "@/lib/ai/credentials";
+import { claudeCliReady } from "@/lib/ai/claude-cli";
+import { allCredentialStatus, KEY_PROVIDERS, setApiKey } from "@/lib/ai/credentials";
+import { deepseekBaseUrl } from "@/lib/ai/deepseek";
 import type { ProviderId } from "@/lib/ai/types";
 import { geminiApiRoot } from "@/lib/ai/gemini-catalog";
 import { nvidiaBaseUrl } from "@/lib/ai/nvidia-catalog";
@@ -18,19 +20,40 @@ import { resolveOpenAiCompatEnv } from "@/lib/ai/provider-config";
 
 export const runtime = "nodejs";
 
-const PROVIDERS: ProviderId[] = ["anthropic", "groq", "openai", "nvidia", "gemini"];
+/** Providers that take a key here; the Claude CLI row is read-only (its login lives in `claude`). */
+const PROVIDERS = KEY_PROVIDERS;
 
 function isProvider(value: unknown): value is ProviderId {
   return typeof value === "string" && PROVIDERS.includes(value as ProviderId);
 }
 
+/** Every key row, plus a read-only "Claude subscription (CLI)" row. */
+async function providerRows() {
+  const [keys, cli] = await Promise.all([allCredentialStatus(), claudeCliReady()]);
+  return [
+    ...keys,
+    {
+      provider: "claude-cli" as const,
+      label: "Claude subscription (CLI)",
+      readOnly: true,
+      configured: cli,
+      masked: null,
+      fromEnv: false,
+      envVar: "",
+    },
+  ];
+}
+
 export async function GET() {
-  return Response.json({ providers: await allCredentialStatus() });
+  return Response.json({ providers: await providerRows() });
 }
 
 function modelsEndpoint(provider: ProviderId): { label: string; url: string } {
   if (provider === "nvidia") {
     return { label: "NVIDIA", url: `${nvidiaBaseUrl()}/models` };
+  }
+  if (provider === "deepseek") {
+    return { label: "DeepSeek", url: `${deepseekBaseUrl()}/models` };
   }
   if (provider === "openai") {
     return { label: "The endpoint", url: `${resolveOpenAiCompatEnv().baseUrl}/models` };
@@ -88,7 +111,7 @@ async function verifyKey(
       return { ok: false, error: `Gemini returned ${response.status}.` };
     }
 
-    // Groq, NVIDIA and OpenAI-compatible endpoints all list models with the key.
+    // Groq, NVIDIA, DeepSeek and OpenAI-compatible endpoints all list models with the key.
     const { label, url } = modelsEndpoint(provider);
     const response = await fetch(url, {
       headers: { authorization: `Bearer ${key}` },
@@ -135,7 +158,7 @@ export async function PUT(request: Request) {
   }
 
   await setApiKey(body.provider, key);
-  return Response.json({ ok: true, providers: await allCredentialStatus() });
+  return Response.json({ ok: true, providers: await providerRows() });
 }
 
 export async function DELETE(request: Request) {
@@ -145,5 +168,5 @@ export async function DELETE(request: Request) {
     return Response.json({ error: "Unknown provider" }, { status: 400 });
   }
   await setApiKey(provider, null);
-  return Response.json({ ok: true, providers: await allCredentialStatus() });
+  return Response.json({ ok: true, providers: await providerRows() });
 }

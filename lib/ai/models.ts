@@ -245,6 +245,66 @@ const NVIDIA_MODELS: ModelSpec[] = [
 
 MODELS.push(...NVIDIA_MODELS);
 
+/**
+ * DeepSeek's own API (`api.deepseek.com`, OpenAI-compatible, `DEEPSEEK_API_KEY`).
+ * Thinking is on by default, and with tools every earlier assistant turn's
+ * `reasoning_content` must be sent back (else HTTP 400): the adapter does so.
+ * Prices are approximate off-peak list prices (peak hours bill 2x).
+ */
+function deepseekModel(wire: string, label: string, blurb: string, tier: ModelTier, pricing: ModelSpec["pricing"]): ModelSpec {
+  return {
+    id: `deepseek:${wire}`,
+    provider: "deepseek",
+    label,
+    blurb,
+    tier,
+    contextWindow: 128_000,
+    maxOutput: 32_000,
+    defaultMaxOutput: 8_192,
+    pricing,
+    supportsEffort: false,
+    supportsThinking: false,
+    // Automatic server-side prefix caching; hits are reported, nothing to mark.
+    supportsCaching: false,
+    agentic: true,
+  };
+}
+
+MODELS.push(
+  deepseekModel("deepseek-v4-pro", "DeepSeek V4 Pro", "DeepSeek's strongest model, direct API.", "frontier", { input: 0.5, output: 2 }),
+  deepseekModel("deepseek-v4-flash", "DeepSeek V4 Flash", "Fast, cheap DeepSeek model with thinking, direct API.", "balanced", { input: 0.15, output: 0.6 }),
+);
+
+/**
+ * A locally logged-in Claude Code CLI (`claude -p`): a Claude subscription,
+ * no API key. Tools go through the text protocol; cost is what the CLI
+ * reports, so the price table stays at zero. `auto` picks these only when
+ * no API-key provider is configured.
+ */
+function claudeCliModel(alias: string, label: string, tier: ModelTier): ModelSpec {
+  return {
+    id: `claude-cli:${alias}`,
+    provider: "claude-cli",
+    label: `${label} (Claude CLI)`,
+    blurb: "Claude through the local `claude` login (subscription, no API key).",
+    tier,
+    contextWindow: 200_000,
+    maxOutput: 32_000,
+    defaultMaxOutput: 32_000,
+    pricing: { input: 0, output: 0 },
+    supportsEffort: false,
+    supportsThinking: false,
+    supportsCaching: false,
+    agentic: true,
+  };
+}
+
+MODELS.push(
+  claudeCliModel("opus", "Claude Opus", "frontier"),
+  claudeCliModel("sonnet", "Claude Sonnet", "balanced"),
+  claudeCliModel("haiku", "Claude Haiku", "fast"),
+);
+
 const BY_ID = new Map(MODELS.map((m) => [m.id, m] as const));
 
 /** Add (or replace) a model at runtime, e.g. one named by `AI_MODEL`. */
@@ -292,6 +352,13 @@ export function ensureModel(id: string): ModelSpec | undefined {
     return registerModel(
       nvidiaModel(id.slice("nvidia:".length), id.slice("nvidia:".length), "NVIDIA API Catalog model.", "balanced", 128_000, true),
     );
+  }
+  if (id.startsWith("deepseek:") && id.length > "deepseek:".length) {
+    const wire = id.slice("deepseek:".length);
+    return registerModel(deepseekModel(wire, `${wire} (DeepSeek)`, "DeepSeek API model.", "balanced", { input: 0, output: 0 }));
+  }
+  if (id.startsWith("claude-cli:") && id.length > "claude-cli:".length) {
+    return registerModel(claudeCliModel(id.slice("claude-cli:".length), id.slice("claude-cli:".length), "balanced"));
   }
   const envId = envModelId();
   if (!id.startsWith("openai:") && id !== envId) return undefined;
