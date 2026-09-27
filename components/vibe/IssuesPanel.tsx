@@ -23,6 +23,7 @@ import {
   fixIssues,
   INTERVAL_MAX,
   INTERVAL_MIN,
+  isRefix,
   issueStatus,
   pollInterval,
   saveWatch,
@@ -181,7 +182,8 @@ export function IssuesPanel() {
     if (!repoKey || numbers.length === 0) return;
     setPending((p) => new Set([...p, ...numbers]));
     setFixError(null);
-    const result = await fixIssues(repoKey, numbers);
+    // An explicit click: re-fix issues that already have a PR too.
+    const result = await fixIssues(repoKey, numbers, { refix: true });
     setPending((p) => new Set([...p].filter((n) => !numbers.includes(n))));
     if (!result.ok) {
       setFixError(result.error ?? { kind: "other", message: "Could not queue the fixes." });
@@ -521,10 +523,10 @@ export function IssuesPanel() {
                             className="vb-btn vb-btn-ghost"
                             style={SMALL_BTN}
                             disabled={isPending}
-                            title={`Fix #${row.number} and open a draft pull request`}
+                            title={isRefix(row) ? `Fix #${row.number} again and update its pull request` : `Fix #${row.number} and open a draft pull request`}
                             onClick={() => void fix([row.number])}
                           >
-                            {isPending ? <Loader2 className="size-3 animate-spin" /> : "Fix → PR"}
+                            {isPending ? <Loader2 className="size-3 animate-spin" /> : isRefix(row) ? "Fix again" : "Fix → PR"}
                           </button>
                         )}
                       </td>
@@ -585,6 +587,9 @@ function StatusCell({
     return (
       <span className="flex items-center gap-1.5 font-mono text-[11px]" style={{ color }}>
         {dot}
+        <span className="shrink-0 font-sans" style={{ color: "var(--vb-text-dim)" }}>
+          Fixed in
+        </span>
         <a
           href={prUrl}
           target="_blank"

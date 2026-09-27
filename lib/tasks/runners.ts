@@ -12,10 +12,9 @@ import { DEFAULT_CONCURRENCY, MAX_CONCURRENCY, MIN_CONCURRENCY } from "@/lib/lim
 import {
   branchName,
   createIssueWorktree,
-  existingIssueBranch,
-  issueBranchName,
   deliver,
   evidenceFromResult,
+  refixTarget,
   removeIssueWorktree,
   renderPrBody,
   reportOnIssue,
@@ -51,14 +50,19 @@ export const runFixTask: TaskRunner = async (task, { emit, signal }) => {
   try {
     if (signal.aborted) return { error: "Stopped." };
     const meta = await registerLocalWorkspace(tree.dir, {}, { signal });
-    // One branch (and PR) per issue: a rerun replaces it rather than opening another.
-    const branch = (await existingIssueBranch(home, issue.number)) ?? issueBranchName(issue.number, issue.title);
+    // One branch (and PR) per issue: a rerun replaces it rather than opening
+    // another — unless the previous PR was merged, in which case reusing the
+    // branch would force-push over history GitHub already merged, so a
+    // refix gets a fresh branch and a new PR instead.
+    const target = await refixTarget(home, issue.number, issue.title, task.refixOf);
     return await fixIn({ ...task, repoKey: meta.repoKey }, tree.dir, home, text, {
       emit,
       signal,
       title: `Fix #${issue.number}: ${issue.title}`,
       baseBranch: tree.base,
-      branch,
+      branch: target.branch,
+      replaceBranch: target.replaceBranch,
+      mergedPrUrl: target.mergedPrUrl,
     });
   } finally {
     await removeIssueWorktree(home, tree.dir);
@@ -71,7 +75,17 @@ async function fixIn(
   root: string,
   memoryRoot: string,
   text: string,
-  ctx: { emit: (event: OrchestrationEvent) => void; signal: AbortSignal; title?: string; baseBranch?: string; branch?: string },
+  ctx: {
+    emit: (event: OrchestrationEvent) => void;
+    signal: AbortSignal;
+    title?: string;
+    baseBranch?: string;
+    branch?: string;
+    /** `branch` is Viberon's own stable issue branch: force-push to update its PR. Default true when `branch` is set. */
+    replaceBranch?: boolean;
+    /** Set when `branch` was made fresh because this issue's previous PR was merged: noted once the new PR is known. */
+    mergedPrUrl?: string;
+  },
 ): Promise<TaskOutcome> {
   const handle = await openWorkspace(task.repoKey);
   const { solveTask } = await import("@/lib/harness/solve");
@@ -117,9 +131,10 @@ async function fixIn(
       body: renderPrBody({ summary: result.summary, evidence, issueUrl: task.issueUrl }),
       expectedFiles: result.filesChanged,
       ...(ctx.baseBranch ? { baseBranch: ctx.baseBranch } : {}),
-      ...(ctx.branch ? { branch: ctx.branch, replaceBranch: true } : {}),
+      ...(ctx.branch ? { branch: ctx.branch, replaceBranch: ctx.replaceBranch ?? true } : {}),
     });
     outcome.prUrl = pr.prUrl;
+    if (ctx.mergedPrUrl) outcome.note = `Previous PR ${ctx.mergedPrUrl} was merged; opened new PR ${pr.prUrl}.`;
   } catch (error) {
     return { result, error: `Delivery failed: ${error instanceof Error ? error.message : String(error)}` };
   }

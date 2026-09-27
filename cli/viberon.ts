@@ -9,7 +9,7 @@
  *               [--task-id <id>] [--json] [--thorough] [--no-review] [--review-model <id>]
  *               [--deliver [--issue-url <url>]]
  *   viberon review [--repo <path>] [--base <ref> | --pr <url>] [--model <id>] [--json]
- *   viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--no-deliver] [--model <id>] [--json]
+ *   viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--refix] [--no-deliver] [--model <id>] [--json]
  *   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
  *   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
  *   viberon swe --ids a,b [--model <id>] [--limit <n>] [--max-turns <n>] [--timeout <sec>] [--data <file>] [--out <dir>] [--gold]
@@ -39,9 +39,11 @@ export const USAGE = `Usage:
                           (default: the task, when it is an issue URL)
   viberon review [--repo <path>] [--base <ref> | --pr <url>] [--model <id>] [--json]
       reviews the work tree against HEAD, against the merge base with --base, or a GitHub PR
-  viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--no-deliver] [--model <id>] [--json]
+  viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--refix] [--no-deliver] [--model <id>] [--json]
       lists the open GitHub issues of the repo's origin; --fix fixes them one by one, each in its own
-      worktree of origin/<default>, and opens a draft PR for every fix its checks prove
+      worktree of origin/<default>, and opens a draft PR for every fix its checks prove; --fix always
+      re-fixes an issue that already has a PR too (updates it, or opens a new one if it was merged);
+      --refix is accepted as an explicit alias for that same default
   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
   viberon swe --ids a,b [--model <id>] [--limit <n>] [--max-turns <n>] [--timeout <sec>] [--data <rows.json>] [--out <dir>] [--gold]
@@ -93,6 +95,7 @@ export interface IssuesArgs {
   repo: string;
   label?: string;
   fix?: number[] | "all";
+  refix: boolean;
   deliver: boolean;
   model?: string;
   json: boolean;
@@ -147,7 +150,7 @@ export type CliArgs =
 
 export class CliError extends Error {}
 
-const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-review", "thorough", "no-deliver", "independent-test", "gold"]);
+const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-review", "thorough", "no-deliver", "independent-test", "gold", "refix"]);
 
 function splitFlags(argv: string[]): { flags: Map<string, string | true>; positionals: string[] } {
   const flags = new Map<string, string | true>();
@@ -196,7 +199,7 @@ const KNOWN: Record<string, Set<string>> = {
     "review", "no-review", "thorough", "review-model", "independent-test",
   ]),
   review: new Set(["repo", "base", "pr", "model", "json", "help"]),
-  issues: new Set(["repo", "label", "fix", "no-deliver", "model", "json", "help"]),
+  issues: new Set(["repo", "label", "fix", "refix", "no-deliver", "model", "json", "help"]),
   clone: new Set(["ref", "depth", "setup", "json", "help"]),
   eval: new Set(["only", "model", "max-turns", "timeout", "help"]),
   swe: new Set(["ids", "model", "limit", "max-turns", "timeout", "data", "out", "gold", "help"]),
@@ -281,11 +284,15 @@ export function parseCliArgs(argv: string[]): CliArgs {
       fix = numbers;
     }
     if (flags.has("no-deliver") && !fix) throw new CliError("issues: --no-deliver needs --fix");
+    if (flags.has("refix") && !fix) throw new CliError("issues: --refix needs --fix");
     return {
       command,
       repo: stringFlag(flags, "repo") ?? positionals[0] ?? ".",
       label: stringFlag(flags, "label"),
       ...(fix ? { fix } : {}),
+      // An explicit --fix always re-fixes an issue that already has a PR
+      // (--refix is accepted as an explicit, equivalent alias).
+      refix: Boolean(fix),
       deliver: !flags.has("no-deliver"),
       model: stringFlag(flags, "model"),
       json: flags.has("json"),
@@ -437,7 +444,7 @@ export async function main(argv: string[]): Promise<number> {
         log("no open issues to fix");
         return 0;
       }
-      const { tasks, skipped } = await fixIssues({ repoKey, numbers, deliver: args.deliver, model: args.model, source: "cli" });
+      const { tasks, skipped } = await fixIssues({ repoKey, numbers, deliver: args.deliver, refix: args.refix, model: args.model, source: "cli" });
       for (const s of skipped) log(`#${s.number} skipped: ${s.reason}`);
       log(`fixing ${tasks.length} issue${tasks.length === 1 ? "" : "s"} one at a time…`);
       const queue = getTaskQueue();

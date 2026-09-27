@@ -6,6 +6,7 @@ import {
   ERROR_TEXT,
   issueStatus,
   isAllIssuesFixRequest,
+  isRefix,
   issuePromptRepo,
   issuesError,
   normalizeFix,
@@ -145,12 +146,18 @@ describe("issue status", () => {
     });
   });
 
-  it("decides fixability and the poll interval", () => {
+  it("decides fixability (an explicit click can always re-fix a delivered issue) and the poll interval", () => {
     expect(canFix(row(null))).toBe(true);
     expect(canFix(row({ id: "a", state: "failed" }))).toBe(true);
     expect(canFix(row({ id: "a", state: "done" }))).toBe(true);
+    expect(canFix(row({ id: "a", state: "queued" }))).toBe(false);
     expect(canFix(row({ id: "a", state: "running" }))).toBe(false);
-    expect(canFix(row({ id: "a", state: "done", prUrl: "u" }))).toBe(false);
+    // Done with a PR is still fixable: an explicit Fix click re-fixes it (refix: true).
+    expect(canFix(row({ id: "a", state: "done", prUrl: "u" }))).toBe(true);
+    expect(isRefix(row({ id: "a", state: "done", prUrl: "u" }))).toBe(true);
+    expect(isRefix(row({ id: "a", state: "done" }))).toBe(false);
+    expect(isRefix(row({ id: "a", state: "failed" }))).toBe(false);
+    expect(isRefix(row(null))).toBe(false);
     expect(pollInterval([row(null), row({ id: "a", state: "queued" })])).toBe(POLL_ACTIVE_MS);
     expect(pollInterval([row({ id: "a", state: "done", prUrl: "u" })])).toBe(POLL_IDLE_MS);
     expect(pollInterval(null)).toBe(POLL_IDLE_MS);

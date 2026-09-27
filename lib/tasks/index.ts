@@ -37,6 +37,13 @@ export interface Task {
   note?: string;
   issueUrl?: string;
   /**
+   * An explicit refix of an issue that already had a pull request: that
+   * PR's URL, so the runner can check whether it was merged (then it must
+   * not force-push over that branch; it opens a fresh one) or is still open
+   * (then it force-pushes the stable branch and updates it).
+   */
+  refixOf?: string;
+  /**
    * A batch: fix every one of these GitHub issues on ONE branch (a commit per
    * resolved issue, from a clean worktree of origin/<default>) and open ONE
    * pull request. Mutually exclusive with `issueUrl`.
@@ -128,6 +135,7 @@ export interface EnqueueInput {
   task: string;
   source: TaskSource;
   issueUrl?: string;
+  refixOf?: string;
   issueUrls?: string[];
   issueTitles?: string[];
   instructions?: string;
@@ -251,6 +259,7 @@ export class TaskQueue {
       state: "queued",
       createdAt: Date.now(),
       ...(input.issueUrl ? { issueUrl: input.issueUrl } : {}),
+      ...(input.refixOf ? { refixOf: input.refixOf } : {}),
       ...(input.issueUrls?.length ? { issueUrls: [...input.issueUrls] } : {}),
       ...(input.issueTitles?.length ? { issueTitles: [...input.issueTitles] } : {}),
       ...(input.instructions ? { instructions: input.instructions } : {}),

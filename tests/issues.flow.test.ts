@@ -65,8 +65,8 @@ let bare: string;
 const posted: { method: string; url: string; body: unknown }[] = [];
 /** Open PRs by head branch; the fake remembers what it opened. */
 const openPrs = new Map<string, { number: number; html_url: string }>();
-/** Knobs for failure scenarios. */
-const gh = { issueStatus: 200, createConflict: false };
+/** Knobs for failure scenarios, and which PR numbers GitHub reports as merged/closed. */
+const gh = { issueStatus: 200, createConflict: false, mergedPrs: new Set<number>(), closedPrs: new Set<number>(), nextPrNumber: 12 };
 
 function fakeGithub(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const url = String(input);
@@ -108,19 +108,31 @@ function fakeGithub(input: string | URL | Request, init?: RequestInit): Promise<
   if (url.includes("/pulls?state=open")) {
     const head = decodeURIComponent(/head=([^&]+)/.exec(url)?.[1] ?? "").split(":")[1] ?? "";
     const pr = openPrs.get(head);
-    return json(pr ? [pr] : []);
+    const stillOpen = pr && !gh.mergedPrs.has(pr.number) && !gh.closedPrs.has(pr.number);
+    return json(stillOpen ? [pr] : []);
   }
   if (url.endsWith("/repos/o/r/pulls") && method === "POST") {
-    if (openPrs.has(body.head) || gh.createConflict) {
+    const existing = openPrs.get(body.head);
+    const stillOpen = Boolean(existing) && !gh.mergedPrs.has(existing!.number) && !gh.closedPrs.has(existing!.number);
+    if (stillOpen || gh.createConflict) {
       gh.createConflict = false;
-      openPrs.set(body.head, { number: 12, html_url: "https://github.com/o/r/pull/12" });
+      if (!stillOpen) openPrs.set(body.head, existing ?? { number: gh.nextPrNumber, html_url: `https://github.com/o/r/pull/${gh.nextPrNumber++}` });
       return json({ message: "Validation Failed", errors: [{ message: `A pull request already exists for o:${body.head}.` }] }, 422);
     }
-    openPrs.set(body.head, { number: 12, html_url: "https://github.com/o/r/pull/12" });
-    return json({ number: 12, title: body.title, body: body.body, html_url: "https://github.com/o/r/pull/12", state: "open", head: { ref: body.head, sha: "x" }, base: { ref: "main" } }, 201);
+    const pr = { number: gh.nextPrNumber, html_url: `https://github.com/o/r/pull/${gh.nextPrNumber++}` };
+    openPrs.set(body.head, pr);
+    return json({ number: pr.number, title: body.title, body: body.body, html_url: pr.html_url, state: "open", head: { ref: body.head, sha: "x" }, base: { ref: "main" } }, 201);
   }
-  if (url.endsWith("/repos/o/r/pulls/12") && method === "PATCH") {
-    return json({ number: 12, html_url: "https://github.com/o/r/pull/12", state: "open", head: { ref: "", sha: "x" }, base: { ref: "main" } });
+  const pullNumber = /\/repos\/o\/r\/pulls\/(\d+)$/.exec(url);
+  if (pullNumber && method === "PATCH") {
+    const number = Number(pullNumber[1]);
+    return json({ number, html_url: `https://github.com/o/r/pull/${number}`, state: "open", head: { ref: "", sha: "x" }, base: { ref: "main" } });
+  }
+  if (pullNumber && method === "GET") {
+    const number = Number(pullNumber[1]);
+    const merged = gh.mergedPrs.has(number);
+    const closed = merged || gh.closedPrs.has(number);
+    return json({ number, html_url: `https://github.com/o/r/pull/${number}`, state: closed ? "closed" : "open", merged, head: { ref: "", sha: "x" }, base: { ref: "main" } });
   }
   if (url.endsWith("/issues/7/comments") && method === "POST") return json({ html_url: "https://github.com/o/r/issues/7#c1", id: 1 }, 201);
   return json({ message: `unexpected ${method} ${url}` }, 404);
@@ -132,7 +144,7 @@ beforeEach(() => {
   hooks.beforeSolve = null;
   posted.length = 0;
   openPrs.clear();
-  Object.assign(gh, { issueStatus: 200, createConflict: false });
+  Object.assign(gh, { issueStatus: 200, createConflict: false, mergedPrs: new Set<number>(), closedPrs: new Set<number>(), nextPrNumber: 12 });
   process.env.GITHUB_TOKEN = "ghp_test";
   // Model resolution needs a configured provider; the stubbed solver never calls it.
   vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test");
@@ -277,6 +289,152 @@ describe("rerunning the same issue", () => {
   });
 });
 
+describe("explicit refix", () => {
+  it("without refix, an explicit fix on an issue that already has a PR is refused", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const first = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui" });
+    await getTaskQueue().idle();
+    expect((await getTaskQueue().get(first.tasks[0]!.id))?.prUrl).toBe("https://github.com/o/r/pull/12");
+
+    const again = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui" });
+    expect(again.tasks).toEqual([]);
+    expect(again.skipped).toEqual([{ number: 7, reason: "already fixed in https://github.com/o/r/pull/12" }]);
+  });
+
+  it("re-fixes an issue that already has an open PR: same branch, force-pushed, same PR updated (not re-created), comment re-posted", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const queue = getTaskQueue();
+
+    const first = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui" });
+    await queue.idle();
+    const firstDone = await queue.get(first.tasks[0]!.id);
+    expect(firstDone?.prUrl).toBe("https://github.com/o/r/pull/12");
+    const branch = "viberon/issue-7-add-subtracts";
+    const firstHead = execFileSync("git", ["--git-dir", bare, "rev-parse", branch], { encoding: "utf8" }).trim();
+
+    const again = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui", refix: true });
+    expect(again.skipped).toEqual([]);
+    expect(again.tasks).toHaveLength(1);
+    expect(again.tasks[0]!.id).not.toBe(first.tasks[0]!.id);
+    await queue.idle();
+    const secondDone = await queue.get(again.tasks[0]!.id);
+    expect(secondDone?.error).toBeUndefined();
+    expect(secondDone?.state).toBe("done");
+    expect(secondDone?.prUrl).toBe("https://github.com/o/r/pull/12");
+
+    // The solve ran again, on the same stable branch, replacing its commit.
+    expect(solved).toHaveLength(2);
+    const secondHead = execFileSync("git", ["--git-dir", bare, "rev-parse", branch], { encoding: "utf8" }).trim();
+    expect(secondHead).not.toBe(firstHead);
+    expect(execFileSync("git", ["--git-dir", bare, "for-each-ref", "--format=%(refname)", "refs/heads/viberon"], { encoding: "utf8" }).trim()).toBe(
+      `refs/heads/${branch}`,
+    );
+    // One PR opened, then updated in place: never a second POST.
+    expect(posted.filter((p) => p.method === "POST" && p.url.endsWith("/pulls"))).toHaveLength(1);
+    expect(posted.filter((p) => p.method === "PATCH" && p.url.endsWith("/pulls/12"))).toHaveLength(1);
+    // The issue gets the evidence comment again, once per run (no duplicate within a run).
+    expect(posted.filter((p) => p.method === "POST" && p.url.endsWith("/issues/7/comments"))).toHaveLength(2);
+  });
+
+  it("refuses a second run while the issue is already queued or running, even with refix", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    hooks.beforeSolve = (options) =>
+      new Promise<void>((resolve) => {
+        if (options.signal?.aborted) resolve();
+        options.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    const first = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui" });
+    expect(first.tasks).toHaveLength(1);
+    for (let i = 0; i < 200 && solved.length < 1; i += 1) await new Promise((r) => setTimeout(r, 10));
+
+    const again = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui", refix: true });
+    expect(again.tasks).toEqual([]);
+    expect(again.skipped).toEqual([{ number: 7, reason: `is already being fixed (task ${first.tasks[0]!.id})` }]);
+
+    await getTaskQueue().cancelAll(repoKey);
+    await getTaskQueue().idle();
+  });
+
+  it("when the previous PR was merged, opens a fresh branch and a new PR instead of force-pushing the merged one", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const queue = getTaskQueue();
+
+    const first = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui" });
+    await queue.idle();
+    expect((await queue.get(first.tasks[0]!.id))?.prUrl).toBe("https://github.com/o/r/pull/12");
+    const branch = "viberon/issue-7-add-subtracts";
+    const mergedHead = execFileSync("git", ["--git-dir", bare, "rev-parse", branch], { encoding: "utf8" }).trim();
+
+    gh.mergedPrs.add(12); // GitHub now reports PR #12 as merged.
+    const again = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui", refix: true });
+    expect(again.tasks).toHaveLength(1);
+    await queue.idle();
+    const secondDone = await queue.get(again.tasks[0]!.id);
+    expect(secondDone?.error).toBeUndefined();
+    expect(secondDone?.prUrl).not.toBe("https://github.com/o/r/pull/12");
+    expect(secondDone?.note).toMatch(/previous pr .*\/pull\/12 was merged; opened new pr/i);
+
+    // The merged branch was never force-pushed: its history is exactly as it was.
+    expect(execFileSync("git", ["--git-dir", bare, "rev-parse", branch], { encoding: "utf8" }).trim()).toBe(mergedHead);
+    const created = posted.filter((p) => p.method === "POST" && p.url.endsWith("/pulls"));
+    expect(created).toHaveLength(2);
+    const newBranch = (created.at(-1)!.body as { head: string }).head;
+    expect(newBranch).not.toBe(branch);
+    expect(newBranch).toMatch(/^viberon\/issue-7-add-subtracts-2$/);
+  });
+
+  it("a closed (not merged) previous PR still gets a fresh PR, on the same reused branch", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const queue = getTaskQueue();
+
+    const first = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui" });
+    await queue.idle();
+    expect((await queue.get(first.tasks[0]!.id))?.prUrl).toBe("https://github.com/o/r/pull/12");
+    const branch = "viberon/issue-7-add-subtracts";
+
+    gh.closedPrs.add(12); // closed by a maintainer, never merged.
+    const again = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui", refix: true });
+    await queue.idle();
+    const secondDone = await queue.get(again.tasks[0]!.id);
+    expect(secondDone?.error).toBeUndefined();
+    // #12 is closed (not open): reusing the branch is safe, but it gets a fresh PR, not an update of #12.
+    expect(secondDone?.prUrl).not.toBe("https://github.com/o/r/pull/12");
+    const created = posted.filter((p) => p.method === "POST" && p.url.endsWith("/pulls"));
+    expect(created).toHaveLength(2);
+    expect((created.at(-1)!.body as { head: string }).head).toBe(branch);
+    expect(posted.filter((p) => p.method === "PATCH" && p.url.endsWith("/pulls/12"))).toEqual([]);
+  });
+
+  it("the auto-fix watcher never refixes: an already-fixed issue stays skipped", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { fixIssues } = await import("@/lib/issues");
+    const { checkRepo, setWatch } = await import("@/lib/issues/watch");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const first = await fixIssues({ repoKey, numbers: [7], deliver: true, source: "ui" });
+    await getTaskQueue().idle();
+    expect((await getTaskQueue().get(first.tasks[0]!.id))?.prUrl).toBe("https://github.com/o/r/pull/12");
+
+    await setWatch(repoKey, { enabled: true, label: "viberon", intervalMinutes: 5 });
+    const polled = await checkRepo(repoKey);
+    expect(polled.lastError).toBeUndefined();
+    // #7 is not queued again by the watcher: it is "handled" as already fixed.
+    expect(polled.handledIssues).toContain(7);
+    const tasks = await getTaskQueue().list(repoKey);
+    expect(tasks.filter((t) => t.issueUrl?.endsWith("/issues/7"))).toHaveLength(1);
+    await setWatch(repoKey, { enabled: false, label: "viberon", intervalMinutes: 5 });
+  });
+});
+
 describe("duplicate queueing", () => {
   it("a double click (or UI + watcher at once) queues an issue once", async () => {
     const { repoKey } = await registerLocalWorkspace(repo.root);
@@ -370,6 +528,14 @@ describe("issue helpers", () => {
     expect(skipReason(t("done", "https://github.com/o/r/pull/1"))).toMatch(/already fixed/);
     expect(skipReason(t("failed"))).toBeNull();
     expect(skipReason(t("done"))).toBeNull();
+  });
+
+  it("refix still refuses work in flight, but no longer refuses a delivered issue", () => {
+    const t = (state: Task["state"], prUrl?: string) => ({ id: "abc", state, prUrl }) as Task;
+    expect(skipReason(t("queued"), true)).toBe("is already being fixed (task abc)");
+    expect(skipReason(t("running"), true)).toBe("is already being fixed (task abc)");
+    expect(skipReason(t("done", "https://github.com/o/r/pull/1"), true)).toBeNull();
+    expect(skipReason(t("failed"), true)).toBeNull();
   });
 });
 

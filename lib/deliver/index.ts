@@ -29,6 +29,8 @@ import {
   findOpenPullRequest,
   getDefaultBranch,
   GitHubApiError,
+  isPullRequestMerged,
+  parsePrUrl,
   parseRemote,
   redactSecret,
   updatePullRequest,
@@ -99,6 +101,60 @@ export async function existingIssueBranch(root: string, number: number): Promise
     if (at >= 0) return ref.slice(at).trim();
   }
   return null;
+}
+
+/**
+ * A `viberon/issue-<N>-<slug>` variant not already used locally or on a
+ * remote (suffix `-2`, `-3`, …): for a refix that must not reuse the branch a
+ * merged PR used (force-pushing over it would rewrite history GitHub already
+ * merged).
+ */
+export async function freshIssueBranchName(root: string, number: number, title: string): Promise<string> {
+  const prefix = `${BRANCH_PREFIX}issue-${number}-`;
+  const refs = await runGit(root, ["for-each-ref", "--format=%(refname)", `refs/heads/${prefix}*`, `refs/remotes/*/${prefix}*`], {
+    allowFailure: true,
+  });
+  const taken = new Set(
+    refs.stdout
+      .split("\n")
+      .map((ref) => {
+        const at = ref.indexOf(prefix);
+        return at >= 0 ? ref.slice(at).trim() : "";
+      })
+      .filter(Boolean),
+  );
+  const base = issueBranchName(number, title);
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n += 1) {
+    const suffix = `-${n}`;
+    const candidate = `${base.slice(0, MAX_BRANCH_LENGTH - suffix.length)}${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
+/**
+ * Where a refix of issue `number` should land: the existing stable branch,
+ * force-pushed to update its (still open) PR — unless the previous PR is
+ * known and GitHub says it was merged, in which case a fresh branch (never
+ * force-pushed) so a new PR is opened instead of rewriting merged history.
+ * `previousPrUrl` is the issue's last known PR (from the task being
+ * re-fixed); undefined for a first run, which always gets the stable branch.
+ */
+export async function refixTarget(
+  root: string,
+  number: number,
+  title: string,
+  previousPrUrl: string | undefined,
+  opts: { token?: string | null; fetchImpl?: typeof fetch } = {},
+): Promise<{ branch: string; replaceBranch: boolean; mergedPrUrl?: string }> {
+  const existing = await existingIssueBranch(root, number);
+  const prRef = previousPrUrl ? parsePrUrl(previousPrUrl) : null;
+  if (existing && prRef) {
+    const token = opts.token === undefined ? await resolveGithubToken() : opts.token;
+    const merged = await isPullRequestMerged(prRef, { token, fetchImpl: opts.fetchImpl });
+    if (merged) return { branch: await freshIssueBranchName(root, number, title), replaceBranch: false, mergedPrUrl: previousPrUrl };
+  }
+  return { branch: existing ?? issueBranchName(number, title), replaceBranch: true };
 }
 
 /** Paths git reports as changed (staged, unstaged or untracked); both sides of a rename. */

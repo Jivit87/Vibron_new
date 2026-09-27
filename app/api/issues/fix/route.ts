@@ -1,9 +1,11 @@
 /**
- * POST /api/issues/fix { repoKey, numbers?: number[], all?: boolean, combined?: boolean, deliver?: boolean = true, model? }
+ * POST /api/issues/fix { repoKey, numbers?: number[], all?: boolean, combined?: boolean, deliver?: boolean = true, refix?: boolean, model? }
  *   → { tasks: Task[], skipped: { number, reason }[] }
  * Queues one fix task per issue (each in its own worktree of origin/<default>,
  * a draft PR per proven fix), or with `combined` one task that fixes them all
- * on one branch and opens ONE PR. `all` takes every open issue.
+ * on one branch and opens ONE PR. `all` takes every open issue. `refix`: an
+ * explicit request to fix an issue again even if it already has a PR (the
+ * runner updates that PR, or opens a new one if it was merged).
  */
 
 import { fixIssues } from "@/lib/issues";
@@ -30,6 +32,7 @@ export async function POST(request: Request) {
       ...(all ? { all } : { numbers: body.numbers as number[] }),
       combined: body.combined === true,
       deliver: body.deliver !== false,
+      refix: body.refix === true,
       source: "ui",
       ...(typeof body.prompt === "string" ? { prompt: body.prompt.slice(0, 4000) } : {}),
       ...(typeof body.model === "string" && body.model ? { model: body.model } : {}),

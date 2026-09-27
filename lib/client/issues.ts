@@ -220,11 +220,18 @@ export function issueStatus(task: IssueTask | null): IssueStatus {
   }
 }
 
-/** Whether a row can be queued: nothing in flight and no PR yet. */
+/**
+ * Whether a row can be queued: nothing in flight. A row already done with a
+ * PR can still be fixed again (an explicit re-fix updates or reopens it).
+ */
 export function canFix(row: IssueRow): boolean {
   const s = row.task?.state;
-  if (s === "queued" || s === "running") return false;
-  return !(s === "done" && row.task?.prUrl);
+  return s !== "queued" && s !== "running";
+}
+
+/** A row that already has a PR: an explicit Fix click re-fixes it (see `canFix`). */
+export function isRefix(row: IssueRow): boolean {
+  return row.task?.state === "done" && Boolean(row.task.prUrl);
 }
 
 export const POLL_ACTIVE_MS = 5_000;
@@ -286,7 +293,7 @@ export async function fetchIssues(
 export async function fixIssues(
   repoKey: string,
   numbers: number[] | "all",
-  options: { combined?: boolean; model?: string; prompt?: string } = {},
+  options: { combined?: boolean; model?: string; prompt?: string; refix?: boolean } = {},
 ): Promise<FixResult> {
   const payload = {
     repoKey,
@@ -295,6 +302,7 @@ export async function fixIssues(
     ...(options.combined ? { combined: true } : {}),
     ...(options.model && options.model !== "auto" ? { model: options.model } : {}),
     ...(options.prompt?.trim() ? { prompt: options.prompt.trim() } : {}),
+    ...(options.refix ? { refix: true } : {}),
   };
   if (isMockMode()) return normalizeFix(mockFixIssues(numbers === "all" ? [] : numbers, Boolean(options.combined)), 200);
   try {
@@ -349,10 +357,12 @@ export async function saveWatch(
 /**
  * Fix mode's "fix every GitHub issue": one task solves the open issues one by
  * one on a single branch and opens ONE pull request; its live run is attached
- * to the run view. Returns an error message, or null when it started.
+ * to the run view. An explicit click, so it re-fixes issues that already
+ * have a PR by default (`refix`). Returns an error message, or null when it
+ * started.
  */
-export async function fixAllIssuesInOnePr(repoKey: string, model?: string, prompt?: string): Promise<string | null> {
-  const result = await fixIssues(repoKey, "all", { combined: true, model, prompt });
+export async function fixAllIssuesInOnePr(repoKey: string, model?: string, prompt?: string, refix = true): Promise<string | null> {
+  const result = await fixIssues(repoKey, "all", { combined: true, model, prompt, refix });
   if (!result.ok) return result.error?.message ?? "Could not queue the fix.";
   const task = result.tasks[0];
   if (!task) return result.skipped.length ? `Nothing to fix: ${result.skipped.map((s) => `#${s.number} ${s.reason}`).join("; ")}` : "No open issues.";

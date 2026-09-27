@@ -282,10 +282,17 @@ export interface PullRequest {
   draft?: boolean;
   head: { ref: string; sha: string };
   base: { ref: string };
+  /** Only present on a single-PR GET (not on a list). */
+  merged?: boolean;
 }
 
 export function getPullRequest(pr: PrRef, opts?: ApiOptions): Promise<PullRequest> {
   return call("GET", `/repos/${pr.owner}/${pr.repo}/pulls/${pr.number}`, undefined, opts);
+}
+
+/** Whether a known PR was merged (false, including on a lookup error: never blocks a refix on it). */
+export async function isPullRequestMerged(pr: PrRef, opts?: ApiOptions): Promise<boolean> {
+  return getPullRequest(pr, opts).then((p) => Boolean(p.merged), () => false);
 }
 
 /** Unified diff of a PR. */

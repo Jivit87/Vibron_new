@@ -118,11 +118,19 @@ function forIssue(task: Task, url: string): Task {
   };
 }
 
-/** Why an issue must not be enqueued again, or null. */
-export function skipReason(task: Task | undefined): string | null {
+/**
+ * Why an issue must not be enqueued again, or null. With `refix` (an
+ * explicit user request to fix it again): a task already in flight still
+ * blocks a second run on the same issue branch (their force-with-lease
+ * pushes would fight), but a done task with a PR no longer does — the whole
+ * point of a refix is to run it again and update or reopen that PR.
+ */
+export function skipReason(task: Task | undefined, refix = false): string | null {
   if (!task) return null;
-  if (task.state === "queued" || task.state === "running") return `already ${task.state}`;
-  if (task.state === "done" && task.prUrl) return `already fixed in ${task.prUrl}`;
+  if (task.state === "queued" || task.state === "running") {
+    return refix ? `is already being fixed (task ${task.id})` : `already ${task.state}`;
+  }
+  if (!refix && task.state === "done" && task.prUrl) return `already fixed in ${task.prUrl}`;
   return null;
 }
 
@@ -186,6 +194,13 @@ export async function fixIssues(
     deliver?: boolean;
     model?: string;
     source?: "ui" | "api" | "cli" | "issue";
+    /**
+     * An explicit user request: re-fix issues that already have a PR (queue
+     * the fix again; the runner reuses the stable branch and updates the PR,
+     * or opens a new one if it was merged). Never set by the watcher, so it
+     * still skips already-fixed issues.
+     */
+    refix?: boolean;
   },
   opts?: ApiOptions,
 ): Promise<{ tasks: Task[]; skipped: SkippedIssue[] }> {
@@ -215,11 +230,13 @@ async function enqueueIssues(
   const skipped: SkippedIssue[] = [];
   for (const number of numbers) {
     const url = issueKey(issueUrl(repo, number));
-    const reason = skipReason(byIssue.get(url));
+    const prevTask = byIssue.get(url);
+    const reason = skipReason(prevTask, input.refix);
     if (reason) {
       skipped.push({ number, reason });
       continue;
     }
+    const refixOf = input.refix && prevTask?.state === "done" ? prevTask.prUrl : undefined;
     const issue = await Promise.resolve(listedByNumber.get(number) ?? getIssue({ ...repo, number }, opts)).catch((error: unknown) => {
       skipped.push({
         number,
@@ -247,6 +264,7 @@ async function enqueueIssues(
         issueUrl: issue.html_url,
         deliver: input.deliver !== false,
         ...(input.model ? { model: input.model } : {}),
+        ...(refixOf ? { refixOf } : {}),
       }),
     );
   }
