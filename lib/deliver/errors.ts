@@ -1,4 +1,4 @@
-import { GitHubApiError } from "@/lib/github-api";
+import { GitHubApiError, redactSecret } from "@/lib/github-api";
 
 /** A refusal or failure with the HTTP status the routes return as-is. */
 export class DeliverError extends Error {
@@ -16,7 +16,8 @@ export class DeliverError extends Error {
 
 /** JSON error response for the deliver/CI/tasks routes. Messages never contain the token. */
 export function errorResponse(error: unknown): Response {
-  const message = error instanceof Error ? error.message : String(error);
+  // Belt and braces: URL credentials and token-shaped strings never leave in a response.
+  const message = redactSecret(error instanceof Error ? error.message : String(error), null);
   if (error instanceof DeliverError) {
     return Response.json({ error: message, code: error.code, ...error.partial }, { status: error.status });
   }

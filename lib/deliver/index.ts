@@ -29,6 +29,7 @@ import {
   findOpenPullRequest,
   getDefaultBranch,
   parseRemote,
+  redactSecret,
   updatePullRequest,
   type ApiOptions,
   type RepoId,
@@ -81,8 +82,33 @@ function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
-function redact(text: string, token: string | null): string {
-  return token ? text.split(token).join("***") : text;
+const redact = redactSecret;
+
+/**
+ * A failed push's git output in plain language: why it failed and what to
+ * do, for the cases people hit (the remote moved, the token was refused, the
+ * branch is protected); otherwise git's own last lines.
+ */
+export function explainPushFailure(output: string): { reason: "non_fast_forward" | "auth" | "protected" | "other"; message: string } {
+  if (/protected branch|GH006|push declined due to repository rule|GH013/i.test(output)) {
+    return {
+      reason: "protected",
+      message: "the branch is protected on GitHub and does not accept direct pushes; deliver to a new branch and open a pull request instead",
+    };
+  }
+  if (/non-fast-forward|\(fetch first\)|Updates were rejected because the (?:remote contains|tip of)/i.test(output)) {
+    return {
+      reason: "non_fast_forward",
+      message: "the remote branch has new commits that are not in your local branch; pull or rebase onto it, then deliver again",
+    };
+  }
+  if (/Authentication failed|could not read Username|Invalid username or password|Permission to \S+ denied|returned error: 40[13]|Write access to repository not granted|terminal prompts disabled/i.test(output)) {
+    return {
+      reason: "auth",
+      message: "GitHub rejected the token (it may be expired, revoked, or lack write access to this repository); reconnect GitHub in Settings → Integrations",
+    };
+  }
+  return { reason: "other", message: output.split("\n").slice(-4).join(" ").slice(0, 500) };
 }
 
 /** git with the token in env config only; the rest of the environment is scrubbed. */
@@ -296,7 +322,7 @@ export async function deliver(options: DeliverOptions): Promise<DeliverResult> {
   // 4. Push; on failure the local branch and commit stay.
   const push = await gitWithAuth(root, ["push", pushRemote, `HEAD:refs/heads/${branch}`], auth);
   if (push.code !== 0) {
-    const reason = redact(push.output, token).split("\n").slice(-4).join(" ").slice(0, 500);
+    const reason = explainPushFailure(redact(push.output, token)).message;
     throw new DeliverError(
       `Push to ${fork ? `${fork.owner}/${fork.repo}` : remote} failed: ${reason || `exit ${push.code}`}. Commit ${commit.slice(0, 12)} is on local branch ${branch}; fix the cause and deliver again.`,
       "push_failed",

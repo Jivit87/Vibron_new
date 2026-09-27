@@ -15,6 +15,7 @@ import {
   DeliverError,
   deliveryTarget,
   evidenceFromResult,
+  explainPushFailure,
   MAX_BRANCH_LENGTH,
   renderPrBody,
   reportOnIssue,
@@ -203,6 +204,33 @@ describe("deliver", () => {
     expect(error.partial?.branch).toBe("viberon/fix-it");
     expect(repo.git("rev-parse", "viberon/fix-it").trim()).toBe(error.partial?.commit);
     expect(gh.calls.some((c) => c.method === "POST")).toBe(false);
+  });
+
+  it("explains a non-fast-forward push in plain language and keeps the branch and commit", async () => {
+    // The remote branch has a commit the local one does not.
+    repo.git("switch", "-q", "-c", "elsewhere");
+    repo.write("b.txt", "theirs\n");
+    repo.git("commit", "-qam", "theirs");
+    repo.git("push", "-q", "origin", "HEAD:refs/heads/viberon/moved");
+    repo.git("switch", "-q", "-");
+    repo.git("branch", "-q", "-D", "elsewhere");
+    const gh = fakeGitHub();
+    repo.write("a.txt", "fixed\n");
+    const error = (await deliver({ ...base(gh), branch: "viberon/moved", title: "Fix it", body: "" }).catch((e: unknown) => e)) as DeliverError;
+    expect(error.code).toBe("push_failed");
+    expect(error.message).toMatch(/the remote branch has new commits/);
+    expect(error.message).toContain("local branch viberon/moved");
+    expect(repo.git("rev-parse", "viberon/moved").trim()).toBe(error.partial?.commit);
+  });
+});
+
+describe("explainPushFailure", () => {
+  it("names auth failures, protected branches and non-fast-forwards", () => {
+    expect(explainPushFailure("remote: Invalid username or password.\nfatal: Authentication failed for 'https://github.com/o/r.git/'").message).toMatch(/GitHub rejected the token/);
+    expect(explainPushFailure("remote: Permission to o/r.git denied to someone.\nfatal: unable to access: The requested URL returned error: 403").reason).toBe("auth");
+    expect(explainPushFailure("remote: error: GH006: Protected branch update failed for refs/heads/main.").reason).toBe("protected");
+    expect(explainPushFailure(" ! [rejected]        HEAD -> x (fetch first)\nhint: Updates were rejected because the remote contains work").reason).toBe("non_fast_forward");
+    expect(explainPushFailure("fatal: something odd").message).toBe("fatal: something odd");
   });
 });
 
