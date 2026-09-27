@@ -11,10 +11,15 @@ import {
   normalizeSuggestions,
 } from "@/lib/client/review";
 import {
+  batchIssueElapsedMs,
+  batchIssueTotals,
+  batchTimingPct,
   branchError,
   branchSlug,
   checkState,
   ciFailureTask,
+  normalizeBatchIssueResult,
+  normalizeBatchIssueStatus,
   normalizeCi,
   normalizeDeliver,
   normalizeRerun,
@@ -260,5 +265,101 @@ describe("tasks reader", () => {
   it("shortens GitHub refs", () => {
     expect(shortRef("https://github.com/acme/textkit/pull/42")).toBe("acme/textkit#42");
     expect(shortRef("https://github.com/acme/textkit/issues/7")).toBe("acme/textkit#7");
+  });
+});
+
+describe("batch issue results", () => {
+  it("normalizes a rich issue row, defensively", () => {
+    const row = normalizeBatchIssueResult({
+      url: "https://github.com/acme/textkit/issues/52",
+      number: 52,
+      title: "slugify() drops accents",
+      status: "verified",
+      startedAt: "2026-09-27T10:00:00Z",
+      finishedAt: "2026-09-27T10:00:08Z",
+      timing: { modelMs: 4_200, toolsMs: 2_600, proofMs: 700 },
+      usage: { input: 5_400, output: 380, cached: 2_100, calls: 1 },
+      prUrl: "https://github.com/acme/textkit/pull/70",
+      fastPath: { used: true, calls: 1, accepted: true },
+    })!;
+    expect(row).toMatchObject({
+      url: "https://github.com/acme/textkit/issues/52",
+      number: 52,
+      status: "verified",
+      timing: { modelMs: 4_200, toolsMs: 2_600, proofMs: 700 },
+      usage: { input: 5_400, output: 380, cached: 2_100, calls: 1 },
+      fastPath: { used: true, calls: 1, accepted: true },
+    });
+    expect(normalizeBatchIssueResult({ number: 1 })).toBeNull();
+  });
+
+  it("maps every status alias, and falls back to the task's own state", () => {
+    expect(normalizeBatchIssueStatus("resolved")).toBe("verified");
+    expect(normalizeBatchIssueStatus("gave_up")).toBe("unproven");
+    expect(normalizeBatchIssueStatus("canceled")).toBe("cancelled");
+    expect(normalizeBatchIssueStatus(undefined, "running")).toBe("running");
+    expect(normalizeBatchIssueStatus(undefined, "done")).toBe("verified");
+  });
+
+  it("ignores empty timing and usage instead of a zeroed object", () => {
+    const row = normalizeBatchIssueResult({ url: "u", status: "running", timing: { modelMs: 0, toolsMs: 0, proofMs: 0 }, usage: {} })!;
+    expect(row.timing).toBeUndefined();
+    expect(row.usage).toBeUndefined();
+  });
+
+  it("computes elapsed time and a fallback bar for untimed rows", () => {
+    expect(batchIssueElapsedMs({ startedAt: 1_000, finishedAt: 4_000 }, 9_999)).toBe(3_000);
+    expect(batchIssueElapsedMs({ startedAt: 1_000 }, 4_000)).toBe(3_000);
+    expect(batchIssueElapsedMs({}, 4_000)).toBe(0);
+    expect(batchTimingPct(undefined)).toEqual({ modelPct: 0, toolsPct: 0, proofPct: 0 });
+    expect(batchTimingPct({ modelMs: 3, toolsMs: 1, proofMs: 0 })).toEqual({ modelPct: 75, toolsPct: 25, proofPct: 0 });
+  });
+
+  it("sums tokens and calls across a batch's rows", () => {
+    const rows = [
+      { url: "a", status: "verified" as const, usage: { input: 100, output: 10, cached: 20, calls: 1 } },
+      { url: "b", status: "running" as const, usage: { input: 50, output: 0, cached: 0, calls: 2 } },
+      { url: "c", status: "queued" as const },
+    ];
+    expect(batchIssueTotals(rows)).toEqual({ tokens: 180, calls: 3 });
+  });
+
+  it("carries a batch task's issueResults through normalizeTask", () => {
+    const t = normalizeTask({
+      id: "t1",
+      state: "running",
+      model: "claude-sonnet-5",
+      issueResults: [
+        { url: "https://github.com/acme/textkit/issues/1", status: "verified" },
+        { number: 1 },
+      ],
+    })!;
+    expect(t.model).toBe("claude-sonnet-5");
+    expect(t.issueResults).toHaveLength(1);
+    expect(t.issueResults?.[0].status).toBe("verified");
+  });
+});
+
+describe("batch rows from the server's issueProgress", () => {
+  it("reads issueProgress rows, maps boolean fastPath and fills the combined PR for fixed issues", async () => {
+    const { normalizeTask } = await import("@/lib/client/deliver");
+    const row = normalizeTask({
+      id: "t1",
+      kind: "fix",
+      repoKey: "r",
+      state: "done",
+      prUrl: "https://github.com/o/r/pull/9",
+      issueResults: [{ url: "https://github.com/o/r/issues/1", fixed: true }, { url: "https://github.com/o/r/issues/2", fixed: false }],
+      issueProgress: [
+        { url: "https://github.com/o/r/issues/1", number: 1, title: "a", status: "verified", fastPath: true, usage: { input: 1000, output: 200, cached: 0, calls: 1 }, timing: { modelMs: 900, toolsMs: 0, proofMs: 300 } },
+        { url: "https://github.com/o/r/issues/2", number: 2, title: "b", status: "unproven", detail: "gave up" },
+      ],
+    });
+    const rows = row?.issueResults ?? [];
+    expect(rows.map((r) => r.status)).toEqual(["verified", "unproven"]);
+    expect(rows[0]?.fastPath).toEqual({ used: true, calls: 1, accepted: true });
+    expect(rows[0]?.prUrl).toBe("https://github.com/o/r/pull/9");
+    expect(rows[1]?.prUrl).toBeUndefined();
+    expect(rows[0]?.usage?.calls).toBe(1);
   });
 });

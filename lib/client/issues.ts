@@ -293,7 +293,7 @@ export async function fetchIssues(
 export async function fixIssues(
   repoKey: string,
   numbers: number[] | "all",
-  options: { combined?: boolean; model?: string; prompt?: string; refix?: boolean } = {},
+  options: { combined?: boolean; model?: string; prompt?: string; refix?: boolean; autoPr?: boolean; batch?: boolean } = {},
 ): Promise<FixResult> {
   const payload = {
     repoKey,
@@ -303,8 +303,12 @@ export async function fixIssues(
     ...(options.model && options.model !== "auto" ? { model: options.model } : {}),
     ...(options.prompt?.trim() ? { prompt: options.prompt.trim() } : {}),
     ...(options.refix ? { refix: true } : {}),
+    ...(options.autoPr !== undefined ? { autoPr: options.autoPr } : {}),
+    ...(options.batch ? { batch: true } : {}),
   };
-  if (isMockMode()) return normalizeFix(mockFixIssues(numbers === "all" ? [] : numbers, Boolean(options.combined)), 200);
+  if (isMockMode()) {
+    return normalizeFix(mockFixIssues(numbers === "all" ? [] : numbers, Boolean(options.combined), Boolean(options.batch)), 200);
+  }
   try {
     const response = await fetch("/api/issues/fix", {
       method: "POST",
@@ -369,6 +373,44 @@ export async function fixAllIssuesInOnePr(repoKey: string, model?: string, promp
   const { attachTaskRun } = await import("@/lib/client/agent-stream");
   void attachTaskRun(task);
   return null;
+}
+
+export interface BatchStartOptions {
+  /** One shared pull request, vs. one per proven issue. */
+  combined: boolean;
+  /** Open pull requests for proven fixes without a manual step per issue. */
+  autoPr: boolean;
+  model?: string;
+  prompt?: string;
+}
+
+/**
+ * The batch view's "Start batch": queues every selected issue (or every open
+ * one) as ONE task whose live `issueResults[]` the batch view polls — no run
+ * view attaches. Returns the task id to poll, or an error message.
+ */
+export async function startIssueBatch(
+  repoKey: string,
+  numbers: number[] | "all",
+  options: BatchStartOptions,
+): Promise<{ ok: true; taskId: string } | { ok: false; error: string }> {
+  const result = await fixIssues(repoKey, numbers, {
+    combined: options.combined,
+    autoPr: options.autoPr,
+    model: options.model,
+    prompt: options.prompt,
+    refix: true,
+    batch: true,
+  });
+  if (!result.ok) return { ok: false, error: result.error?.message ?? "Could not start the batch." };
+  const task = result.tasks[0];
+  if (!task) {
+    return {
+      ok: false,
+      error: result.skipped.length ? `Nothing to fix: ${result.skipped.map((s) => `#${s.number} ${s.reason}`).join("; ")}` : "No open issues.",
+    };
+  }
+  return { ok: true, taskId: task.id };
 }
 
 /** Route an explicit request to fix the repository's issues through the issue pipeline. */
