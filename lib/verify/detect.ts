@@ -9,7 +9,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { IGNORED_DIRS } from "@/lib/local-disk-workspace";
@@ -82,7 +82,49 @@ const PY_SYNTAX_CHECK = [
   "sys.exit(1 if bad else 0)",
 ].join("\n");
 
+/**
+ * Files whose change can change detection. Their mtimes (plus the root and
+ * test dirs, which change when a manifest or test file is added or removed,
+ * the repo venv, and PATH) key the per-root cache.
+ */
+const DETECT_INPUTS = [
+  // A pip install that adds pytest adds bin/pytest, touching bin/.
+  ".", "tests", "test", ".venv/bin", "venv/bin",
+  "package.json", "pnpm-lock.yaml", "yarn.lock", "tsconfig.json",
+  "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "tox.ini", "pytest.ini",
+  "go.mod", "Cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts", "Makefile",
+];
+
+function detectKey(root: string): string {
+  const stamps = DETECT_INPUTS.map((rel) => {
+    try {
+      const st = statSync(path.join(root, rel));
+      return `${st.mtimeMs}:${st.size}`;
+    } catch {
+      return "-";
+    }
+  });
+  return `${process.env.PATH ?? ""}|${stamps.join("|")}`;
+}
+
+const detectCache = new Map<string, { key: string; commands: VerifyCommand[] }>();
+
+/**
+ * `detectVerifyCommands` walks the tree and probes the repo's Python for
+ * pytest (hundreds of ms). The answer only changes when a manifest does, so
+ * it is cached per root, keyed on those files' mtimes.
+ */
 export async function detectVerifyCommands(root: string): Promise<VerifyCommand[]> {
+  const resolved = path.resolve(root);
+  const key = detectKey(resolved);
+  const hit = detectCache.get(resolved);
+  if (hit?.key === key) return structuredClone(hit.commands);
+  const commands = await detectUncached(resolved);
+  detectCache.set(resolved, { key, commands: structuredClone(commands) });
+  return commands;
+}
+
+async function detectUncached(root: string): Promise<VerifyCommand[]> {
   const files = listRepoPaths(root);
   const has = new Set(files);
   const env = buildRepoEnv(root);

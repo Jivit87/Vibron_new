@@ -143,17 +143,62 @@ function newTaskId(): string {
   return `run-${stamp}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-/** Task text from --task / --task-file; a GitHub issue URL is fetched. */
+const SHORT_ISSUE_RE = /^([\w.-]+)\/([\w.-]+)#(\d+)$/;
+
+/**
+ * The GitHub issue URL a task spec names: an issue/PR URL, or `owner/repo#N`
+ * (Pramana `repo/issue.py`). Null for anything else.
+ */
+export function issueUrlFromSpec(spec: string | undefined): string | null {
+  const value = spec?.trim() ?? "";
+  if (!value || value.includes("\n")) return null;
+  if (parseGitHubIssueUrl(value)) return value;
+  const short = SHORT_ISSUE_RE.exec(value);
+  return short ? `https://github.com/${short[1]}/${short[2]}/issues/${short[3]}` : null;
+}
+
+/** A task file: `.json` with `problem_statement` (SWE-bench) or `body` is unwrapped; anything else is the text. */
+function taskFromFile(file: string, text: string): string {
+  if (file.endsWith(".json")) {
+    try {
+      const row = JSON.parse(text) as { problem_statement?: unknown; body?: unknown; title?: unknown };
+      const body = typeof row.problem_statement === "string" ? row.problem_statement : typeof row.body === "string" ? row.body : "";
+      if (body) return typeof row.title === "string" && row.title ? `${row.title}\n\n${body}` : body;
+    } catch {
+      // Not JSON after all: use the text.
+    }
+  }
+  return text.trim();
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk as Buffer));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * Task text from --task / --issue / --task-file. A spec may be a GitHub issue
+ * URL or `owner/repo#N` (fetched), `-` (stdin), a file path, or the text
+ * itself (Pramana `parse_issue`).
+ */
 export async function resolveTask(
   options: Pick<HeadlessOptions, "task" | "taskFile">,
   fetchIssue: (url: string) => ReturnType<typeof fetchGitHubIssue> = async (url) =>
     fetchGitHubIssue(url, fetch, await resolveGithubToken()),
+  stdin: () => Promise<string> = readStdin,
 ): Promise<string> {
   let task = options.task?.trim() ?? "";
-  if (!task && options.taskFile) task = (await readFile(options.taskFile, "utf8")).trim();
-  if (!task) throw new Error("A task is required (--task or --task-file).");
-  if (parseGitHubIssueUrl(task)) {
-    const issue = await fetchIssue(task);
+  if (!task && options.taskFile) task = taskFromFile(options.taskFile, await readFile(options.taskFile, "utf8"));
+  else if (task === "-") task = (await stdin()).trim();
+  else if (task && !task.includes("\n") && task.length < 1024 && !issueUrlFromSpec(task)) {
+    const file = path.resolve(task.replace(/^~(?=\/)/, os.homedir()));
+    if (existsSync(file) && statSync(file).isFile()) task = taskFromFile(file, await readFile(file, "utf8"));
+  }
+  if (!task) throw new Error("A task is required (--task, --issue or --task-file).");
+  const url = issueUrlFromSpec(task);
+  if (url) {
+    const issue = await fetchIssue(url);
     task = `${issue.title}\n\n${issue.body}\n\n(Issue: ${issue.url})`;
   }
   return task;
@@ -176,7 +221,7 @@ async function createWorktree(repo: string, taskId: string): Promise<string> {
 }
 
 function issueFromTask(task: string | undefined): string | undefined {
-  return task && parseGitHubIssueUrl(task.trim()) ? task.trim() : undefined;
+  return issueUrlFromSpec(task) ?? undefined;
 }
 
 /** Deliver a resolved run (and report on the issue); failures are returned, never thrown. */

@@ -8,8 +8,11 @@
  * adapter degrades it to OpenAI-style messages.
  */
 
-/** "openai" = any OpenAI-compatible endpoint (OpenAI, Azure, Gemini, OpenRouter, vLLM, Ollama, …). */
-export type ProviderId = "anthropic" | "groq" | "openai" | "nvidia" | "gemini";
+/**
+ * "openai" = any OpenAI-compatible endpoint (OpenAI, Azure, Gemini, OpenRouter, vLLM, Ollama, …).
+ * "claude-cli" = a locally logged-in Claude Code CLI (`claude -p`, subscription, no API key).
+ */
+export type ProviderId = "anthropic" | "groq" | "openai" | "nvidia" | "gemini" | "deepseek" | "claude-cli";
 
 /** A single message in the running conversation. */
 export interface AiMessage {
@@ -158,6 +161,8 @@ export interface AiTurnResult {
   refusal?: { category: string | null; explanation?: string };
   /** Full assistant content, ready to append to `messages` for the next turn. */
   content: AiContent[];
+  /** USD the provider itself reported for this turn (the Claude CLI does); wins over the price table. */
+  costUsd?: number;
 }
 
 /** Streaming callbacks fired while a turn is in flight. */
@@ -188,20 +193,21 @@ export interface AiProvider {
   ): Promise<AiTurnResult>;
 }
 
+const MISSING_CREDENTIAL: Record<ProviderId, string> = {
+  anthropic: "No Anthropic API key configured. Add one in Settings → Providers, or set ANTHROPIC_API_KEY.",
+  groq: "No Groq API key configured. Add one in Settings → Providers, or set GROQ_API_KEY.",
+  nvidia: "No NVIDIA API key configured. Add one in Settings → Providers, or set NVIDIA_API_KEY.",
+  gemini: "No Gemini API key configured. Add one in Settings → Providers, or set GEMINI_API_KEY.",
+  deepseek: "No DeepSeek API key configured. Add one in Settings → Providers, or set DEEPSEEK_API_KEY.",
+  "claude-cli":
+    "The Claude CLI is not available: install Claude Code so `claude` is on PATH, then run `claude auth login` (a Claude subscription, no API key).",
+  openai: "No OpenAI-compatible API key configured. Set AI_API_KEY (and AI_BASE_URL / AI_MODEL for other endpoints).",
+};
+
 /** Raised when a provider has no credential configured. */
 export class MissingCredentialError extends Error {
   constructor(readonly provider: ProviderId) {
-    super(
-      provider === "anthropic"
-        ? "No Anthropic API key configured. Add one in Settings → Providers, or set ANTHROPIC_API_KEY."
-        : provider === "groq"
-          ? "No Groq API key configured. Add one in Settings → Providers, or set GROQ_API_KEY."
-          : provider === "nvidia"
-            ? "No NVIDIA API key configured. Add one in Settings → Providers, or set NVIDIA_API_KEY."
-            : provider === "gemini"
-              ? "No Gemini API key configured. Add one in Settings → Providers, or set GEMINI_API_KEY."
-            : "No OpenAI-compatible API key configured. Set AI_API_KEY (and AI_BASE_URL / AI_MODEL for other endpoints).",
-    );
+    super(MISSING_CREDENTIAL[provider]);
     this.name = "MissingCredentialError";
   }
 }

@@ -3,7 +3,7 @@
  * VIBERON_STORE=memory before any store module loads); this module has no
  * side effects so tests can import `parseCliArgs`.
  *
- *   viberon run --repo <path> (--task <text|issue-url> | --task-file <file>)
+ *   viberon run --repo <path> (--task <spec> | --issue <spec> | --task-file <file>)
  *               [--worktree] [--keep-worktree] [--out <dir>] [--test-cmd <cmd>]
  *               [--no-gate] [--max-turns <n>] [--timeout <sec>] [--model <id>]
  *               [--task-id <id>] [--json] [--review [--review-model <id>]]
@@ -12,11 +12,13 @@
  *   viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--no-deliver] [--model <id>] [--json]
  *   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
  *   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
+ *   viberon swe --ids a,b [--model <id>] [--limit <n>] [--max-turns <n>] [--timeout <sec>] [--data <file>] [--out <dir>] [--gold]
  *   viberon arena report <results.jsonl> [--json]
  */
 
 export const USAGE = `Usage:
-  viberon run --repo <path> (--task <text|issue-url> | --task-file <file>) [options]
+  viberon run --repo <path> (--task <spec> | --issue <spec> | --task-file <file>) [options]
+      <spec> is the task text, a GitHub issue URL, owner/repo#N, a file path, or - (stdin)
       --worktree          work in a detached git worktree of HEAD (original untouched)
       --keep-worktree     do not delete the worktree afterwards
       --out <dir>         evidence bundle dir (default <repo>/.viberon/runs/<task-id>)
@@ -40,6 +42,9 @@ export const USAGE = `Usage:
       worktree of origin/<default>, and opens a draft PR for every fix its checks prove
   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
+  viberon swe --ids a,b [--model <id>] [--limit <n>] [--max-turns <n>] [--timeout <sec>] [--data <rows.json>] [--out <dir>] [--gold]
+      SWE-bench Verified instances graded by their hidden tests (FAIL_TO_PASS / PASS_TO_PASS);
+      --gold applies the official patch instead of running the agent (validates the environment)
   viberon arena report <results.jsonl> [--json]
       compares harnesses on tasks completed by every harness; ranks by fixes, tokens, then time
 
@@ -112,11 +117,23 @@ export interface ArenaArgs {
   json: boolean;
 }
 
-export type CliArgs = RunArgs | ReviewArgs | IssuesArgs | CloneArgs | EvalArgs | ArenaArgs | { command: "help" };
+export interface SweArgs {
+  command: "swe";
+  ids: string[];
+  model?: string;
+  limit?: number;
+  maxTurns?: number;
+  timeoutSec?: number;
+  data?: string;
+  out?: string;
+  gold: boolean;
+}
+
+export type CliArgs = RunArgs | ReviewArgs | IssuesArgs | CloneArgs | EvalArgs | SweArgs | ArenaArgs | { command: "help" };
 
 export class CliError extends Error {}
 
-const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-deliver", "independent-test"]);
+const BOOLEAN_FLAGS = new Set(["worktree", "keep-worktree", "no-gate", "json", "setup", "help", "deliver", "review", "no-deliver", "independent-test", "gold"]);
 
 function splitFlags(argv: string[]): { flags: Map<string, string | true>; positionals: string[] } {
   const flags = new Map<string, string | true>();
@@ -160,7 +177,7 @@ function stringFlag(flags: Map<string, string | true>, name: string): string | u
 
 const KNOWN: Record<string, Set<string>> = {
   run: new Set([
-    "repo", "task", "task-file", "task-id", "worktree", "keep-worktree", "out", "test-cmd",
+    "repo", "task", "issue", "task-file", "task-id", "worktree", "keep-worktree", "out", "test-cmd",
     "no-gate", "max-turns", "timeout", "model", "json", "help", "deliver", "issue-url",
     "review", "review-model", "independent-test",
   ]),
@@ -168,6 +185,7 @@ const KNOWN: Record<string, Set<string>> = {
   issues: new Set(["repo", "label", "fix", "no-deliver", "model", "json", "help"]),
   clone: new Set(["ref", "depth", "setup", "json", "help"]),
   eval: new Set(["only", "model", "max-turns", "timeout", "help"]),
+  swe: new Set(["ids", "model", "limit", "max-turns", "timeout", "data", "out", "gold", "help"]),
   arena: new Set(["json", "help"]),
 };
 
@@ -191,10 +209,11 @@ export function parseCliArgs(argv: string[]): CliArgs {
   if (command === "run") {
     const repo = stringFlag(flags, "repo") ?? positionals[0];
     if (!repo) throw new CliError("run: --repo is required");
-    const task = stringFlag(flags, "task");
+    const specs = [stringFlag(flags, "task"), stringFlag(flags, "issue")].filter((s) => s !== undefined);
+    const task = specs[0];
     const taskFile = stringFlag(flags, "task-file");
-    if (!task && !taskFile) throw new CliError("run: --task or --task-file is required");
-    if (task && taskFile) throw new CliError("run: use only one of --task and --task-file");
+    if (!task && !taskFile) throw new CliError("run: --task, --issue or --task-file is required");
+    if (specs.length + (taskFile ? 1 : 0) > 1) throw new CliError("run: use only one of --task, --issue and --task-file");
     const issueUrl = stringFlag(flags, "issue-url");
     if (issueUrl && !flags.has("deliver")) throw new CliError("run: --issue-url needs --deliver");
     const reviewModel = stringFlag(flags, "review-model");
@@ -266,6 +285,21 @@ export function parseCliArgs(argv: string[]): CliArgs {
       depth: intFlag(flags, "depth"),
       setup: flags.has("setup"),
       json: flags.has("json"),
+    };
+  }
+  if (command === "swe") {
+    const ids = (stringFlag(flags, "ids") ?? positionals.join(",")).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!ids.length) throw new CliError("swe: --ids a,b is required");
+    return {
+      command,
+      ids,
+      model: stringFlag(flags, "model"),
+      limit: intFlag(flags, "limit"),
+      maxTurns: intFlag(flags, "max-turns"),
+      timeoutSec: intFlag(flags, "timeout"),
+      data: stringFlag(flags, "data"),
+      out: stringFlag(flags, "out"),
+      gold: flags.has("gold"),
     };
   }
   const only = stringFlag(flags, "only");
@@ -434,6 +468,27 @@ export async function main(argv: string[]): Promise<number> {
       return 0;
     } catch (error) {
       log(`clone failed: ${error instanceof Error ? error.message : String(error)}`);
+      return 2;
+    }
+  }
+
+  if (args.command === "swe") {
+    try {
+      const { runSwe } = await import("@/eval/swe/run");
+      const summary = await runSwe({
+        ids: args.ids,
+        model: args.model,
+        limit: args.limit,
+        maxTurns: args.maxTurns,
+        timeoutMs: args.timeoutSec ? args.timeoutSec * 1000 : undefined,
+        dataFile: args.data,
+        resultsDir: args.out,
+        gold: args.gold,
+        log,
+      });
+      return summary.resolved === summary.total ? 0 : 1;
+    } catch (error) {
+      log(`swe failed: ${error instanceof Error ? error.message : String(error)}`);
       return 2;
     }
   }

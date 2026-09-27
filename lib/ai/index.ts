@@ -7,7 +7,8 @@
 
 import { anthropicProvider } from "@/lib/ai/anthropic";
 import { groqProvider } from "@/lib/ai/groq";
-import { geminiProvider, nvidiaProvider, openaiCompatProvider } from "@/lib/ai/openai-compat";
+import { claudeCliProvider, claudeCliReady } from "@/lib/ai/claude-cli";
+import { deepseekProvider, geminiProvider, nvidiaProvider, openaiCompatProvider } from "@/lib/ai/openai-compat";
 import { getApiKey } from "@/lib/ai/credentials";
 import { geminiCatalog, geminiModelUsable } from "@/lib/ai/gemini-catalog";
 import { ModelUnavailableError, nvidiaCatalog, nvidiaModelUsable } from "@/lib/ai/nvidia-catalog";
@@ -38,7 +39,17 @@ const PROVIDERS: Record<ProviderId, AiProvider> = {
   openai: openaiCompatProvider,
   nvidia: nvidiaProvider,
   gemini: geminiProvider,
+  deepseek: deepseekProvider,
+  "claude-cli": claudeCliProvider,
 };
+
+/** A provider can serve turns: a key, or (Claude CLI) a logged-in `claude` binary. */
+async function providerReady(provider: ProviderId): Promise<boolean> {
+  if (provider === "claude-cli") return claudeCliReady();
+  // A keyless OpenAI-compatible endpoint (Ollama, vLLM) is named by its base URL alone.
+  if (provider === "openai" && process.env.AI_BASE_URL?.trim()) return true;
+  return Boolean(await getApiKey(provider));
+}
 
 /**
  * Test seam: route every turn through one scripted provider and treat every
@@ -63,9 +74,7 @@ export async function ensureModelReady(model: string): Promise<void> {
   if (override) return;
   const spec = getModel(model);
   if (!spec) throw new Error(`Unknown model: ${model}`);
-  const ready =
-    spec.provider === "openai" ? PROVIDERS.openai.isConfigured() : Boolean(await getApiKey(spec.provider));
-  if (!ready) throw new MissingCredentialError(spec.provider);
+  if (!(await providerReady(spec.provider))) throw new MissingCredentialError(spec.provider);
 }
 
 export interface EnrichedTurnResult extends AiTurnResult {
@@ -170,7 +179,7 @@ async function runTurnOnce(
   return {
     ...result,
     model: request.model,
-    cost: estimateCost(request.model, result.usage),
+    cost: result.costUsd ?? estimateCost(request.model, result.usage),
     uncachedCost: estimateUncachedCost(request.model, result.usage),
   };
 }
@@ -187,11 +196,14 @@ export async function availableModels(): Promise<
   if (envId) ensureModel(envId);
   const keys = await Promise.all(
     (Object.keys(PROVIDERS) as ProviderId[]).map(
-      async (id) =>
-        [id, override !== null || Boolean(await getApiKey(id))] as const,
+      async (id) => [id, override !== null || (await providerReady(id))] as const,
     ),
   );
   const configured = new Map(keys);
+  // The Claude CLI (a subscription login) serves automatic picks only when no
+  // API-key provider can: a configured key means the user chose that
+  // provider. Naming a CLI model explicitly still works (resolveModel).
+  if (keys.some(([id, ready]) => ready && id !== "claude-cli")) configured.set("claude-cli", false);
   // NVIDIA and Gemini retire models and list ones a key cannot call, so
   // their models are only "available" when the live catalog includes them.
   // Reading Gemini's catalog also registers its current models.
@@ -208,7 +220,7 @@ export async function availableModels(): Promise<
   });
 }
 
-const PROVIDER_PREFERENCE: ProviderId[] = ["anthropic", "gemini", "nvidia", "openai", "groq"];
+const PROVIDER_PREFERENCE: ProviderId[] = ["anthropic", "deepseek", "gemini", "nvidia", "openai", "groq", "claude-cli"];
 
 /**
  * Best available model at or above a tier, preferring Anthropic because its
@@ -219,6 +231,7 @@ export async function resolveModel(
   preferred: string | "auto",
   opts: { agenticOnly?: boolean } = {},
 ): Promise<string> {
+  if (getModel(preferred)?.provider === "claude-cli" && (override !== null || (await claudeCliReady()))) return preferred;
   const models = await availableModels();
   const usable = models.filter(
     ({ spec, available }) => available && (!opts.agenticOnly || spec.agentic),
@@ -240,9 +253,12 @@ export async function resolveModel(
   }
 
   // An explicitly configured model (AI_MODEL) wins "auto": evaluation runs
-  // name the one model everyone must use.
+  // name the one model everyone must use. A bare id also matches a
+  // provider-prefixed one (AI_MODEL=deepseek-v4-flash → deepseek:deepseek-v4-flash).
   const envId = envModelId();
-  const envMatch = envId ? usable.find((m) => m.spec.id === envId) : undefined;
+  const envMatch = envId
+    ? (usable.find((m) => m.spec.id === envId) ?? usable.find((m) => m.spec.id.endsWith(`:${envId}`)))
+    : undefined;
   if (envMatch) return envMatch.spec.id;
 
   const rank: Record<string, number> = { frontier: 0, balanced: 1, fast: 2 };
