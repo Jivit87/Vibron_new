@@ -284,8 +284,31 @@ export type OrchestrationEvent =
       tokensIn: number;
       tokensOut: number;
       tokensCached: number;
+      /** Tokens written to the provider prompt cache (billed at ~1.25x input). */
+      tokensCacheWrite?: number;
       costUsd: number;
       uncachedUsd: number;
+    }
+  /**
+   * Usage of one model call, emitted right after it returns. Drives the
+   * per-turn timeline and the context-window meter; the `ledger` event stays
+   * the authoritative run total.
+   */
+  | {
+      type: "turn_usage";
+      agentId: string;
+      model: string;
+      /** Uncached input tokens. */
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      costUsd: number;
+      /** What the same call would have cost with no prompt caching. */
+      uncachedUsd: number;
+      /** Size of the prompt plus reply: how full the context window is. */
+      contextTokens: number;
+      at: number;
     }
   | { type: "wave_start"; wave: number; stepIds: string[] }
   | { type: "wave_end"; wave: number }

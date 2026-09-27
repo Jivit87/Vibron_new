@@ -14,6 +14,7 @@ import type { ApprovalDecision, OrchestrationEvent, RunPlan, RunStatus } from "@
 import { RUN_ID_HEADER, type AgentRequest, type Interaction } from "@/lib/harness/contracts";
 import type { ContextAttachment, ImageAttachment } from "@/lib/composer/types";
 import { answerMockApproval, isMockMode, mockResponse, mockScript, mockTaskScript } from "@/lib/client/mock-run";
+import { useUsageStore } from "@/store/usage";
 import { useViberon } from "@/store/viberon";
 
 /** Parse one `data:`-prefixed SSE frame. */
@@ -155,7 +156,7 @@ export async function sendPrompt(
     conversational: true,
     open: (signal) =>
       isMockMode()
-        ? Promise.resolve(mockResponse(mockScript({ prompt: trimmed, interaction, plan: options.plan }), signal))
+        ? Promise.resolve(mockResponse(mockScript({ prompt: trimmed, interaction, plan: options.plan, graph: store.graph }), signal))
         : fetch("/api/agent", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -237,6 +238,10 @@ async function pumpRun({
     if (queue.length === 0) return;
     const batch = queue.splice(0, queue.length);
     useViberon.getState().applyEvents(batch);
+    // Usage is attributed to the run the batch belongs to (known once applied).
+    const usage = useUsageStore.getState();
+    const runId = useViberon.getState().run?.id;
+    for (const event of batch) usage.ingest(runId, event);
   };
   const schedule = () => {
     if (flushHandle !== null) return;

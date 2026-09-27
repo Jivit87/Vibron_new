@@ -20,6 +20,10 @@ import {
   type NoteOverlayNode,
 } from "@/lib/client/memory-graph";
 import { Segmented } from "@/components/vibe/primitives";
+import { SCOPE_OPTIONS, useUsage } from "@/components/vibe/usage-ui";
+import { computeHeat, heatAlpha, heatIntensity, type HeatMap } from "@/lib/client/usage-heat";
+import { formatTok, type UsageScope } from "@/lib/client/usage";
+import { useUsageStore } from "@/store/usage";
 import { useViberon } from "@/store/viberon";
 
 /**
@@ -183,6 +187,9 @@ export function BubbleGraph() {
   const setExpandedFolders = useViberon((s) => s.setExpandedFolders);
   const repoKey = useViberon((s) => s.repoKey);
   const rootPath = useViberon((s) => s.rootPath);
+  // Token heatmap: an independent layer, composable with the memory overlay.
+  const heatOn = useUsageStore((s) => s.graphHeat);
+  const { scope: heatScope, usage } = useUsage();
 
   // Memory overlay: vault notes drawn over the code graph.
   const [layer, setLayer] = useState<"code" | "memory">("code");
@@ -285,6 +292,11 @@ export function BubbleGraph() {
     if (!graph) return null;
     return aggregate(graph, expandedFolders);
   }, [graph, expandedFolders]);
+
+  const heat = useMemo<HeatMap | null>(() => {
+    if (!heatOn || !graph || !renderGraph) return null;
+    return computeHeat(graph, renderGraph.symbolToRenderId, usage.files, usage.nodes);
+  }, [heatOn, graph, renderGraph, usage.files, usage.nodes]);
 
   const overlay = useMemo(() => {
     if (layer !== "memory" || !memGraph || !graph || !renderGraph) return null;
@@ -597,7 +609,12 @@ export function BubbleGraph() {
             const isPulsed = pulseSet.has(n.id);
             const isHovered = hoveredId === n.id;
             const baseR = nodeRadius(n);
-            const r = isSelected ? baseR * 1.25 : isPulsed ? baseR * 1.1 : baseR;
+            // Heatmap: one hue (the accent) whose opacity carries the value; hot
+            // symbols also grow a little, since expanded symbols are small.
+            const nodeHeat = heat?.byRenderId.get(n.id);
+            const intensity = heat ? heatIntensity(nodeHeat?.tokens ?? 0, heat.max) : 0;
+            const heatScale = !isFolder && intensity > 0 ? 1 + 0.6 * intensity : 1;
+            const r = (isSelected ? baseR * 1.25 : isPulsed ? baseR * 1.1 : baseR) * heatScale;
             const px = 1 / Math.max(scale, 1);
 
             const prevAlpha = ctx.globalAlpha;
@@ -614,16 +631,27 @@ export function BubbleGraph() {
             } else {
               alpha = 1.0;
             }
+            // With the heatmap on, nodes that sent nothing recede.
+            if (heat && intensity === 0 && !isPulsed && !isSelected && !isHovered) alpha *= 0.4;
             ctx.globalAlpha = alpha;
 
             // Flat fill + 1px outline. Folder super-nodes use a dashed
             // outline so they read as containers.
-            ctx.fillStyle = isFolder ? folderFill : symbolFill;
+            if (heat && intensity > 0) {
+              ctx.fillStyle = pal.bgBase;
+              ctx.beginPath();
+              ctx.arc(n.x, n.y, r, 0, 2 * Math.PI);
+              ctx.fill();
+              ctx.fillStyle = withAlpha(pal.accent, heatAlpha(intensity));
+            } else {
+              ctx.fillStyle = isFolder ? folderFill : symbolFill;
+            }
             ctx.beginPath();
             ctx.arc(n.x, n.y, r, 0, 2 * Math.PI);
             ctx.fill();
 
             let outline = isFolder ? folderStroke : symbolStroke;
+            if (heat && intensity > 0) outline = withAlpha(pal.accent, 0.5 + 0.5 * intensity);
             if (isHovered) outline = pal.textMid;
             if (isPulsed) outline = pal.add;
             if (isSelected) outline = pal.accent;
@@ -645,7 +673,7 @@ export function BubbleGraph() {
               ctx.font = `500 ${badgeFont}px ui-monospace, Menlo, monospace`;
               ctx.textAlign = "center";
               ctx.textBaseline = "middle";
-              ctx.fillStyle = pal.textMid;
+              ctx.fillStyle = heat && intensity > 0.55 ? pal.bgBase : pal.textMid;
               ctx.fillText(sizeText, n.x, n.y);
             }
 
@@ -738,6 +766,14 @@ export function BubbleGraph() {
               `;
             }
             const isRetrieved = pulseSet.has(node.id);
+            const h = heat?.byRenderId.get(node.id);
+            const heatLine = heat
+              ? `<div style="${TOOLTIP_DIM} margin-top: 4px;">${
+                  h && h.tokens > 0
+                    ? `<span style="color: var(--vb-text)">${escapeHtml(formatTok(h.tokens))} tokens</span> sent · ${Number(h.reads)} read${h.reads === 1 ? "" : "s"}${node.kind === "folder" ? ` · ${Number(h.files)} file${h.files === 1 ? "" : "s"}` : " · click to open"}`
+                  : "no context sent"
+                }</div>`
+              : "";
             const nameColor =
               node.id === selectedNodeId ? "var(--vb-accent)" : "var(--vb-text)";
             const status = isRetrieved
@@ -753,6 +789,7 @@ export function BubbleGraph() {
                     ${status}
                   </div>
                   <div style="${TOOLTIP_DIM} margin-top: 4px;">${Number(node.totalLoc ?? 0)} total LOC · click to expand</div>
+                  ${heatLine}
                 </div>
               `;
             }
@@ -766,6 +803,7 @@ export function BubbleGraph() {
                   ${status}
                 </div>
                 <div style="${TOOLTIP_DIM} margin-top: 4px;">${Number(sym?.loc ?? 0)} LOC · lines ${Number(sym?.startLine ?? 0)}–${Number(sym?.endLine ?? 0)}</div>
+                ${heatLine}
               </div>
             `;
           }}
@@ -784,7 +822,12 @@ export function BubbleGraph() {
               return;
             }
             if (typeof n.id === "string") {
-              useViberon.getState().selectNode(n.id);
+              const store = useViberon.getState();
+              store.selectNode(n.id);
+              // With the heatmap on, a hot symbol opens where its tokens went.
+              if (heat?.byRenderId.get(n.id) && n.symbol?.file) {
+                store.openTab(n.symbol.file, undefined, { preview: true });
+              }
             }
           }}
         />
@@ -860,6 +903,20 @@ export function BubbleGraph() {
           )}
         </div>
         <div className="pointer-events-auto flex shrink-0 items-center gap-2">
+        <button
+          type="button"
+          onClick={() => useUsageStore.getState().setGraphHeat(!heatOn)}
+          aria-pressed={heatOn}
+          title="Shade nodes by context tokens sent to the model"
+          className="h-[24px] rounded-[4px] px-2 text-[11.5px] font-medium hover:bg-[var(--vb-hover)]"
+          style={{
+            ...panelStyle,
+            color: heatOn ? "var(--vb-text-hi)" : "var(--vb-text-dim)",
+            background: heatOn ? "var(--vb-active)" : panelStyle.background,
+          }}
+        >
+          Tokens
+        </button>
         <div className="rounded-[4px] p-px" style={panelStyle}>
           <Segmented<"code" | "memory">
             value={layer}
@@ -911,6 +968,7 @@ export function BubbleGraph() {
 
       {/* Bottom-left legend */}
       <div className="pointer-events-none absolute bottom-4 left-4 flex flex-col gap-2">
+        {heat && <HeatLegend heat={heat} scope={heatScope} accent={pal.accent} />}
         <div className="rounded-[4px] px-2.5 py-2" style={panelStyle}>
           <div className="mb-1.5 text-[11px]" style={{ color: "var(--vb-text-dim)" }}>
             Legend
@@ -992,6 +1050,47 @@ export function BubbleGraph() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Heatmap key: the ramp, its range, and which scope it shows. */
+function HeatLegend({ heat, scope, accent }: { heat: HeatMap; scope: UsageScope; accent: string }) {
+  const steps = [0.1, 0.3, 0.5, 0.75, 1];
+  return (
+    <div className="pointer-events-auto flex w-[252px] flex-col gap-2 rounded-[4px] px-2.5 py-2" style={panelStyle}>
+      <div className="flex items-center gap-2">
+        <span className="whitespace-nowrap text-[11px]" style={{ color: "var(--vb-text-dim)" }}>
+          Context tokens
+        </span>
+        <span className="flex-1" />
+        <Segmented<UsageScope>
+          value={scope}
+          options={SCOPE_OPTIONS}
+          onChange={(next) => useUsageStore.getState().setScope(next)}
+        />
+      </div>
+      {heat.max > 0 ? (
+        <>
+          <div className="flex h-2 overflow-hidden rounded-[2px]" style={{ background: "var(--vb-bg-base)" }}>
+            {steps.map((step) => (
+              <span key={step} className="h-full flex-1" style={{ background: withAlpha(accent, heatAlpha(step)) }} />
+            ))}
+          </div>
+          <div className="flex items-center font-mono text-[10.5px]" style={{ color: "var(--vb-text-faint)" }}>
+            <span>0</span>
+            <span className="flex-1" />
+            <span>{formatTok(heat.max)}</span>
+          </div>
+          <div className="text-[11px]" style={{ color: "var(--vb-text-mid)" }}>
+            {heat.hotFiles} file{heat.hotFiles === 1 ? "" : "s"} · {heat.hotSymbols} symbol{heat.hotSymbols === 1 ? "" : "s"} in context
+          </div>
+        </>
+      ) : (
+        <div className="text-[11px] leading-snug" style={{ color: "var(--vb-text-dim)" }}>
+          No context sent in this scope yet.
+        </div>
+      )}
     </div>
   );
 }

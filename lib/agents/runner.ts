@@ -498,6 +498,19 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
       turn.usage.cacheReadTokens +
       turn.usage.cacheWriteTokens +
       turn.usage.outputTokens;
+    input.emit({
+      type: "turn_usage",
+      agentId: input.agentId,
+      model: input.model,
+      inputTokens: turn.usage.inputTokens,
+      outputTokens: turn.usage.outputTokens,
+      cacheReadTokens: turn.usage.cacheReadTokens,
+      cacheWriteTokens: turn.usage.cacheWriteTokens,
+      costUsd: turn.cost,
+      uncachedUsd: turn.uncachedCost,
+      contextTokens,
+      at: Date.now(),
+    });
   }
 
   function truncationRecovery(detail: string): void {

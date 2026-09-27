@@ -10,6 +10,7 @@ import { toast } from "sonner";
 
 import { AssistantMessage } from "@/components/AssistantMessage";
 import { AgentRunView } from "@/components/vibe/AgentRunView";
+import { MessageUsage } from "@/components/vibe/usage-ui";
 import { Composer } from "@/components/vibe/Composer";
 import { ConversationHistory } from "@/components/vibe/ConversationHistory";
 import { useViberon, type ChatMessage, type RunState } from "@/store/viberon";
@@ -203,6 +204,7 @@ function MessageBlock({
       {(message.content.trim() || (streaming && !run)) && (
         <div className="relative">
           <AssistantMessage content={message.content} />
+          {!streaming && <MessageUsage message={message} />}
           {message.content && (
             <button
               type="button"

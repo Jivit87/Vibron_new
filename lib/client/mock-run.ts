@@ -9,6 +9,8 @@
  */
 
 import type { OrchestrationEvent, RunPlan } from "@/lib/agents/events";
+import { MODELS } from "@/lib/ai/models";
+import type { LedgerEvent, LedgerSnapshot } from "@/lib/context/ledger";
 import type { Interaction } from "@/lib/harness/contracts";
 import type { GitSnapshot, ProblemsResult } from "@/lib/client/workspace-types";
 
@@ -120,6 +122,219 @@ function ledger(tokensIn: number, tokensOut: number, costUsd: number): Orchestra
   };
 }
 
+/* ------------------------------ mock usage -------------------------------- */
+
+/** The slice of a code graph the mock needs to attribute context. */
+export interface MockGraph {
+  nodes: { id: string; file: string; loc: number }[];
+}
+
+interface MockTarget {
+  path: string;
+  nodeIds: string[];
+  /** Whole-file token estimate, the naive baseline for a read. */
+  tokens: number;
+}
+
+const FALLBACK_TARGETS: MockTarget[] = [
+  { path: "src/components/Header.tsx", nodeIds: ["src/components/Header.tsx#Header"], tokens: 820 },
+  { path: "src/hooks/useTheme.ts", nodeIds: ["src/hooks/useTheme.ts#useTheme"], tokens: 610 },
+  { path: "src/app/layout.tsx", nodeIds: ["src/app/layout.tsx#RootLayout"], tokens: 1_400 },
+  { path: "src/lib/settings.ts", nodeIds: ["src/lib/settings.ts#loadSettings", "src/lib/settings.ts#saveSettings"], tokens: 2_300 },
+  { path: "src/components/Nav.tsx", nodeIds: ["src/components/Nav.tsx#Nav"], tokens: 900 },
+  { path: "src/styles/theme.css", nodeIds: [], tokens: 700 },
+];
+
+/**
+ * Real files and symbol ids from the open workspace's graph, so the usage
+ * panel's "Top context" opens real files and the graph heatmap lights real
+ * nodes. Deterministic: the files with the most symbols, tests skipped.
+ */
+export function mockTargets(graph?: MockGraph | null): MockTarget[] {
+  if (!graph || graph.nodes.length === 0) return FALLBACK_TARGETS;
+  const byFile = new Map<string, { ids: string[]; loc: number }>();
+  for (const node of graph.nodes) {
+    if (/(^|\/)(tests?|__tests__)\/|\.test\./.test(node.file)) continue;
+    const entry = byFile.get(node.file) ?? { ids: [], loc: 0 };
+    entry.ids.push(node.id);
+    entry.loc += Math.max(1, node.loc);
+    byFile.set(node.file, entry);
+  }
+  const ranked = [...byFile.entries()]
+    .sort((a, b) => b[1].ids.length - a[1].ids.length || a[0].localeCompare(b[0]))
+    .slice(0, 8)
+    .map(([path, entry]) => ({ path, nodeIds: entry.ids, tokens: Math.max(2_400, Math.round(entry.loc * 40)) }));
+  return ranked.length >= 3 ? ranked : FALLBACK_TARGETS;
+}
+
+/**
+ * Accumulates a believable run's usage while the script is built: per-call
+ * `turn_usage` events, and cumulative `ledger` snapshots whose events carry
+ * paths and node ids. Totals always equal the sum of the calls (plus a
+ * small planning call), so every view can be checked against the others.
+ */
+class MockUsage {
+  private turns: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; uncached: number }[] = [];
+  private events: LedgerEvent[] = [];
+  private files = new Map<string, { path: string; sentTokens: number; dedupedTokens: number; reads: number }>();
+  private nodes = new Map<string, { id: string; sentTokens: number; dedupedTokens: number; reads: number }>();
+  private sources = new Map<string, { source: string; tokens: number; dedupedTokens: number; count: number }>();
+  private sent = 0;
+  private deduped = 0;
+  private baseline = 0;
+  private clock = Date.now();
+
+  constructor(private targets: MockTarget[]) {}
+
+  private target(index: number): MockTarget {
+    return this.targets[index % this.targets.length];
+  }
+
+  /** Price a call the way `estimateCost` does. */
+  private price(model: string, input: number, output: number, cacheRead: number, cacheWrite: number) {
+    const pricing = MODELS.find((m) => m.id === model)?.pricing ?? { input: 3, output: 15 };
+    const inRate = pricing.input / 1_000_000;
+    const outRate = pricing.output / 1_000_000;
+    return {
+      cost: input * inRate + cacheRead * inRate * 0.1 + cacheWrite * inRate * 1.25 + output * outRate,
+      uncached: (input + cacheRead + cacheWrite) * inRate + output * outRate,
+    };
+  }
+
+  /** One model call. */
+  turn(agentId: string, model: string, input: number, output: number, cacheRead: number, cacheWrite = 0): ScriptStep {
+    const { cost, uncached } = this.price(model, input, output, cacheRead, cacheWrite);
+    this.turns.push({ input, output, cacheRead, cacheWrite, cost, uncached });
+    this.clock += 2_000 + Math.round(input / 20);
+    return {
+      delay: 30,
+      event: {
+        type: "turn_usage",
+        agentId,
+        model,
+        inputTokens: input,
+        outputTokens: output,
+        cacheReadTokens: cacheRead,
+        cacheWriteTokens: cacheWrite,
+        costUsd: cost,
+        uncachedUsd: uncached,
+        contextTokens: input + cacheRead + cacheWrite + output,
+        at: this.clock,
+      },
+    };
+  }
+
+  /** Context delivered to an agent, attributed to targets by index. */
+  read(
+    source: string,
+    label: string,
+    targets: number[],
+    tokens: number,
+    options: { deduped?: boolean; untracked?: boolean; nodes?: "all" | "first" | "none" } = {},
+  ): this {
+    const picked = targets.map((i) => this.target(i));
+    const paths = [...new Set(picked.map((t) => t.path))];
+    const nodeMode = options.nodes ?? "all";
+    const nodeIds = [
+      ...new Set(
+        picked.flatMap((t) => (nodeMode === "none" ? [] : nodeMode === "first" ? t.nodeIds.slice(0, 2) : t.nodeIds.slice(0, 6))),
+      ),
+    ];
+    const deduped = Boolean(options.deduped);
+    this.events.push({
+      at: this.clock,
+      source,
+      label,
+      tokens,
+      deduped,
+      ...(paths.length ? { paths } : {}),
+      ...(nodeIds.length ? { nodeIds } : {}),
+      ...(options.untracked ? { untracked: true } : {}),
+    });
+    const src = this.sources.get(source) ?? { source, tokens: 0, dedupedTokens: 0, count: 0 };
+    src.count += 1;
+    if (deduped) src.dedupedTokens += tokens;
+    else src.tokens += tokens;
+    this.sources.set(source, src);
+    for (const path of paths) {
+      const stat = this.files.get(path) ?? { path, sentTokens: 0, dedupedTokens: 0, reads: 0 };
+      stat.reads += 1;
+      if (deduped) stat.dedupedTokens += tokens / paths.length;
+      else stat.sentTokens += tokens / paths.length;
+      this.files.set(path, stat);
+    }
+    for (const id of nodeIds) {
+      const stat = this.nodes.get(id) ?? { id, sentTokens: 0, dedupedTokens: 0, reads: 0 };
+      stat.reads += 1;
+      if (deduped) stat.dedupedTokens += tokens / nodeIds.length;
+      else stat.sentTokens += tokens / nodeIds.length;
+      this.nodes.set(id, stat);
+    }
+    if (!options.untracked) {
+      if (deduped) this.deduped += tokens;
+      else this.sent += tokens;
+      if (!deduped) for (const t of picked) this.baseline += t.tokens;
+    }
+    return this;
+  }
+
+  private snapshot(): LedgerSnapshot {
+    const round = <T extends { sentTokens: number; dedupedTokens: number }>(v: T): T => ({
+      ...v,
+      sentTokens: Math.round(v.sentTokens),
+      dedupedTokens: Math.round(v.dedupedTokens),
+    });
+    const saved = Math.max(0, this.baseline - this.sent);
+    return {
+      sentTokens: this.sent,
+      dedupedTokens: this.deduped,
+      baselineTokens: this.baseline,
+      savedTokens: saved,
+      savedPercent: this.baseline > 0 ? Math.round((saved / this.baseline) * 100) : 0,
+      events: [...this.events],
+      files: [...this.files.values()].map(round).sort((a, b) => b.sentTokens - a.sentTokens),
+      nodes: [...this.nodes.values()].map(round).sort((a, b) => b.sentTokens - a.sentTokens),
+      sources: [...this.sources.values()].sort((a, b) => b.tokens - a.tokens),
+    };
+  }
+
+  /** Cumulative `ledger` event; `planning` adds un-itemized orchestrator usage. */
+  ledger(planning: { input: number; output: number; model: string } | null = null): ScriptStep {
+    if (planning) {
+      const { cost, uncached } = this.price(planning.model, planning.input, planning.output, 0, 0);
+      this.turns.push({ input: planning.input, output: planning.output, cacheRead: 0, cacheWrite: 0, cost, uncached });
+    }
+    const sum = this.turns.reduce(
+      (acc, t) => ({
+        input: acc.input + t.input,
+        output: acc.output + t.output,
+        cacheRead: acc.cacheRead + t.cacheRead,
+        cacheWrite: acc.cacheWrite + t.cacheWrite,
+        cost: acc.cost + t.cost,
+        uncached: acc.uncached + t.uncached,
+      }),
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, uncached: 0 },
+    );
+    return {
+      delay: 40,
+      event: {
+        type: "ledger",
+        ledger: this.snapshot(),
+        tokensIn: sum.input + sum.cacheRead,
+        tokensOut: sum.output,
+        tokensCached: sum.cacheRead,
+        tokensCacheWrite: sum.cacheWrite,
+        costUsd: sum.cost,
+        uncachedUsd: sum.uncached,
+      },
+    };
+  }
+
+  get costUsd(): number {
+    return this.turns.reduce((sum, t) => sum + t.cost, 0);
+  }
+}
+
 function words(agentId: string, text: string, type: "agent_text" | "agent_thinking" = "agent_text"): ScriptStep[] {
   return text.split(/(?<= )/).map((chunk) => ({
     delay: 18,
@@ -146,12 +361,39 @@ function tool(
 }
 
 /** The build script: plan → two waves → approvals → done. */
-function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
+function buildScript(prompt: string, withPlan?: RunPlan, graph?: MockGraph | null): ScriptStep[] {
   const plan = withPlan ?? MOCK_PLAN;
   const fail = /\bfail\b/i.test(prompt);
   const a = "s1";
   const b = "s2";
   const c = "s3";
+  const u = new MockUsage(mockTargets(graph));
+  const t = mockTargets(graph);
+  // Wave 0: orient with the graph, read one file, write the hook.
+  u.read("graph_slice", 'graph slice for "theme"', [0, 1, 2], 3_400);
+  u.read("symbol_outline", t[1].path, [1], 520, { untracked: true });
+  u.read("read_file", t[0].path, [0], 1_900, { nodes: "first" });
+  const wave0 = [
+    u.turn(a, "claude-sonnet-5", 9_800, 420, 0, 6_200),
+    u.turn(a, "claude-sonnet-5", 3_100, 610, 12_900),
+    u.turn(a, "claude-sonnet-5", 2_400, 880, 15_600),
+  ];
+  const ledger0 = u.ledger({ input: 3_600, output: 540, model: "claude-sonnet-5" });
+  // Wave 1: the header agent re-reads (deduped), the tester greps.
+  u.read("read_file", t[0].path, [0], 1_900, { deduped: true, nodes: "first" });
+  u.read("graph_slice", 'graph slice for "header toggle"', [0, 3], 2_300);
+  u.read("grep", 'grep "theme"', [4, 5, 0], 640, { untracked: true, nodes: "first" });
+  u.read("read_file", t[2].path, [2], 1_200, { nodes: "first" });
+  u.read("find_symbols", "useTheme", [1], 180, { untracked: true, nodes: "first" });
+  u.read("graph_slice", 'graph slice for "theme"', [0, 1, 2], 3_400, { deduped: true });
+  const wave1 = [
+    u.turn(b, "claude-sonnet-5", 8_600, 390, 0, 5_900),
+    u.turn(c, "claude-haiku-4-5", 7_200, 520, 0, 4_100),
+    u.turn(b, "claude-sonnet-5", 2_900, 740, 14_800),
+    u.turn(c, "claude-haiku-4-5", 1_700, 910, 11_300),
+    u.turn(b, "claude-sonnet-5", 1_600, 420, 17_900),
+  ];
+  const ledger1 = u.ledger();
   return [
     {
       delay: 80,
@@ -201,7 +443,8 @@ function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
       },
     },
     ...tool(a, "c1", "search", "theme", "4 matches in 3 files"),
-    ...tool(a, "c2", "read_file", "src/components/Header.tsx", "9 lines"),
+    ...tool(a, "c2", "read_file", t[0].path, "9 lines"),
+    wave0[0],
     {
       delay: 120,
       event: {
@@ -225,6 +468,7 @@ function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
         ],
       },
     },
+    wave0[1],
     ...words(a, "I'll add a small hook that owns the attribute and the persisted value."),
     { delay: 60, event: { type: "agent_tool", agentId: a, callId: "c3", tool: "write_file", args: "src/hooks/useTheme.ts", phase: "start" } },
     {
@@ -264,7 +508,8 @@ function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
         ],
       },
     },
-    { delay: 40, event: ledger(24_000, 1_900, 0.041) },
+    wave0[2],
+    ledger0,
     {
       delay: 80,
       event: {
@@ -303,8 +548,10 @@ function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
         wave: 1,
       },
     },
-    ...tool(b, "c4", "read_file", "src/components/Header.tsx", "9 lines"),
-    ...tool(c, "c5", "list_files", "src/hooks", "2 entries"),
+    wave1[0],
+    wave1[1],
+    ...tool(b, "c4", "read_file", t[0].path, "already in context"),
+    ...tool(c, "c5", "grep", "theme", "4 matches in 3 files"),
     {
       delay: 120,
       event: {
@@ -342,6 +589,7 @@ function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
         injected: true,
       },
     },
+    wave1[2],
     ...tool(b, "c6", "edit_file", "src/components/Header.tsx", "1 replacement"),
     {
       delay: 60,
@@ -408,8 +656,10 @@ function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
       },
     },
     ...tool(c, "c7", "run_command", "npm test -- src/hooks", fail ? "1 failed" : "3 passed", !fail, 400),
+    wave1[3],
     ...words(b, "Header now renders a toggle bound to the hook."),
-    { delay: 40, event: ledger(61_000, 4_800, 0.112) },
+    wave1[4],
+    ledger1,
     {
       delay: 60,
       event: {
@@ -446,13 +696,16 @@ function buildScript(prompt: string, withPlan?: RunPlan): ScriptStep[] {
           : "Added a persisted theme toggle: `useTheme` in `src/hooks`, the button in `Header`, and tests.",
         filesChanged: 3,
         durationMs: 14_000,
-        costUsd: 0.112,
+        costUsd: u.costUsd,
       },
     },
   ];
 }
 
-function planScript(): ScriptStep[] {
+function planScript(graph?: MockGraph | null): ScriptStep[] {
+  const u = new MockUsage(mockTargets(graph));
+  u.read("graph_slice", 'graph slice for "theme settings"', [0, 1, 3], 2_800);
+  const planned = u.ledger({ input: 8_200, output: 700, model: "claude-sonnet-5" });
   return [
     {
       delay: 80,
@@ -463,21 +716,32 @@ function planScript(): ScriptStep[] {
       event: { type: "orchestrator_text", text: (s.event as { text: string }).text } as OrchestrationEvent,
     })),
     { delay: 300, event: { type: "plan", plan: MOCK_PLAN, awaitingApproval: true } },
-    { delay: 40, event: ledger(9_000, 700, 0.012) },
-    { delay: 40, event: { type: "run_done", status: "done", summary: "", filesChanged: 0, durationMs: 1_200, costUsd: 0.012 } },
+    planned,
+    { delay: 40, event: { type: "run_done", status: "done", summary: "", filesChanged: 0, durationMs: 1_200, costUsd: u.costUsd } },
   ];
 }
 
-function askScript(): ScriptStep[] {
+function askScript(graph?: MockGraph | null): ScriptStep[] {
+  const u = new MockUsage(mockTargets(graph));
+  const t = mockTargets(graph);
+  u.read("grep", 'grep "theme"', [2, 0, 5], 380, { untracked: true, nodes: "first" });
+  u.read("read_file", t[2].path, [2], 1_300);
+  const calls = [
+    u.turn("assistant", "claude-haiku-4-5", 5_400, 160, 0, 3_900),
+    u.turn("assistant", "claude-haiku-4-5", 1_900, 240, 9_300),
+  ];
   const answer =
     "The theme is applied in `src/app/layout.tsx` via a `dark` class on `<html>`. Nothing persists it today, so it resets on reload.\n\nTwo options:\n\n1. Store it in `localStorage` and apply it before paint with an inline script.\n2. Store it in a cookie so the server can render the right class.";
   return [
     { delay: 80, event: { type: "run_start", runId: `mock_ask_${Date.now().toString(36)}`, mode: "single", model: "claude-haiku-4-5", at: Date.now() } },
     { delay: 40, event: { type: "intent", intent: "ask", reason: "A question about the code." } },
-    ...tool("assistant", "q1", "search", "theme", "4 matches"),
+    ...tool("assistant", "q1", "grep", "theme", "4 matches"),
+    calls[0],
+    ...tool("assistant", "q2", "read_file", t[2].path, "38 lines"),
+    calls[1],
     ...answer.split(/(?<= )/).map((chunk) => ({ delay: 14, event: { type: "answer", text: chunk } as OrchestrationEvent })),
-    { delay: 40, event: ledger(6_000, 300, 0.004) },
-    { delay: 40, event: { type: "run_done", status: "done", summary: answer, filesChanged: 0, durationMs: 1_900, costUsd: 0.004 } },
+    u.ledger(),
+    { delay: 40, event: { type: "run_done", status: "done", summary: answer, filesChanged: 0, durationMs: 1_900, costUsd: u.costUsd } },
   ];
 }
 
@@ -702,11 +966,13 @@ export function mockScript(input: {
   prompt: string;
   interaction: Interaction;
   plan?: RunPlan;
+  /** The open workspace's graph, so mock context points at real files. */
+  graph?: MockGraph | null;
 }): ScriptStep[] {
-  if (input.interaction === "plan") return planScript();
-  if (input.interaction === "ask") return askScript();
+  if (input.interaction === "plan") return planScript(input.graph);
+  if (input.interaction === "ask") return askScript(input.graph);
   if (input.interaction === "fix") return fixScript();
-  return buildScript(input.prompt, input.plan);
+  return buildScript(input.prompt, input.plan, input.graph);
 }
 
 const pendingMockApprovals = new Map<string, (decision: string) => void>();

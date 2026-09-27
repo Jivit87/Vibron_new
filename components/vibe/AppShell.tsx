@@ -34,7 +34,8 @@ import type { Graph } from "@/lib/graph";
 import { useProblems } from "@/store/problems";
 import { useScm } from "@/store/scm";
 import { resolveTheme, useViberon } from "@/store/viberon";
-import { cx, Dot, formatCost, formatTokens, Kbd, MenuItem, Popover, Segmented } from "@/components/vibe/primitives";
+import { cx, Dot, Kbd, MenuItem, Popover, Segmented } from "@/components/vibe/primitives";
+import { UsageChip } from "@/components/vibe/usage-ui";
 
 export interface AppShellProps {
   repoKey: string;
@@ -477,20 +478,7 @@ function StatusBar() {
 
       <div className="flex-1" />
 
-      {run && run.tokensIn > 0 && (
-        <StatusItem
-          title="Token ledger"
-          onClick={() => {
-            const store = useViberon.getState();
-            store.setAppMode("ide");
-            store.setBottomPanel("ledger");
-          }}
-        >
-          <span className="font-mono">
-            {formatTokens(run.tokensIn)} in · {formatTokens(run.tokensOut)} out · {formatCost(run.costUsd)}
-          </span>
-        </StatusItem>
-      )}
+      <UsageChip />
       <StatusItem title={`${fileList.length} files indexed`}>
         <span className="font-mono">{fileList.length} files</span>
       </StatusItem>
