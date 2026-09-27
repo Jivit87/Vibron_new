@@ -236,8 +236,7 @@ async function pumpRun({
     flushHandle = null;
     if (queue.length === 0) return;
     const batch = queue.splice(0, queue.length);
-    const state = useViberon.getState();
-    for (const event of batch) state.applyEvent(event);
+    useViberon.getState().applyEvents(batch);
   };
   const schedule = () => {
     if (flushHandle !== null) return;

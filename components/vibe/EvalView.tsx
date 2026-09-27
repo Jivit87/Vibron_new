@@ -168,7 +168,11 @@ function ResultsTable({ rows, totals }: { rows: EvalRow[]; totals: ReturnType<ty
               <td className="border-b py-[5px] pr-3 text-right font-mono text-[11.5px] tabular-nums" style={{ borderColor: "var(--vb-line-faint)", color: "var(--vb-text-mid)" }}>
                 {row.tokens ? formatTokens(row.tokens) : "—"}
               </td>
-              <td className="border-b py-[5px] text-right font-mono text-[11.5px] tabular-nums" style={{ borderColor: "var(--vb-line-faint)", color: "var(--vb-text-mid)" }}>
+              <td
+                className="border-b py-[5px] text-right font-mono text-[11.5px] tabular-nums"
+                style={{ borderColor: "var(--vb-line-faint)", color: "var(--vb-text-mid)" }}
+                title={row.phaseMs ? Object.entries(row.phaseMs).map(([name, ms]) => `${name} ${formatDuration(ms)}`).join("\n") : undefined}
+              >
                 {row.durationMs ? formatDuration(row.durationMs) : "—"}
               </td>
             </tr>

@@ -25,6 +25,7 @@ import {
   formatPrice,
   groupModels,
   matchesModel,
+  setupAction,
   type ModelOption,
 } from "@/lib/client/model-picker";
 
@@ -246,7 +247,7 @@ export function ModelPicker({
                         className="text-[11px] underline-offset-2 hover:underline"
                         style={{ color: "var(--vb-accent)" }}
                       >
-                        Add key
+                        {setupAction(group.id)}
                       </button>
                     )}
                   </div>

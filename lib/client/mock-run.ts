@@ -537,12 +537,24 @@ function fixScript(): ScriptStep[] {
       attempt,
     } as OrchestrationEvent,
   });
+  // Round 5 events, cast until they are part of the union.
+  const phase = (name: string, ms: number, delay = 30): ScriptStep => ({
+    delay,
+    event: { type: "phase", name, ms } as unknown as OrchestrationEvent,
+  });
+  const loose = (delay: number, event: Record<string, unknown>): ScriptStep => ({
+    delay,
+    event: event as unknown as OrchestrationEvent,
+  });
+  const independentCmd = "python -m pytest -q tests/test_viberon_independent.py";
   return [
     {
-      delay: 80,
+      // First frame: the run exists before any model call.
+      delay: 0,
       event: { type: "run_start", runId: `mock_fix_${Date.now().toString(36)}`, mode: "single", model: "claude-sonnet-5", at: Date.now() },
     },
     { delay: 40, event: { type: "checkpoint", id: "cp_fix", label: "Before fix", fileCount: 61, kind: "run" } },
+    phase("setup", 1_840, 120),
     {
       delay: 80,
       event: {
@@ -556,6 +568,18 @@ function fixScript(): ScriptStep[] {
         snippetReproduced: true,
       } as unknown as OrchestrationEvent,
     },
+    phase("localize", 620),
+    loose(160, {
+      type: "criteria",
+      items: [
+        "slugify(\"Crème brûlée\") returns \"creme-brulee\"; accented letters keep their base letter.",
+        "Characters with no ASCII decomposition are dropped, not replaced with a separator.",
+        "Leading and trailing separators are still stripped (\"Hello, world!\" -> \"hello-world\").",
+        "A custom `sep` argument is honoured for transliterated input.",
+        "Existing callers in textkit/cli.py see no change for ASCII input.",
+      ],
+    }),
+    phase("criteria", 2_100),
     solver(a1, "Fix slugify transliteration", 1),
     {
       delay: 120,
@@ -650,7 +674,14 @@ E   AssertionError: assert 'hello-world-' == 'hello-world'` },
     { delay: 60, event: { type: "gate", agentId: a2, decision: "accept", reason: "Fixes 2 failing checks; no regressions. 1 failure was already failing on the original.", attempt: 1 } },
     { delay: 40, event: { type: "checkpoint", id: "cp_best", label: "Best", fileCount: 1, kind: "best", ref: "c93e1aa" } },
     ...words(a2, "Normalized to NFKD before the ASCII filter so accented letters keep their base letter, and kept the separator strip."),
+    phase("gate", 4_300),
     { delay: 40, event: { type: "agent_done", agentId: a2, summary: "Verified fix.", tokensIn: 12_100, tokensOut: 1_300, cost: 0.029, durationMs: 3_100 } },
+    phase("loop", 41_200),
+    loose(80, { type: "independent_test", status: "written", command: independentCmd }),
+    loose(1_400, { type: "independent_test", status: "ran", command: independentCmd, verdict: "fixes", seconds: 6.4 }),
+    phase("testWriter", 9_800),
+    phase("review", 7_600, 200),
+    phase("deliver", 350),
     { delay: 40, event: ledger(30_500, 3_200, 0.07) },
     {
       delay: 60,
@@ -659,7 +690,8 @@ E   AssertionError: assert 'hello-world-' == 'hello-world'` },
         status: "done",
         summary: "Fixed `slugify` dropping accented letters: it now NFKD-normalizes before stripping to ASCII. The reproduction and the repo's tests prove it (3 fixed, 0 regressions).",
         filesChanged: 1,
-        durationMs: 9_000,
+        // Setup, localize and criteria overlap, so this is under the phase sum.
+        durationMs: 57_750,
         costUsd: 0.07,
       },
     },
@@ -731,6 +763,19 @@ export function mockResponse(steps: ScriptStep[], signal: AbortSignal): Response
 }
 
 /* ------------------------------ fixtures ---------------------------------- */
+
+/** `GET /api/settings/keys` under `?mock=1`: DeepSeek from the env, the CLI logged in. */
+export const MOCK_PROVIDER_STATUS = {
+  providers: [
+    { provider: "anthropic", configured: false, masked: null, fromEnv: false, envVar: "ANTHROPIC_API_KEY" },
+    { provider: "deepseek", configured: true, masked: "sk-…9c2e", fromEnv: true, envVar: "DEEPSEEK_API_KEY" },
+    { provider: "groq", configured: false, masked: null, fromEnv: false, envVar: "GROQ_API_KEY" },
+    { provider: "gemini", configured: true, masked: "AIza…Qk3o", fromEnv: false, envVar: "GEMINI_API_KEY" },
+    { provider: "nvidia", configured: false, masked: null, fromEnv: false, envVar: "NVIDIA_API_KEY" },
+    { provider: "openai", configured: false, masked: null, fromEnv: false, envVar: "OPENAI_API_KEY" },
+    { provider: "claude-cli", configured: true, masked: "claude 2.1.14" },
+  ],
+};
 
 export const MOCK_GIT_SNAPSHOT: GitSnapshot = {
   virtual: false,

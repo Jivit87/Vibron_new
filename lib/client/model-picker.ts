@@ -17,8 +17,10 @@ export interface ModelOption {
 
 const PROVIDERS: { id: string; label: string }[] = [
   { id: "anthropic", label: "Anthropic" },
+  { id: "claude-cli", label: "Claude subscription (CLI)" },
   { id: "gemini", label: "Google Gemini" },
   { id: "nvidia", label: "NVIDIA" },
+  { id: "deepseek", label: "DeepSeek" },
   { id: "openai", label: "OpenAI-compatible" },
   { id: "groq", label: "Groq" },
 ];
@@ -83,4 +85,9 @@ export function groupModels(models: ModelOption[], query: string): Group[] {
 /** Inside a provider group the "(Gemini)" / "(NVIDIA)" suffix only repeats the heading. */
 export function displayLabel(model: ModelOption): string {
   return model.label.replace(/\s*\((Gemini|NVIDIA|Groq)\)$/, "");
+}
+
+/** What an unconfigured provider group offers: the CLI logs in, the rest take a key. */
+export function setupAction(providerId: string): string {
+  return providerId === "claude-cli" ? "Log in with claude" : "Add key";
 }
