@@ -137,6 +137,14 @@ export function repoEnvPrelude(root: string): string {
   const quote = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
   const parts = [`export PYTHONDONTWRITEBYTECODE=1`];
   if (prefix.length) parts.push(`export PATH=${quote(prefix.join(path.delimiter))}:"$PATH"`);
+  // The repo (and a src/ layout) importable from anywhere, e.g. a script in
+  // .viberon/scratch/: without this, a real run lost 3 of 5 turns to an
+  // import error before finding PYTHONPATH=. by itself.
+  const importable = [root];
+  if (existsSync(path.join(root, "src")) && !existsSync(path.join(root, "src", "__init__.py"))) {
+    importable.unshift(path.join(root, "src"));
+  }
+  parts.push(`export PYTHONPATH=${quote(importable.join(path.delimiter))}\${PYTHONPATH:+:$PYTHONPATH}`);
   const venv = findRepoVenv(root);
   if (venv) parts.push(`export VIRTUAL_ENV=${quote(venv)}`);
   return `${parts.join("; ")}; `;
