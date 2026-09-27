@@ -9,14 +9,15 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import { fetchGitHubIssue, parseGitHubIssueUrl, type GitHubIssue } from "@/lib/github";
 import { lastIndexStats, registerLocalWorkspace } from "@/lib/local-disk-workspace";
-import { bootstrapEnvironment } from "@/lib/workspace/bootstrap";
+import { listRepoPaths } from "@/lib/verify";
+import { bootstrapEnvironment, probeRepo, type RepoProbe } from "@/lib/workspace/bootstrap";
 
 export interface CloneTarget {
   /** What `git clone` receives. */
@@ -209,6 +210,17 @@ export function runGit(
   });
 }
 
+/** A reused clone fetched this recently skips the network round-trip. */
+export const FETCH_TTL_MS = 60_000;
+
+function fetchedRecently(dest: string, ttlMs: number): boolean {
+  try {
+    return Date.now() - statSync(path.join(dest, ".git", "FETCH_HEAD")).mtimeMs < ttlMs;
+  } catch {
+    return false;
+  }
+}
+
 export interface CloneResult {
   rootPath: string;
   reused: boolean;
@@ -217,6 +229,11 @@ export interface CloneResult {
 /**
  * Clone into `<reposDir>/<owner>__<name>`, or reuse + fetch an existing
  * clone. `ref` checks out a branch/tag/commit after clone or fetch.
+ *
+ * Fast by default: without an explicit `depth` or `ref` the clone is shallow
+ * (`--depth 1 --single-branch`); `depth: 0` asks for full history. A shallow
+ * reused clone fetches shallowly (just the ref when one is given), and a
+ * clone fetched within `fetchTtlMs` skips the fetch altogether.
  */
 export async function cloneRepository(
   target: CloneTarget,
@@ -228,6 +245,8 @@ export async function cloneRepository(
     onProgress?: (text: string) => void;
     /** GitHub token for https clones (see `gitAuthEnv`). */
     token?: string | null;
+    /** Skip the fetch of a reused clone fetched this recently (default FETCH_TTL_MS; 0 = always fetch). */
+    fetchTtlMs?: number;
   } = {},
 ): Promise<CloneResult> {
   const dest = cloneDestination(target, options.baseDir);
@@ -235,20 +254,36 @@ export async function cloneRepository(
   if (options.ref && (!/^[\w./-]+$/.test(options.ref) || options.ref.startsWith("-"))) {
     throw new Error(`Invalid ref: ${options.ref}`);
   }
-  const depth = options.depth && Number.isInteger(options.depth) && options.depth > 0 ? options.depth : undefined;
+  const depth =
+    options.depth === undefined
+      ? options.ref
+        ? undefined
+        : 1
+      : Number.isInteger(options.depth) && options.depth > 0
+        ? options.depth
+        : undefined;
   const auth = gitAuthEnv(options.token, target.cloneUrl);
 
   let reused = false;
   if (existsSync(path.join(dest, ".git"))) {
     reused = true;
-    progress(`Reusing existing clone at ${dest}; fetching…`);
-    const fetch = await runGit(["fetch", "--prune", "origin"], { cwd: dest, signal: options.signal, onLine: progress, env: auth });
-    if (fetch.code !== 0) progress("git fetch failed; continuing with the local copy");
+    const shallow = existsSync(path.join(dest, ".git", "shallow"));
+    if (!options.ref && fetchedRecently(dest, options.fetchTtlMs ?? FETCH_TTL_MS)) {
+      progress(`Reusing existing clone at ${dest} (fetched recently)`);
+    } else {
+      progress(`Reusing existing clone at ${dest}; fetching…`);
+      // Measured: `fetch --depth 1` on an up-to-date shallow clone renegotiates
+      // (~1.3 s vs ~0.8 s), so only a named ref on a shallow clone uses it.
+      const args =
+        shallow && options.ref ? ["fetch", "--depth", "1", "origin", options.ref] : ["fetch", "--prune", "origin"];
+      const fetch = await runGit(args, { cwd: dest, signal: options.signal, onLine: progress, env: auth });
+      if (fetch.code !== 0) progress("git fetch failed; continuing with the local copy");
+    }
   } else {
     await mkdir(path.dirname(dest), { recursive: true });
     progress(`Cloning ${target.cloneUrl} into ${dest}…`);
     const args = ["clone", "--progress"];
-    if (depth) args.push("--depth", String(depth));
+    if (depth) args.push("--depth", String(depth), "--single-branch");
     if (options.ref && depth) args.push("--branch", options.ref);
     args.push("--", target.cloneUrl, dest);
     const clone = await runGit(args, { signal: options.signal, onLine: progress, env: auth });
@@ -263,6 +298,10 @@ export async function cloneRepository(
     if (checkout.code !== 0) {
       checkout = await runGit(["checkout", "--detach", `origin/${options.ref}`], { cwd: dest, onLine: progress });
     }
+    if (checkout.code !== 0 && reused) {
+      // A shallow clone fetched the ref by name only: it lives in FETCH_HEAD.
+      checkout = await runGit(["checkout", "--detach", "FETCH_HEAD"], { cwd: dest, onLine: progress });
+    }
     if (checkout.code !== 0) throw new Error(`Could not check out ${options.ref}`);
   }
   return { rootPath: dest, reused };
@@ -275,6 +314,8 @@ export interface ClonedWorkspace {
   reused: boolean;
   issue?: GitHubIssue;
   setupNotes?: string[];
+  /** Language + test command, detected in one pass over the file list. */
+  probe?: RepoProbe;
 }
 
 /**
@@ -303,6 +344,14 @@ export async function cloneToWorkspace(
   const token = options.token === undefined ? await resolveGithubToken() : options.token;
   const { rootPath, reused } = await cloneRepository(target, { ...options, token, onProgress: progress });
 
+  // Indexing and dependency setup are independent: run them concurrently.
+  let setupPromise: Promise<string[]> | undefined;
+  if (options.setup) {
+    progress("Setting up the environment…");
+    setupPromise = bootstrapEnvironment(rootPath, { onProgress: progress, signal: options.signal }).catch(
+      (error: unknown) => [`setup failed: ${error instanceof Error ? error.message : String(error)}`],
+    );
+  }
   progress("Indexing code graph…");
   const label = `${target.owner}/${target.name}`;
   const meta = await registerLocalWorkspace(rootPath, { label });
@@ -319,10 +368,7 @@ export async function cloneToWorkspace(
     }
   }
 
-  let setupNotes: string[] | undefined;
-  if (options.setup) {
-    progress("Setting up the environment…");
-    setupNotes = await bootstrapEnvironment(rootPath, { onProgress: progress, signal: options.signal });
-  }
-  return { repoKey: meta.repoKey, rootPath, label, reused, issue, setupNotes };
+  const setupNotes = setupPromise ? await setupPromise : undefined;
+  const probe = probeRepo(rootPath, listRepoPaths(rootPath));
+  return { repoKey: meta.repoKey, rootPath, label, reused, issue, setupNotes, probe };
 }
