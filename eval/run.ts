@@ -16,6 +16,8 @@ import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "n
 import os from "node:os";
 import path from "node:path";
 
+import { envModelId, resolveModel } from "@/lib/ai";
+
 import type { SolveOptions, SolveResult } from "@/lib/harness/solve-types";
 import { runHeadless } from "@/lib/headless/run";
 import { execInRepo, which } from "@/lib/verify";
@@ -122,7 +124,8 @@ export async function runEval(options: RunEvalOptions = {}): Promise<EvalSummary
   const picked = resolveSuite(options.suite ?? process.env.VIBERON_EVAL_SUITE, options.only, tasks.map((t) => t.name));
   tasks = tasks.filter((t) => picked.includes(t.name));
   if (!tasks.length) throw new Error("no eval tasks found");
-  const model = options.model ?? process.env.VIBERON_MODEL ?? "claude-opus-5";
+  // AI_MODEL is the evaluator's model; resolve it like every other entry point.
+  const model = options.model ?? (await resolveModel("auto", { agenticOnly: true }).catch(() => envModelId() ?? "claude-opus-5"));
   const venv = options.venv !== false && tasks.some((t) => t.language === "python")
     ? await ensureEvalVenv(path.join(EVAL_DIR, ".cache"), log)
     : null;

@@ -6,7 +6,7 @@
  * picks the default model for the review tools.
  */
 
-import { availableModels, cliAutoOptIn, runTurn as defaultRunTurn, type AiTurnRequest, type AiUsage } from "@/lib/ai";
+import { availableModels, cliAutoOptIn, envModelId, resolveModel, runTurn as defaultRunTurn, type AiTurnRequest, type AiUsage } from "@/lib/ai";
 
 export interface TurnOutcome {
   text: string;
@@ -89,12 +89,18 @@ export async function structuredCall<T>(
 const RANK: Record<string, number> = { fast: 0, balanced: 1, frontier: 2 };
 
 /**
- * The cheapest agentic model with a configured key (fast tier first, then
- * price). With no key at all it returns the cheapest agentic model anyway,
+ * The model for side calls: the one the environment names (AI_MODEL /
+ * VIBERON_MODEL) when set, else the cheapest agentic model with a configured
+ * key (fast tier first, then price). With no key at all it returns the cheapest agentic model anyway,
  * so `ensureModelReady` produces the credential message.
  */
 export async function reviewModel(preferred?: string): Promise<string> {
   if (preferred && preferred !== "auto") return preferred;
+  // An evaluation names ONE model for everything (AI_MODEL / VIBERON_MODEL):
+  // side calls (review, criteria, the blind writer) must not switch to a
+  // cheaper one. resolveModel maps a bare id to its provider-prefixed form.
+  const envId = envModelId();
+  if (envId) return resolveModel(envId, { agenticOnly: true }).catch(() => envId);
   // Never an implicit Claude CLI (subscription) pick; callers on the CLI pass it explicitly.
   const models = (await availableModels()).filter((m) => m.spec.agentic && (m.spec.provider !== "claude-cli" || cliAutoOptIn()));
   const pick = (list: typeof models) =>
