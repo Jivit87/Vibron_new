@@ -17,6 +17,7 @@ import {
   addUsage,
   EMPTY_USAGE,
   TRUNCATED_CALL_ERROR,
+  type AiEffort,
   type AiMessage,
   type AiSystemBlock,
   type AiToolCall,
@@ -156,6 +157,8 @@ export interface AgentRunInput {
   attempt?: number;
   /** Why this attempt started, echoed on `agent_start`. */
   attemptReason?: string;
+  /** Overrides the role's reasoning effort for this run. */
+  effort?: AiEffort;
 }
 
 export interface AgentRunResult {
@@ -479,7 +482,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
         system: buildSystem(),
         messages,
         tools: buildTools(),
-        effort: role.effort,
+        effort: input.effort ?? role.effort,
         showThinking: input.showThinking,
         ...(maxTokens ? { maxTokens } : {}),
         signal: input.signal,

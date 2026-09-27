@@ -773,6 +773,9 @@ export async function solveTask(options: SolveOptions): Promise<SolveResult> {
         stepId: `attempt-${n}`,
         role: "solver",
         model: options.model,
+        // Fast path: light reasoning (measured on the CLI: 11-16 s instead of
+        // 25 s per fix, same result). Escalated or thorough runs think hard.
+        ...(escalated ? {} : { effort: "medium" as const }),
         task: reviewTask ?? initialMessage(options.task, overview, renderLocalization(loc), lessons, source, criteria),
         title: reviewPass ? reviewTitle : n === 1 ? "Solve task" : `Solve task (attempt ${n}, fresh context)`,
         attempt: n,
