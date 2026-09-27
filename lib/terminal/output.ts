@@ -150,19 +150,42 @@ export class UrlDetector {
 /* --------------------------- output trimming ----------------------------- */
 
 /**
+ * Model-facing cleanup (Pramana `clean_output`): strip ANSI and collapse
+ * carriage-return progress bars to their final state. A `pip install` or
+ * `npm ci` progress bar is thousands of redraws that carry no information.
+ */
+export function cleanTerminalOutput(text: string): string {
+  return stripAnsi(text)
+    .split("\n")
+    .map((line) => {
+      if (!line.includes("\r")) return line;
+      const segments = line.split("\r").filter((s) => s.trim());
+      return segments.length ? segments[segments.length - 1] : "";
+    })
+    .join("\n");
+}
+
+/**
  * Cap text for a model's context, keeping the head (the command and early
- * errors) and the tail (the summary and exit code).
+ * errors) and the tail (the summary and exit code). The marker says how
+ * much was dropped and how to see it, so the model narrows the command
+ * instead of re-running it blind (Pramana `truncate`, 45/55 split).
  */
 export function trimHeadTail(
   full: string,
   cap: number,
-): { output: string; truncated: boolean } {
-  if (full.length <= cap) return { output: full, truncated: false };
-  const head = Math.floor(cap * 0.4);
-  const tail = Math.floor(cap * 0.6);
+): { output: string; truncated: boolean; omittedLines: number } {
+  if (full.length <= cap) return { output: full, truncated: false, omittedLines: 0 };
+  const head = Math.floor(cap * 0.45);
+  const tail = cap - head;
+  const omitted = full.slice(head, full.length - tail);
+  const omittedLines = omitted.split("\n").length - 1;
   return {
-    output: `${full.slice(0, head)}\n… [${full.length - head - tail} chars trimmed] …\n${full.slice(-tail)}`,
+    output:
+      `${full.slice(0, head)}\n… [${omittedLines} lines / ${omitted.length} chars trimmed to save context. ` +
+      `Narrow the command (grep, head, tail, -k, -x) to see a specific part] …\n${full.slice(-tail)}`,
     truncated: true,
+    omittedLines,
   };
 }
 

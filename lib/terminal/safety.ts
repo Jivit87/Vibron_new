@@ -524,6 +524,49 @@ export function classifyCommand(command: string): CommandVerdict {
   return { allowed: true, needsApproval: !autoOk };
 }
 
+/* --------------------------- agent denylist ------------------------------ */
+
+/** `git [-C dir] [-c k=v] [--flag] <sub> …` → `<sub>` and its args. */
+function gitSubcommand(words: string[]): { sub: string; args: string[] } | null {
+  let i = words.findIndex((w) => baseName(w) === "git");
+  if (i === -1) return null;
+  i++;
+  while (i < words.length && words[i].startsWith("-")) {
+    // Options that take a separate value.
+    if (/^(-C|-c|--git-dir|--work-tree|--namespace|--exec-path)$/.test(words[i])) i++;
+    i++;
+  }
+  if (i >= words.length) return null;
+  return { sub: words[i], args: words.slice(i + 1) };
+}
+
+/**
+ * Pramana `DENYLIST` parity for commands an *agent* runs. A user may push
+ * from their own terminal; an agent never does (delivery owns remotes), and
+ * `git clean -f/-d/-x` wipes the scratch area and untracked user work.
+ */
+export function classifyAgentCommand(command: string): CommandVerdict {
+  const verdict = classifyCommand(command);
+  if (!verdict.allowed) return verdict;
+  const normalized = command.trim();
+  const parsed = parseShell(normalized);
+  // Backstop for lines the tokenizer cannot follow (`$(git push)`, `(git push)`).
+  if (parsed.hazards.length && /\bgit\s+(-\S+\s+)*push\b/.test(normalized)) {
+    return { allowed: false, reason: "pushes to a remote; agents never push (delivery handles remotes)" };
+  }
+  for (const seg of parsed.segments) {
+    const git = gitSubcommand(seg.words);
+    if (!git) continue;
+    if (git.sub === "push") {
+      return { allowed: false, reason: "pushes to a remote; agents never push (delivery handles remotes)" };
+    }
+    if (git.sub === "clean" && git.args.some((a) => /^-[a-zA-Z]*[fdx]/.test(a) || a === "--force")) {
+      return { allowed: false, reason: "runs git clean, which deletes untracked work; remove specific files instead" };
+    }
+  }
+  return verdict;
+}
+
 /* ---------------------------- env scrubbing ------------------------------ */
 
 const SECRET_NAME =
