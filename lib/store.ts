@@ -9,6 +9,7 @@ import type {
   StoredRawFile,
 } from "@/lib/graph";
 import { getFirestoreDb } from "@/lib/firebase-admin";
+import { isEphemeralStoreKey, onEphemeralRelease } from "@/lib/workspace/ephemeral";
 
 const GRAPH_TTL_SECONDS = 60 * 60 * 24 * 7;
 const JOB_TTL_SECONDS = 60 * 60;
@@ -102,7 +103,22 @@ function reloadIfDiskNewer(): void {
   }
 }
 
+// Entries of ephemeral workspaces (issue worktrees): process memory only,
+// never the disk file or Firestore, and dropped when the worktree goes.
+const ephemeralEntries = new Map<string, unknown>();
+onEphemeralRelease((repoKey) => {
+  for (const key of ephemeralEntries.keys()) {
+    if (key.slice(key.indexOf(":") + 1) === repoKey) ephemeralEntries.delete(key);
+  }
+});
+
+/** Keys in the persisted store (diagnostics and tests). */
+export function persistedStoreKeys(): string[] {
+  return [...memory.keys()];
+}
+
 async function getValue<T>(key: string): Promise<T | null> {
+  if (isEphemeralStoreKey(key)) return (ephemeralEntries.get(key) as T | undefined) ?? null;
   const db = memoryOnly() ? null : getFirestoreDb();
   if (db) {
     const ref = db.collection(STORE_COLLECTION).doc(docIdForKey(key));
@@ -128,6 +144,10 @@ async function getValue<T>(key: string): Promise<T | null> {
 }
 
 async function setValue(key: string, value: unknown, ttlSeconds?: number): Promise<void> {
+  if (isEphemeralStoreKey(key)) {
+    ephemeralEntries.set(key, value);
+    return;
+  }
   const db = memoryOnly() ? null : getFirestoreDb();
   if (db) {
     await db.collection(STORE_COLLECTION).doc(docIdForKey(key)).set({
@@ -270,6 +290,7 @@ export async function setValueRaw(
 
 export function resetMemoryStoreForTests(): void {
   memory.clear();
+  ephemeralEntries.clear();
   if (process.env.VITEST || memoryOnly()) return;
   try {
     if (existsSync(DISK_STORE_FILE)) {

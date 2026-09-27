@@ -52,7 +52,8 @@ export const USAGE = `Usage:
 
 Exit codes (run): 0 resolved/unverified, 1 failed/incomplete, 2 error (delivery never changes them).
 Exit codes (review): 0 reviewed, 2 error.
-Exit codes (issues): 0 listed / every fix succeeded, 1 some fix failed, 2 error.`;
+Exit codes (issues): 0 listed / every fix succeeded, 1 some fix failed, 2 error, 130 interrupted (Ctrl-C cancels
+queued and running fixes and removes their worktrees first).`;
 
 export interface RunArgs {
   command: "run";
@@ -411,7 +412,26 @@ export async function main(argv: string[]): Promise<number> {
       for (const s of skipped) log(`#${s.number} skipped: ${s.reason}`);
       log(`fixing ${tasks.length} issue${tasks.length === 1 ? "" : "s"} one at a time…`);
       const queue = getTaskQueue();
-      await queue.idle();
+      // Ctrl-C: cancel what is queued, stop what runs, wait for the runners
+      // to remove their worktrees, then exit 130. A second Ctrl-C exits now.
+      let interrupted = false;
+      const onSigint = () => {
+        if (interrupted) process.exit(130);
+        interrupted = true;
+        log("stopping: cancelling queued and running fixes, cleaning up worktrees… (Ctrl-C again to quit now)");
+        void queue.cancelAll(repoKey);
+      };
+      process.on("SIGINT", onSigint);
+      try {
+        await queue.idle();
+      } finally {
+        process.off("SIGINT", onSigint);
+      }
+      if (interrupted) {
+        await removeLeftoverWorktrees(path.resolve(args.repo));
+        log("stopped");
+        return 130;
+      }
       const done = await Promise.all(tasks.map((t) => queue.get(t.id)));
       if (args.json) process.stdout.write(`${JSON.stringify({ tasks: done, skipped }, null, 2)}\n`);
       for (const t of done) {
@@ -507,4 +527,24 @@ export async function main(argv: string[]): Promise<number> {
     log,
   });
   return summary.resolved === summary.total ? 0 : 1;
+}
+
+/**
+ * After an interrupt: any issue worktree this process still holds (a runner
+ * that was force-finished before its own cleanup ran) is removed, so Ctrl-C
+ * never leaves `viberon-issue-*` checkouts or `git worktree` entries behind.
+ */
+async function removeLeftoverWorktrees(home: string): Promise<void> {
+  const [{ runGit }, { ephemeralWorkspaceRoots, sweepEphemeralWorkspaces }, { rm }, path] = await Promise.all([
+    import("@/lib/git"),
+    import("@/lib/workspace/ephemeral"),
+    import("node:fs/promises"),
+    import("node:path"),
+  ]);
+  for (const dir of ephemeralWorkspaceRoots()) {
+    await runGit(home, ["worktree", "remove", "--force", dir], { allowFailure: true }).catch(() => undefined);
+    await rm(path.dirname(dir), { recursive: true, force: true }).catch(() => undefined);
+  }
+  await runGit(home, ["worktree", "prune"], { allowFailure: true }).catch(() => undefined);
+  sweepEphemeralWorkspaces();
 }

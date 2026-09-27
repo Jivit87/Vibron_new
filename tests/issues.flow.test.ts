@@ -447,3 +447,127 @@ describe("Stop", () => {
     await getTaskQueue().idle();
   });
 });
+
+describe("viberon issues --fix, Ctrl-C", () => {
+  it("cancels queued and running fixes, removes their worktrees, and exits 130", async () => {
+    const { main } = await import("@/cli/viberon");
+    const { getTaskQueue } = await import("@/lib/tasks");
+    const { ephemeralWorkspaceCount } = await import("@/lib/workspace/ephemeral");
+    // Every solve parks until it is stopped.
+    hooks.beforeSolve = (options) =>
+      new Promise<void>((resolve) => {
+        if (options.signal?.aborted) resolve();
+        options.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const before = process.listenerCount("SIGINT");
+    try {
+      const startedAt = Date.now();
+      const exit = main(["issues", "--repo", repo.root, "--fix", "7,9,10"]);
+      for (let i = 0; i < 400 && solved.length < 1; i += 1) await new Promise((r) => setTimeout(r, 10));
+      expect(solved.length).toBeGreaterThanOrEqual(1);
+      expect(repo.git("worktree", "list").trim().split("\n").length).toBeGreaterThan(1);
+      process.emit("SIGINT");
+      expect(await exit).toBe(130);
+      const tasks = (await getTaskQueue().list()).filter((t) => t.createdAt >= startedAt);
+      expect(tasks.length).toBeGreaterThan(0);
+      expect(tasks.map((t) => t.state)).toEqual(["cancelled", "cancelled", "cancelled"]);
+      expect(posted).toEqual([]);
+      expect(repo.git("worktree", "list").trim().split("\n")).toHaveLength(1);
+      expect(ephemeralWorkspaceCount()).toBe(0);
+      expect(process.listenerCount("SIGINT")).toBe(before);
+      expect(stderr.mock.calls.map((c) => String(c[0])).join("")).toContain("stopping");
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+});
+
+describe("fetch, store and git-call budget", () => {
+  const fixTask = (repoKey: string, id = "budget-1"): Task => ({
+    id,
+    kind: "fix",
+    repoKey,
+    task: "#7 add() subtracts",
+    source: "issue",
+    state: "running",
+    createdAt: Date.now(),
+    issueUrl: "https://github.com/o/r/issues/7",
+    deliver: true,
+    model: "claude-opus-5",
+  });
+
+  it("fetching origin/<default> survives an upstream force-push", async () => {
+    const { branchFetchArgs, runGit } = await import("@/lib/git");
+    expect(branchFetchArgs("origin", "main")).toEqual(["fetch", "--quiet", "--no-tags", "origin", "+refs/heads/main:refs/remotes/origin/main"]);
+    expect((await runGit(repo.root, branchFetchArgs("origin", "main"))).code).toBe(0);
+    // Rewrite main on the remote (not a fast-forward of what we fetched).
+    const other = makeTmpRepo({ "calc.py": "rewritten\n" });
+    try {
+      other.git("branch", "-M", "main");
+      other.git("push", "-q", "--force", bare, "main");
+      const rewritten = other.git("rev-parse", "HEAD").trim();
+      const fetched = await runGit(repo.root, branchFetchArgs("origin", "main"), { allowFailure: true });
+      expect(fetched.stderr).not.toMatch(/rejected/);
+      expect(fetched.code).toBe(0);
+      expect(repo.git("rev-parse", "refs/remotes/origin/main").trim()).toBe(rewritten);
+    } finally {
+      other.cleanup();
+    }
+  });
+
+  it("an issue worktree never lands in the persisted store and is released after the task", async () => {
+    const { repoKey } = await registerLocalWorkspace(repo.root);
+    const { runFixTask } = await import("@/lib/tasks/runners");
+    const { persistedStoreKeys } = await import("@/lib/store");
+    const { ephemeralWorkspaceCount, sweepEphemeralWorkspaces } = await import("@/lib/workspace/ephemeral");
+    let during: string[] = [];
+    hooks.beforeSolve = async () => {
+      during = persistedStoreKeys();
+    };
+    const outcome = await runFixTask(fixTask(repoKey), { emit: () => undefined, signal: new AbortController().signal });
+    expect(outcome.prUrl).toBe("https://github.com/o/r/pull/12");
+    const treeKey = solved[0]!.handle.repoKey;
+    expect(treeKey).not.toBe(repoKey);
+    const forTree = (keys: string[]) => keys.filter((key) => key.endsWith(`:${treeKey}`));
+    // Not while it ran, not after; the user's own workspace is still stored.
+    expect(during.length).toBeGreaterThan(0);
+    expect(forTree(during)).toEqual([]);
+    expect(forTree(persistedStoreKeys())).toEqual([]);
+    expect(persistedStoreKeys()).toContain(`workspace:${repoKey}`);
+    sweepEphemeralWorkspaces();
+    expect(ephemeralWorkspaceCount()).toBe(0);
+  });
+
+  it("counts the git processes of one issue fix → PR", async () => {
+    // Counting harness: a `git` shim first on PATH logs every git process
+    // (ours, delivery's authenticated ones, and git's own children).
+    const shimDir = mkdtempSync(path.join(os.tmpdir(), "viberon-gitshim-"));
+    const log = path.join(shimDir, "calls.log");
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    writeFileSync(path.join(shimDir, "git"), `#!/bin/sh\nprintf '%s ' "$@" | tr '\\n' ' ' >> "${log}"\necho >> "${log}"\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    const { observeGitExec } = await import("@/lib/git");
+    const viaRunGit: string[] = [];
+    try {
+      const { repoKey } = await registerLocalWorkspace(repo.root);
+      const { runFixTask } = await import("@/lib/tasks/runners");
+      vi.stubEnv("PATH", `${shimDir}:${process.env.PATH ?? ""}`);
+      observeGitExec((_cwd, args) => viaRunGit.push(args.join(" ")));
+      const started = performance.now();
+      const outcome = await runFixTask(fixTask(repoKey, "budget-2"), { emit: () => undefined, signal: new AbortController().signal });
+      const ms = Math.round(performance.now() - started);
+      expect(outcome.prUrl).toBe("https://github.com/o/r/pull/12");
+      const calls = readFileSync(log, "utf8").trim().split("\n");
+      const githubRequests = vi.mocked(fetch).mock.calls.length;
+      console.info(`[git budget] ${calls.length} git processes (${viaRunGit.length} via runGit), ${githubRequests} GitHub requests, ${ms}ms\n  ${calls.join("\n  ")}`);
+      if (process.env.VIBERON_BUDGET_OUT) writeFileSync(process.env.VIBERON_BUDGET_OUT, `${calls.length} ${viaRunGit.length} ${githubRequests} ${ms}\n${calls.join("\n")}\n`);
+      // 18 on this fixture before remote URLs were read once per repository (15 after).
+      expect(calls.length).toBeLessThanOrEqual(15);
+      expect(calls.filter((c) => c.includes("config --get")).length).toBe(1);
+      expect(calls.some((c) => /remote (get-url|-v)/.test(c))).toBe(false);
+    } finally {
+      observeGitExec(null);
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+});

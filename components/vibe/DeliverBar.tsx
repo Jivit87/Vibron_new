@@ -13,6 +13,7 @@ import { Check, ChevronRight, ExternalLink, Loader2, X } from "lucide-react";
 import { findIssueUrl } from "@/lib/client/clone";
 import { branchError, deliveryEvidence, shortRef, type CiCheck } from "@/lib/client/deliver";
 import { isMockMode } from "@/lib/client/mock-run";
+import { sameJson, startBackoffPolling } from "@/lib/client/use-polling";
 import { evidenceOf, type RunState } from "@/lib/client/run-reducer";
 import { useDeliver, type DeliverDraft } from "@/store/deliver";
 import { useViberon } from "@/store/viberon";
@@ -20,6 +21,8 @@ import { Checkbox, cx, formatAgo } from "@/components/vibe/primitives";
 
 const CI_POLL_MS = 20_000;
 const CI_POLL_MOCK_MS = 3_000;
+/** Unchanged checks back off to at most this multiple of the base interval. */
+const CI_POLL_MAX_FACTOR = 8;
 /** `.vb-btn` is unlayered CSS, so size overrides go inline rather than as utilities. */
 const SMALL_BTN = { height: 20, padding: "0 6px", fontSize: 11.5 } as const;
 
@@ -187,11 +190,20 @@ function Delivered({ runId, d, issueUrl, run }: { runId: string; d: DeliverDraft
 
   useEffect(() => {
     if (!pending) return;
-    const id = window.setInterval(
-      () => void useDeliver.getState().pollCi(runId),
-      isMockMode() ? CI_POLL_MOCK_MS : CI_POLL_MS,
-    );
-    return () => window.clearInterval(id);
+    const base = isMockMode() ? CI_POLL_MOCK_MS : CI_POLL_MS;
+    // Back off while the checks are unchanged, pause while the window is
+    // hidden, stop once they complete.
+    return startBackoffPolling({
+      baseMs: base,
+      maxMs: base * CI_POLL_MAX_FACTOR,
+      tick: async () => {
+        const before = useDeliver.getState().byRun[runId]?.ci;
+        await useDeliver.getState().pollCi(runId);
+        const after = useDeliver.getState().byRun[runId]?.ci;
+        if (after && after.state !== "pending") return "done";
+        return sameJson(before, after) ? "same" : "changed";
+      },
+    });
   }, [pending, runId]);
 
   function comment() {

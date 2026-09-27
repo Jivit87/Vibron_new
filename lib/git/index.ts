@@ -16,6 +16,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 
@@ -56,12 +57,106 @@ export interface GitRunResult {
 
 const MAX_BUFFER = 32 * 1024 * 1024;
 
+/** Sees every git process `runGit` starts (the counting harness in tests). */
+export type GitExecObserver = (cwd: string, args: string[]) => void;
+let execObserver: GitExecObserver | null = null;
+
+/** Install (or clear, with null) the observer; returns the previous one. */
+export function observeGitExec(observer: GitExecObserver | null): GitExecObserver | null {
+  const previous = execObserver;
+  execObserver = observer;
+  return previous;
+}
+
+/**
+ * Config reads (remote URLs) cached per repository: one issue fix → PR asks
+ * for the same remote URLs in the checkout and again in its worktree. An
+ * entry is only served while the config file's stamp is unchanged (edits
+ * made outside the app included), a git call through `runGit` that can
+ * change config drops it, and the TTL bounds anything else (global config).
+ */
+const READ_CACHE_TTL_MS = 30_000;
+type RunResult = GitRunResult & { code: number | null };
+const readCache = new Map<string, { at: number; stamp: string; value: Promise<RunResult> }>();
+const CHANGES_CONFIG = new Set(["remote", "init", "clone", "submodule"]);
+
+function changesConfig(args: string[]): boolean {
+  const verb = args[0] ?? "";
+  if (verb === "config") return !args.some((a) => a === "--get" || a === "--get-regexp" || a === "--list" || a === "-l");
+  return CHANGES_CONFIG.has(verb);
+}
+
+function rootPrefix(cwd: string): string {
+  return `${path.resolve(cwd)}\0`;
+}
+
+/** Forget cached reads for `cwd` (every root when omitted). */
+export function invalidateGitReadCache(cwd?: string): void {
+  if (!cwd) {
+    readCache.clear();
+    return;
+  }
+  const prefix = rootPrefix(configOwner(cwd));
+  for (const key of readCache.keys()) if (key.startsWith(prefix)) readCache.delete(key);
+}
+
+/**
+ * The repository whose config `root` reads: a linked worktree (`.git` is a
+ * file naming `<main>/.git/worktrees/<id>`) shares its main checkout's
+ * config, so an issue worktree reuses the checkout's cached remote URLs.
+ * Read from the filesystem: no git process.
+ */
+function configOwner(root: string): string {
+  try {
+    const text = readFileSync(path.join(root, ".git"), "utf8");
+    const gitdir = /^gitdir:\s*(.+)$/m.exec(text)?.[1]?.trim();
+    const common = gitdir && /^(.*[\\/]\.git)[\\/]worktrees[\\/][^\\/]+$/.exec(path.resolve(root, gitdir))?.[1];
+    if (common) return path.dirname(realpathSync(common));
+  } catch {
+    // `.git` is a directory (EISDIR) or missing: the root owns its config.
+  }
+  try {
+    return realpathSync(root);
+  } catch {
+    return path.resolve(root);
+  }
+}
+
+/**
+ * A stamp of the repository's config file (mtime + size), read with one
+ * `stat`: any edit — ours or a terminal `git remote add` — changes it, so a
+ * cached answer is never served across a config change.
+ */
+function configStamp(owner: string): string {
+  try {
+    const info = statSync(path.join(owner, ".git", "config"));
+    return `${info.mtimeMs}:${info.size}`;
+  } catch {
+    return "none";
+  }
+}
+
+/** `runGit` (allowFailure) for a config read whose answer is stable for a run. */
+function runGitCached(cwd: string, args: string[]): Promise<RunResult> {
+  const owner = configOwner(cwd);
+  const key = `${rootPrefix(owner)}${args.join("\0")}`;
+  const stamp = configStamp(owner);
+  const hit = readCache.get(key);
+  if (hit && hit.stamp === stamp && Date.now() - hit.at < READ_CACHE_TTL_MS) return hit.value;
+  const value = runGit(cwd, args, { allowFailure: true });
+  readCache.set(key, { at: Date.now(), stamp, value });
+  value.catch(() => readCache.delete(key));
+  return value;
+}
+
 /** Run git in `cwd` with a fixed argv. No shell is involved. */
 export function runGit(
   cwd: string,
   args: string[],
   opts: { timeoutMs?: number; allowFailure?: boolean } = {},
-): Promise<GitRunResult & { code: number | null }> {
+): Promise<RunResult> {
+  execObserver?.(cwd, args);
+  if (readCache.size && changesConfig(args)) invalidateGitReadCache(cwd);
   return new Promise((resolve, reject) => {
     execFile(
       "git",
@@ -202,6 +297,60 @@ export async function getStatus(rootPath: string): Promise<GitStatus> {
   return parseStatusV2(stdout);
 }
 
+export interface RepoSnapshot {
+  /** false outside a work tree (or when git is unavailable). */
+  isRepo: boolean;
+  /** Full HEAD commit, or null before the first commit. */
+  head: string | null;
+  /** Current branch, or null when detached. */
+  branch: string | null;
+  /** Staged, unstaged and untracked paths; both sides of a rename. */
+  changed: string[];
+}
+
+/**
+ * Everything a delivery checks before it acts, from ONE git process
+ * (`status --porcelain=v2 --branch`) instead of `rev-parse --show-toplevel`,
+ * `rev-parse --verify HEAD`, `status` and `branch --show-current`.
+ */
+export async function repoSnapshot(rootPath: string): Promise<RepoSnapshot> {
+  const r = await runGit(rootPath, ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"], {
+    allowFailure: true,
+  }).catch(() => null);
+  if (!r || r.code !== 0) return { isRepo: false, head: null, branch: null, changed: [] };
+  return parseSnapshot(r.stdout);
+}
+
+/** Parse `status --porcelain=v2 --branch -z` into a `RepoSnapshot`. */
+export function parseSnapshot(stdout: string): RepoSnapshot {
+  const snapshot: RepoSnapshot = { isRepo: true, head: null, branch: null, changed: [] };
+  const changed = new Set<string>();
+  const records = stdout.split("\0");
+  const after = (record: string, fields: number) => record.split(" ").slice(fields).join(" ");
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i]!;
+    if (record.startsWith("# branch.oid ")) {
+      const oid = record.slice("# branch.oid ".length);
+      snapshot.head = oid === "(initial)" ? null : oid;
+    } else if (record.startsWith("# branch.head ")) {
+      const head = record.slice("# branch.head ".length);
+      snapshot.branch = head === "(detached)" ? null : head;
+    } else if (record.startsWith("1 ")) {
+      changed.add(after(record, 8));
+    } else if (record.startsWith("2 ")) {
+      changed.add(after(record, 9));
+      const orig = records[++i];
+      if (orig) changed.add(orig);
+    } else if (record.startsWith("u ")) {
+      changed.add(after(record, 10));
+    } else if (record.startsWith("? ")) {
+      changed.add(record.slice(2));
+    }
+  }
+  snapshot.changed = [...changed].filter(Boolean);
+  return snapshot;
+}
+
 export async function hasHead(rootPath: string): Promise<boolean> {
   const { code } = await runGit(rootPath, ["rev-parse", "--verify", "-q", "HEAD"], {
     allowFailure: true,
@@ -210,14 +359,13 @@ export async function hasHead(rootPath: string): Promise<boolean> {
 }
 
 export async function getLog(rootPath: string, limit = 30): Promise<GitCommit[]> {
-  if (!(await hasHead(rootPath))) return [];
   const n = Math.max(1, Math.min(200, Math.floor(limit)));
-  const { stdout } = await runGit(rootPath, [
-    "log",
-    `-n${n}`,
-    `--pretty=format:${LOG_FORMAT}`,
-  ]);
-  return parseLog(stdout);
+  // One process: before the first commit `git log` fails, which means "no
+  // history" (no separate `rev-parse --verify HEAD` first).
+  const { stdout, code } = await runGit(rootPath, ["log", `-n${n}`, `--pretty=format:${LOG_FORMAT}`], {
+    allowFailure: true,
+  });
+  return code === 0 ? parseLog(stdout) : [];
 }
 
 export async function getBranches(rootPath: string): Promise<GitBranch[]> {
@@ -350,11 +498,6 @@ export async function push(rootPath: string, upstream: string | null): Promise<s
 }
 
 /**
- * A remote's configured URL, or null. Not `git remote get-url`, which expands
- * url.*.insteadOf: the configured URL names the hosting repository, and git
- * applies any rewrite itself when it connects.
- */
-/**
  * The remote that holds the real project: `upstream` when it exists (origin
  * is then usually the user's fork), else `origin`. Issues are read from it,
  * fixes start from its default branch, and pull requests target it.
@@ -363,8 +506,33 @@ export async function projectRemote(root: string): Promise<"upstream" | "origin"
   return (await configuredRemoteUrl(root, "upstream")) ? "upstream" : "origin";
 }
 
+/**
+ * A remote's configured URL, or null. Not `git remote get-url`, which expands
+ * url.*.insteadOf: the configured URL names the hosting repository, and git
+ * applies any rewrite itself when it connects. The only remote-URL helper.
+ *
+ * One `git config --get-regexp` answers every remote of a root at once and is
+ * cached briefly (see `runGitCached`), so asking for `upstream` then `origin`
+ * in one run costs a single git process.
+ */
 export async function configuredRemoteUrl(root: string, remote = "origin"): Promise<string | null> {
   if (!/^[\w.-]+$/.test(remote)) return null;
-  const r = await runGit(root, ["config", "--get", `remote.${remote}.url`], { allowFailure: true });
-  return r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+  const r = await runGitCached(root, ["config", "--get-regexp", "^remote\\..*\\.url$"]);
+  if (r.code !== 0) return null;
+  const want = `remote.${remote}.url`;
+  let url: string | null = null;
+  for (const line of r.stdout.split("\n")) {
+    const space = line.indexOf(" ");
+    if (space > 0 && line.slice(0, space) === want) url = line.slice(space + 1).trim() || null;
+  }
+  return url;
+}
+
+/**
+ * Fetch one branch of `remote` into its remote-tracking ref. The `+` forces
+ * the update, so an upstream force-push (a rewritten default branch) still
+ * fetches; `--no-tags` keeps a tag clash from failing it.
+ */
+export function branchFetchArgs(remote: string, branch: string): string[] {
+  return ["fetch", "--quiet", "--no-tags", remote, `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`];
 }

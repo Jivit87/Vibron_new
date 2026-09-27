@@ -25,6 +25,7 @@ import {
   patchIndexedFile,
   type IndexStats,
 } from "@/lib/workspace/graph-index";
+import { isIssueWorktreeRoot, registerEphemeralWorkspace } from "@/lib/workspace/ephemeral";
 
 export const IGNORED_DIRS = new Set([
   ".git",
@@ -177,6 +178,9 @@ export async function registerLocalWorkspace(
     registeredAt: Date.now(),
   };
 
+  // An issue worktree is throwaway: its files, index and graph stay in
+  // memory and go with it, never into the persisted store.
+  if (isIssueWorktreeRoot(resolvedRoot)) registerEphemeralWorkspace(repoKey, resolvedRoot);
   await putLocalWorkspace(meta);
   // `.viberon/` holds the graph cache and memory; keep it out of any diff.
   await ensureViberonDir(resolvedRoot).catch(() => undefined);
