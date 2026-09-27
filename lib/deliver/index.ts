@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { DeliverError } from "@/lib/deliver/errors";
-import { configuredRemoteUrl, projectRemote, runGit } from "@/lib/git";
+import { branchFetchArgs, configuredRemoteUrl, projectRemote, runGit } from "@/lib/git";
 import {
   canPush,
   createPullRequest,
@@ -465,7 +465,7 @@ export async function createIssueWorktree(
   if (!/^[\w./-]+$/.test(base) || base.startsWith("-")) throw new DeliverError(`Unexpected default branch "${base}".`, "invalid_input", 400);
 
   if (!options.baseBranch) {
-    const fetched = await gitWithAuth(root, ["fetch", "--quiet", project, `refs/heads/${base}:refs/remotes/${project}/${base}`], gitAuthEnv(token, url));
+    const fetched = await gitWithAuth(root, branchFetchArgs(project, base), gitAuthEnv(token, url));
     if (fetched.code !== 0) {
       throw new DeliverError(`Could not fetch ${project}/${base}: ${redact(fetched.output, token).slice(0, 300)}`, "fetch_failed", 502);
     }
