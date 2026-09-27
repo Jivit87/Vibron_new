@@ -19,7 +19,6 @@ import {
   canFix,
   clampInterval,
   fetchIssues,
-  fixAllIssuesInOnePr,
   fixIssues,
   INTERVAL_MAX,
   INTERVAL_MIN,
@@ -35,6 +34,7 @@ import {
 } from "@/lib/client/issues";
 import { useViberon } from "@/store/viberon";
 import { Checkbox, cx, EmptyState, formatAgo, IconButton, Switch } from "@/components/vibe/primitives";
+import { IssueBatchView } from "@/components/vibe/IssueBatchView";
 
 const STATUS_COLOR: Record<IssueStatusKind, string> = {
   none: "var(--vb-text-faint)",
@@ -71,7 +71,7 @@ export function IssuesPanel() {
   const [labelInput, setLabelInput] = useState("");
   const [label, setLabel] = useState("");
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [fixingAll, setFixingAll] = useState(false);
+  const [batchTaskId, setBatchTaskId] = useState<string | null>(null);
   const [pending, setPending] = useState<Set<number>>(new Set());
   const [skipped, setSkipped] = useState<Map<number, string>>(new Map());
   const [fixError, setFixError] = useState<IssuesError | null>(null);
@@ -165,16 +165,6 @@ export function IssuesPanel() {
         return next;
       });
     }
-    void refresh();
-  }
-
-  async function fixAll() {
-    if (!repoKey) return;
-    setFixingAll(true);
-    const error = await fixAllIssuesInOnePr(repoKey, useViberon.getState().settings.model);
-    setFixingAll(false);
-    if (error) toast.error(error);
-    else toast.success("Fixing all open issues; one pull request at the end.");
     void refresh();
   }
 
@@ -290,18 +280,19 @@ export function IssuesPanel() {
         >
           Fix selected{selectedCount > 0 ? ` (${selectedCount})` : ""}
         </button>
-        <button
-          type="button"
-          className="vb-btn vb-btn-primary"
-          style={{ height: 22, padding: "0 8px" }}
-          disabled={fixable.length === 0 || fixingAll}
-          title="Fix every open issue on one branch and open one pull request"
-          onClick={() => void fixAll()}
-        >
-          {fixingAll ? <Loader2 className="size-3.5 animate-spin" /> : null}
-          Fix all → 1 PR
-        </button>
       </div>
+
+      {/* Several issues at once: live status, timing and pull requests per issue. */}
+      <IssueBatchView
+        repoKey={repoKey}
+        numbers={selectedCount > 0 ? [...selected] : "all"}
+        model={useViberon.getState().settings.model}
+        taskId={batchTaskId}
+        onTaskId={(id) => {
+          setBatchTaskId(id);
+          void refresh();
+        }}
+      />
 
       {/* Auto-fix watcher. */}
       <div className="flex h-[26px] shrink-0 items-center gap-2 px-3 pt-1 text-[12px]" style={{ color: "var(--vb-text-mid)" }}>

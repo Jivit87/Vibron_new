@@ -16,6 +16,7 @@ import {
   mockEnqueue,
   mockReport,
   mockRerun,
+  mockTaskById,
   mockTasks,
 } from "@/lib/client/mock-run";
 import type { Evidence } from "@/lib/client/run-reducer";
@@ -378,11 +379,149 @@ export interface TaskRow {
   usage?: TaskUsageRow;
   /** Files the task changed, when the server reports them. */
   files?: string[];
+  /** A batch task's per-issue outcome (`docs/PLAN-ISSUES.md`), several issues at once. */
+  issueResults?: BatchIssueResult[];
+  /** The model the task ran with, when the server reports it. */
+  model?: string;
 }
 
 export interface TaskUsageRow {
   tokens: number;
   costUsd: number;
+}
+
+/* ------------------------------ issue batch -------------------------------- */
+
+/** A batch issue row's lifecycle, richer than a task's own `TaskState`. */
+export type BatchIssueStatus = "queued" | "running" | "verified" | "unproven" | "failed" | "cancelled";
+
+export interface BatchTiming {
+  modelMs: number;
+  toolsMs: number;
+  proofMs: number;
+}
+
+export interface BatchUsageRow {
+  input: number;
+  output: number;
+  cached: number;
+  calls: number;
+}
+
+export interface BatchFastPath {
+  used: boolean;
+  calls: number;
+  accepted: boolean;
+}
+
+/** One issue's row in a batch: `GET /api/tasks/:id` → `task.issueResults[]`. */
+export interface BatchIssueResult {
+  url: string;
+  number?: number;
+  title?: string;
+  status: BatchIssueStatus;
+  phase?: string;
+  startedAt?: number;
+  finishedAt?: number;
+  timing?: BatchTiming;
+  usage?: BatchUsageRow;
+  prUrl?: string;
+  fastPath?: BatchFastPath;
+  detail?: string;
+}
+
+export function normalizeBatchIssueStatus(value: unknown, fallbackState?: unknown): BatchIssueStatus {
+  const s = typeof value === "string" ? value.toLowerCase() : "";
+  if (s === "queued" || s === "pending") return "queued";
+  if (s === "running" || s === "in_progress" || s === "active") return "running";
+  if (s === "verified" || s === "done" || s === "resolved" || s === "fixed") return "verified";
+  if (s === "unproven" || s === "no_proof" || s === "gave_up" || s === "incomplete") return "unproven";
+  if (s === "failed" || s === "error") return "failed";
+  if (s === "cancelled" || s === "canceled" || s === "stopped") return "cancelled";
+  // A batch issue row without its own status yet: fall back to the task's.
+  const t = normalizeTaskState(fallbackState);
+  return t === "done" ? "verified" : t;
+}
+
+function batchTiming(raw: unknown): BatchTiming | undefined {
+  const t = rec(raw);
+  if (!t) return undefined;
+  const modelMs = num(t.modelMs) ?? 0;
+  const toolsMs = num(t.toolsMs) ?? 0;
+  const proofMs = num(t.proofMs) ?? 0;
+  return modelMs || toolsMs || proofMs ? { modelMs, toolsMs, proofMs } : undefined;
+}
+
+function batchUsage(raw: unknown): BatchUsageRow | undefined {
+  const u = rec(raw);
+  if (!u) return undefined;
+  const input = num(u.input) ?? num(u.inputTokens) ?? 0;
+  const output = num(u.output) ?? num(u.outputTokens) ?? 0;
+  const cached = num(u.cached) ?? num(u.cacheReadTokens) ?? 0;
+  const calls = num(u.calls) ?? num(u.modelCalls) ?? 0;
+  return input || output || cached || calls ? { input, output, cached, calls } : undefined;
+}
+
+function batchFastPath(raw: unknown): BatchFastPath | undefined {
+  const f = rec(raw);
+  if (!f) return undefined;
+  return { used: f.used === true, calls: num(f.calls) ?? 0, accepted: f.accepted === true };
+}
+
+export function normalizeBatchIssueResult(raw: unknown): BatchIssueResult | null {
+  const r = rec(raw);
+  if (!r) return null;
+  const url = str(r.url) ?? str(r.issueUrl) ?? str(r.html_url);
+  if (!url) return null;
+  return {
+    url,
+    number: num(r.number) ?? num(r.issueNumber),
+    title: str(r.title),
+    status: normalizeBatchIssueStatus(r.status, r.state),
+    phase: str(r.phase),
+    startedAt: time(r.startedAt),
+    finishedAt: time(r.finishedAt),
+    timing: batchTiming(r.timing),
+    usage: batchUsage(r.usage),
+    prUrl: str(r.prUrl) ?? str(r.pr_url),
+    fastPath: batchFastPath(r.fastPath),
+    detail: str(r.detail) ?? str(r.note) ?? str(r.error),
+  };
+}
+
+function taskIssueResults(r: Record<string, unknown>): BatchIssueResult[] | undefined {
+  const list = Array.isArray(r.issueResults) ? r.issueResults : undefined;
+  if (!list) return undefined;
+  const rows = list.map(normalizeBatchIssueResult).filter((x): x is BatchIssueResult => x !== null);
+  return rows.length ? rows : undefined;
+}
+
+/** Elapsed ms for a batch row: finished-started, else now-started, else 0 (not started). */
+export function batchIssueElapsedMs(row: Pick<BatchIssueResult, "startedAt" | "finishedAt">, now: number): number {
+  if (!row.startedAt) return 0;
+  return Math.max(0, (row.finishedAt ?? now) - row.startedAt);
+}
+
+/** The time-breakdown bar's three segments as a percentage of their sum (100 when nothing was measured). */
+export function batchTimingPct(timing: BatchTiming | undefined): { modelPct: number; toolsPct: number; proofPct: number } {
+  const total = (timing?.modelMs ?? 0) + (timing?.toolsMs ?? 0) + (timing?.proofMs ?? 0);
+  if (!timing || total <= 0) return { modelPct: 0, toolsPct: 0, proofPct: 0 };
+  return {
+    modelPct: (timing.modelMs / total) * 100,
+    toolsPct: (timing.toolsMs / total) * 100,
+    proofPct: (timing.proofMs / total) * 100,
+  };
+}
+
+/** Sums tokens/calls across a batch's rows (its usage, when the task's own totals are unset). */
+export function batchIssueTotals(rows: readonly BatchIssueResult[]): { tokens: number; calls: number } {
+  return rows.reduce(
+    (acc, r) => ({
+      tokens: acc.tokens + (r.usage ? r.usage.input + r.usage.output + r.usage.cached : 0),
+      calls: acc.calls + (r.usage?.calls ?? 0),
+    }),
+    { tokens: 0, calls: 0 },
+  );
 }
 
 /**
@@ -437,7 +576,22 @@ export function normalizeTask(raw: unknown): TaskRow | null {
     note: str(r.note),
     usage: taskUsage(r),
     ...taskFiles(r, result),
+    ...(taskIssueResults(r) ? { issueResults: taskIssueResults(r) } : {}),
+    ...(str(r.model) ? { model: str(r.model) } : {}),
   };
+}
+
+/** One task by id, for a batch's live poll (`GET /api/tasks/:id`). Null on any failure. */
+export async function fetchTask(id: string): Promise<TaskRow | null> {
+  if (isMockMode()) return normalizeTask(mockTaskById(id));
+  try {
+    const response = await fetch(`/api/tasks/${encodeURIComponent(id)}`);
+    if (!response.ok) return null;
+    const body = (await response.json().catch(() => null)) as unknown;
+    return normalizeTask(rec(body)?.task ?? body);
+  } catch {
+    return null;
+  }
 }
 
 /** Changed files from `files` / `changedFiles` / `result.files`, as paths or `{ path }`. */

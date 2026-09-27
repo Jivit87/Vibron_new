@@ -1378,7 +1378,7 @@ const mockTaskList: Record<string, unknown>[] = [
 ];
 
 export function mockTasks(): unknown {
-  return { tasks: mockTaskList.map((t) => ({ ...t })) };
+  return { tasks: mockTaskList.map((t) => (t.__batchDemo ? mockTaskById(t.id as string) : { ...t })) };
 }
 
 export function mockEnqueue(input: Record<string, unknown>): unknown {
@@ -1428,20 +1428,136 @@ const MOCK_BATCH = [
   "#2517 CLI ignores --encoding on stdin",
 ];
 
-/** A combined task for "fix every open issue in one pull request". */
-function mockCombinedTask(): Record<string, unknown> {
+/**
+ * A 10-issue batch that exercises every batch-view state: queued, running
+ * (with a live phase and a fast-path attempt in progress), verified via the
+ * fast path (1 call), verified via the full agent, unproven ("gave up"
+ * without proof), failed, and cancelled. `combined` shares one PR url
+ * across every verified row; per-issue mode gives each its own.
+ */
+interface MockBatchIssueSpec {
+  number: number;
+  title: string;
+  /** Ms after the batch starts that this issue starts / finishes. */
+  startAt: number;
+  finishAt: number | null;
+  status: BatchIssueStatus;
+  fastPath?: { used: boolean; calls: number; accepted: boolean };
+  detail?: string;
+  timing: { modelMs: number; toolsMs: number; proofMs: number };
+  usage: { input: number; output: number; cached: number; calls: number };
+}
+
+type BatchIssueStatus = "queued" | "running" | "verified" | "unproven" | "failed" | "cancelled";
+
+const MOCK_BATCH_10: MockBatchIssueSpec[] = [
+  { number: 201, title: "slugify() drops accented letters", startAt: 0, finishAt: 7_500, status: "verified", fastPath: { used: true, calls: 1, accepted: true }, timing: { modelMs: 4_200, toolsMs: 2_600, proofMs: 700 }, usage: { input: 5_400, output: 380, cached: 2_100, calls: 1 } },
+  { number: 202, title: "Config loader fails on CRLF line endings", startAt: 500, finishAt: 9_800, status: "verified", fastPath: { used: true, calls: 1, accepted: true }, timing: { modelMs: 5_100, toolsMs: 3_200, proofMs: 800 }, usage: { input: 6_100, output: 410, cached: 2_400, calls: 1 } },
+  { number: 203, title: "wrap() splits surrogate pairs at the width boundary", startAt: 1_000, finishAt: 12_400, status: "verified", fastPath: { used: true, calls: 1, accepted: true }, timing: { modelMs: 6_300, toolsMs: 4_100, proofMs: 900 }, usage: { input: 7_200, output: 520, cached: 3_000, calls: 1 } },
+  { number: 204, title: "CLI ignores --encoding when reading from stdin", startAt: 0, finishAt: 43_000, status: "verified", fastPath: { used: true, calls: 1, accepted: false }, timing: { modelMs: 21_400, toolsMs: 16_800, proofMs: 3_600 }, usage: { input: 28_000, output: 2_600, cached: 11_400, calls: 6 } },
+  { number: 205, title: "Windows path separators in textkit.cli output", startAt: 2_000, finishAt: 56_000, status: "verified", fastPath: { used: false, calls: 0, accepted: false }, timing: { modelMs: 27_100, toolsMs: 20_300, proofMs: 5_200 }, usage: { input: 33_500, output: 3_100, cached: 14_200, calls: 7 } },
+  { number: 206, title: "truncate() ellipsis argument ignored on empty strings", startAt: 0, finishAt: 31_000, status: "unproven", fastPath: { used: true, calls: 1, accepted: false }, detail: "gave up after 41,800 tokens without proof: the reproduction still passes on the base commit.", timing: { modelMs: 14_800, toolsMs: 12_600, proofMs: 2_200 }, usage: { input: 32_400, output: 3_600, cached: 5_800, calls: 5 } },
+  { number: 207, title: "Support Python 3.13 in CI matrix", startAt: 3_000, finishAt: 21_000, status: "failed", detail: "worktree checkout failed: origin/main moved during the run.", timing: { modelMs: 8_200, toolsMs: 6_900, proofMs: 0 }, usage: { input: 11_000, output: 900, cached: 2_800, calls: 2 } },
+  { number: 208, title: "Document the truncate() ellipsis argument", startAt: 5_000, finishAt: 15_000, status: "cancelled", detail: "stopped by the user.", timing: { modelMs: 3_100, toolsMs: 2_400, proofMs: 0 }, usage: { input: 4_800, output: 320, cached: 900, calls: 1 } },
+  { number: 209, title: "Numeric locale separators break the CSV export", startAt: 4_000, finishAt: null, status: "running", timing: { modelMs: 0, toolsMs: 0, proofMs: 0 }, usage: { input: 0, output: 0, cached: 0, calls: 0 } },
+  { number: 210, title: "Retry backoff never resets after a success", startAt: 62_000, finishAt: null, status: "queued", timing: { modelMs: 0, toolsMs: 0, proofMs: 0 }, usage: { input: 0, output: 0, cached: 0, calls: 0 } },
+];
+
+/** Live phases a running issue cycles through, for the batch view's phase text. */
+const MOCK_RUN_PHASES = ["localize", "editing", "verifying"];
+
+/**
+ * `task.issueResults[]` for a batch, computed fresh from wall time so the
+ * view shows a live clock and progress without any stored mutable state.
+ */
+export function mockBatchIssueResults(startedAt: number, combined: boolean): unknown[] {
+  const now = Date.now();
+  const elapsed = now - startedAt;
+  return MOCK_BATCH_10.map((spec) => {
+    const url = `https://github.com/acme/textkit/issues/${spec.number}`;
+    if (elapsed < spec.startAt) {
+      return { url, number: spec.number, title: spec.title, status: "queued" };
+    }
+    const running = spec.finishAt === null || elapsed < spec.finishAt;
+    if (running) {
+      const since = elapsed - spec.startAt;
+      const phase = MOCK_RUN_PHASES[Math.floor(since / 5_000) % MOCK_RUN_PHASES.length];
+      return {
+        url,
+        number: spec.number,
+        title: spec.title,
+        status: "running",
+        phase,
+        startedAt: startedAt + spec.startAt,
+        timing: { modelMs: Math.round(since * 0.55), toolsMs: Math.round(since * 0.35), proofMs: Math.round(since * 0.1) },
+        usage: { input: Math.round(since * 0.7), output: Math.round(since * 0.08), cached: Math.round(since * 0.3), calls: 1 + Math.floor(since / 8_000) },
+        fastPath: since < 8_000 ? { used: true, calls: 1, accepted: false } : undefined,
+      };
+    }
+    return {
+      url,
+      number: spec.number,
+      title: spec.title,
+      status: spec.status,
+      startedAt: startedAt + spec.startAt,
+      finishedAt: startedAt + (spec.finishAt ?? spec.startAt),
+      timing: spec.timing,
+      usage: spec.usage,
+      fastPath: spec.fastPath,
+      detail: spec.detail,
+      prUrl: spec.status === "verified" ? (combined ? "https://github.com/acme/textkit/pull/70" : `https://github.com/acme/textkit/pull/${300 + spec.number}`) : undefined,
+    };
+  });
+}
+
+/** A batch task's live totals from its rows, for the header while `usage` has not settled yet. */
+function mockBatchTotals(rows: unknown[]): { inputTokens: number; outputTokens: number; cacheReadTokens: number; costUsd: number; calls: number } {
+  let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, calls = 0;
+  for (const row of rows) {
+    const r = row as { usage?: { input?: number; output?: number; cached?: number; calls?: number } };
+    inputTokens += r.usage?.input ?? 0;
+    outputTokens += r.usage?.output ?? 0;
+    cacheReadTokens += r.usage?.cached ?? 0;
+    calls += r.usage?.calls ?? 0;
+  }
+  return { inputTokens, outputTokens, cacheReadTokens, costUsd: Math.round((inputTokens * 3 + outputTokens * 15) / 1e6 * 1e4) / 1e4, calls };
+}
+
+/** A combined task for "fix every open issue in one pull request" (10 issues, all batch states). */
+function mockCombinedTask(combined = true): Record<string, unknown> {
+  const startedAt = Date.now();
   const task = {
     id: `t_${Math.random().toString(16).slice(2, 6)}`,
     kind: "fix",
     repoKey: "mock",
-    task: `Fix ${MOCK_BATCH.length} open issues in one pull request\n\n${MOCK_BATCH.join("\n")}`,
+    task: `Fix ${MOCK_BATCH_10.length} open issues ${combined ? "in one pull request" : "(one pull request per issue)"}\n\n${MOCK_BATCH.join("\n")}`,
     source: "issue",
     state: "running",
-    createdAt: Date.now(),
-    startedAt: Date.now(),
+    createdAt: startedAt,
+    startedAt,
+    model: "claude-sonnet-5",
+    issueUrls: MOCK_BATCH_10.map((s) => `https://github.com/acme/textkit/issues/${s.number}`),
+    __batchDemo: true,
+    __combined: combined,
   };
   mockTaskList.unshift(task);
   return task;
+}
+
+/** `GET /api/tasks/:id` under `?mock=1`: recomputes a batch's `issueResults` live. */
+export function mockTaskById(id: string): unknown {
+  const task = mockTaskList.find((t) => t.id === id);
+  if (!task) return null;
+  if (!task.__batchDemo) return { ...task };
+  const rows = mockBatchIssueResults(Number(task.startedAt), Boolean(task.__combined));
+  const allDone = rows.every((r) => (r as { status: string }).status !== "queued" && (r as { status: string }).status !== "running");
+  return {
+    ...task,
+    state: allDone ? "done" : "running",
+    finishedAt: allDone ? Date.now() : undefined,
+    issueResults: rows,
+    usage: mockBatchTotals(rows),
+  };
 }
 
 /* ------------------------------ issues → PR ------------------------------- */
@@ -1507,8 +1623,10 @@ export function mockIssues(label: string): unknown {
   };
 }
 
-export function mockFixIssues(numbers: number[], combined = false): unknown {
-  if (combined) return { tasks: [mockCombinedTask()], skipped: [] };
+export function mockFixIssues(numbers: number[], combined = false, batch = false): unknown {
+  // A batch (several issues, one task, `combined` picks one shared PR vs. one per issue).
+  if (batch || (combined && numbers.length > 1)) return { tasks: [mockCombinedTask(combined)], skipped: [] };
+  if (combined) return { tasks: [mockCombinedTask(true)], skipped: [] };
   const tasks: unknown[] = [];
   const skipped: { number: number; reason: string }[] = [];
   for (const n of numbers) {
