@@ -11,3 +11,6 @@ dist/
 .viberon/
 eval/.cache/
 eval/results/runs/
+
+# SWE-bench runner output (bundles can be large; results.md is the summary)
+eval/swe/results/
