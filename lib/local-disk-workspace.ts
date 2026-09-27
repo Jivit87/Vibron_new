@@ -9,7 +9,7 @@ import path from "node:path";
 
 import type { LocalWorkspaceMeta, StoredRawFile } from "@/lib/graph";
 import { repoKey as makeRepoKey } from "@/lib/ids";
-import { countTokens } from "@/lib/tokens";
+import { countTokensCached } from "@/lib/tokens";
 import {
   getFileInfo,
   getLocalWorkspace,
@@ -19,6 +19,7 @@ import {
   putLocalWorkspace,
   putRawFiles,
 } from "@/lib/store";
+import { timeSlicer } from "@/lib/workers/yield";
 import {
   ensureViberonDir,
   indexWorkspaceFiles,
@@ -60,6 +61,16 @@ export const IGNORED_DIRS = new Set([
 
 /** Hard cap on scanned files so a monorepo cannot stall indexing. */
 export const MAX_SCAN_FILES = 20_000;
+/**
+ * Hard cap on the total source read by one scan. Past it the workspace gets
+ * a partial listing and graph (`lastIndexStats.truncated`) instead of the
+ * server spending minutes and gigabytes on it.
+ */
+export const MAX_SCAN_BYTES = 96 * 1024 * 1024;
+
+export interface ScanOptions {
+  signal?: AbortSignal;
+}
 
 const TEXT_EXTENSIONS = new Set([
   ".c",
@@ -161,6 +172,7 @@ export function resolveWorkspaceFilePath(
 export async function registerLocalWorkspace(
   rootPath: string,
   overrides: Partial<Pick<LocalWorkspaceMeta, "repoKey" | "repoRef" | "label">> = {},
+  options: ScanOptions = {},
 ): Promise<LocalWorkspaceMeta> {
   const resolvedRoot = path.resolve(rootPath);
   const info = await stat(resolvedRoot);
@@ -170,10 +182,13 @@ export async function registerLocalWorkspace(
 
   const repoRef = overrides.repoRef ?? repoRefForLocalWorkspace(resolvedRoot);
   const repoKey = overrides.repoKey ?? makeRepoKey(repoRef);
+  // Re-opening a folder keeps the name it was registered under (a clone's
+  // `owner/name`, not its `owner__name` folder).
+  const previous = overrides.label ? null : await getLocalWorkspace(repoKey);
   const meta: LocalWorkspaceMeta = {
     repoKey,
     repoRef,
-    label: overrides.label ?? path.basename(resolvedRoot) ?? "Workspace",
+    label: overrides.label ?? (previous?.rootPath === resolvedRoot ? previous.label : null) ?? path.basename(resolvedRoot) ?? "Workspace",
     rootPath: resolvedRoot,
     registeredAt: Date.now(),
   };
@@ -184,19 +199,19 @@ export async function registerLocalWorkspace(
   await putLocalWorkspace(meta);
   // `.viberon/` holds the graph cache and memory; keep it out of any diff.
   await ensureViberonDir(resolvedRoot).catch(() => undefined);
-  await refreshLocalWorkspace(meta.repoKey);
+  await refreshLocalWorkspace(meta.repoKey, options);
   return meta;
 }
 
-export async function refreshLocalWorkspace(repoKey: string): Promise<StoredRawFile[]> {
+export async function refreshLocalWorkspace(repoKey: string, options: ScanOptions = {}): Promise<StoredRawFile[]> {
   const meta = await getLocalWorkspace(repoKey);
   if (!meta) {
     throw new WorkspacePathError(`Local workspace not found for ${repoKey}.`);
   }
 
-  const files = await scanLocalWorkspace(meta.rootPath);
-  await persistWorkspaceFiles(meta, files);
-  return files;
+  const scan = await scanLocalWorkspaceDetailed(meta.rootPath, options);
+  await persistWorkspaceFiles(meta, scan.files, { ...options, truncated: scan.truncated });
+  return scan.files;
 }
 
 export async function listLocalWorkspaceFiles(repoKey: string): Promise<StoredRawFile[]> {
@@ -241,20 +256,27 @@ export const lastIndexStats = new Map<string, IndexStats>();
 async function persistWorkspaceFiles(
   meta: LocalWorkspaceMeta,
   files: StoredRawFile[],
+  options: ScanOptions & { truncated?: boolean } = {},
 ): Promise<void> {
-  const { graph, stats } = await indexWorkspaceFiles(meta.repoKey, meta.rootPath, meta.repoRef, files);
-  lastIndexStats.set(meta.repoKey, stats);
-  await Promise.all([
-    putRawFiles(meta.repoKey, files),
-    putGraph(meta.repoKey, graph),
-    putFileInfo(
-      meta.repoKey,
-      files.map((file) => ({
-        path: file.path,
-        tokenCount: countTokens(file.source),
-      })),
-    ),
-  ]);
+  const { graph, stats } = await indexWorkspaceFiles(meta.repoKey, meta.rootPath, meta.repoRef, files, options);
+  lastIndexStats.set(meta.repoKey, options.truncated ? { ...stats, truncated: true } : stats);
+  const fileInfo = await tokenIndex(files, options.signal);
+  // Raw sources stay on disk: the store derives them (no putRawFiles).
+  await Promise.all([putGraph(meta.repoKey, graph), putFileInfo(meta.repoKey, fileInfo)]);
+}
+
+/** Token counts of every file, yielding to the event loop as it goes. */
+export async function tokenIndex(
+  files: StoredRawFile[],
+  signal?: AbortSignal,
+): Promise<{ path: string; tokenCount: number }[]> {
+  const tick = timeSlicer();
+  const out: { path: string; tokenCount: number }[] = [];
+  for (const file of files) {
+    await tick(signal);
+    out.push({ path: file.path, tokenCount: countTokensCached(file.source) });
+  }
+  return out;
 }
 
 /**
@@ -280,12 +302,18 @@ export async function patchWorkspaceFile(
     }
     graph = (await indexWorkspaceFiles(repoKey, rootPath, repoRef, files)).graph;
   }
-  const [raw, info] = await Promise.all([getRawFiles(repoKey), getFileInfo(repoKey)]);
-  const nextRaw = raw.filter((file) => file.path !== filePath);
+  const info = await getFileInfo(repoKey);
   const nextInfo = info.filter((file) => file.path !== filePath);
+  if (source !== null) nextInfo.push({ path: filePath, tokenCount: countTokensCached(source) });
+  if (rootPath) {
+    // The file itself is already on disk; only the graph and token index change.
+    await Promise.all([putGraph(repoKey, graph), putFileInfo(repoKey, nextInfo)]);
+    return;
+  }
+  const raw = await getRawFiles(repoKey);
+  const nextRaw = raw.filter((file) => file.path !== filePath);
   if (source !== null) {
     nextRaw.push({ path: filePath, source });
-    nextInfo.push({ path: filePath, tokenCount: countTokens(source) });
     nextRaw.sort((a, b) => a.path.localeCompare(b.path));
   }
   await Promise.all([
@@ -295,17 +323,34 @@ export async function patchWorkspaceFile(
   ]);
 }
 
-export async function scanLocalWorkspace(rootPath: string): Promise<StoredRawFile[]> {
+export async function scanLocalWorkspace(rootPath: string, options: ScanOptions = {}): Promise<StoredRawFile[]> {
+  return (await scanLocalWorkspaceDetailed(rootPath, options)).files;
+}
+
+/** `scanLocalWorkspace` plus whether a cap cut the listing short. */
+export async function scanLocalWorkspaceDetailed(
+  rootPath: string,
+  options: ScanOptions = {},
+): Promise<{ files: StoredRawFile[]; truncated: boolean }> {
   const root = path.resolve(rootPath);
   const files: StoredRawFile[] = [];
+  const tick = timeSlicer();
+  let bytes = 0;
+  let truncated = false;
+  const full = () => {
+    if (files.length >= MAX_SCAN_FILES || bytes >= MAX_SCAN_BYTES) truncated = true;
+    return truncated;
+  };
 
   async function visit(dir: string): Promise<void> {
-    if (files.length >= MAX_SCAN_FILES) return;
+    if (full()) return;
+    options.signal?.throwIfAborted();
     const entries = await readdir(dir, { withFileTypes: true });
     // Any virtualenv, whatever it is called (`env/`, `.venv-3.11/`, …).
     if (dir !== root && entries.some((e) => e.isFile() && e.name === "pyvenv.cfg")) return;
     for (const entry of entries) {
-      if (files.length >= MAX_SCAN_FILES) return;
+      if (full()) return;
+      await tick(options.signal);
       if (entry.isDirectory()) {
         if (IGNORED_DIRS.has(entry.name) || entry.name.endsWith(".egg-info")) continue;
         await visit(path.join(dir, entry.name));
@@ -320,12 +365,13 @@ export async function scanLocalWorkspace(rootPath: string): Promise<StoredRawFil
       if (info.size > MAX_TEXT_FILE_BYTES) continue;
       const source = await readFile(absolutePath, "utf8");
       if (source.includes("\0")) continue;
+      bytes += source.length;
       files.push({ path: relativePath, source });
     }
   }
 
   await visit(root);
-  return files.sort((a, b) => a.path.localeCompare(b.path));
+  return { files: files.sort((a, b) => a.path.localeCompare(b.path)), truncated };
 }
 
 function shouldReadTextFile(filePath: string): boolean {

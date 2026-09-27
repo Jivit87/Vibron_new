@@ -4,6 +4,8 @@ dist/
 .pnpm-store/
 *.tsbuildinfo
 .viberon-dev-store.json
+.viberon-dev-store.json.bak*
+.viberon-store/
 .env*
 .DS_Store
 .playwright-mcp/

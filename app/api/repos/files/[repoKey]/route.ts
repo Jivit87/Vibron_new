@@ -32,7 +32,7 @@ export const runtime = "nodejs";
  *
  *     The repo on disk (the original tarball) is never touched. Edits are
  *     ephemeral — they live in the same in-memory store the dev fallback
- *     persists to `.viberon-dev-store.json`.
+ *     persists to the disk store (`.viberon-store/`).
  */
 export async function GET(
   request: Request,

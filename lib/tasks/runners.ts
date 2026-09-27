@@ -48,7 +48,8 @@ export const runFixTask: TaskRunner = async (task, { emit, signal }) => {
   if (signal.aborted) return { error: "Stopped." };
   const tree = await createIssueWorktree(home);
   try {
-    const meta = await registerLocalWorkspace(tree.dir);
+    if (signal.aborted) return { error: "Stopped." };
+    const meta = await registerLocalWorkspace(tree.dir, {}, { signal });
     // One branch (and PR) per issue: a rerun replaces it rather than opening another.
     const branch = (await existingIssueBranch(home, issue.number)) ?? issueBranchName(issue.number, issue.title);
     return await fixIn({ ...task, repoKey: meta.repoKey }, tree.dir, home, text, {
@@ -135,7 +136,7 @@ interface BatchItem {
   url: string;
   number: number;
   title: string;
-  state: "pending" | "running" | "resolved" | "failed";
+  state: "pending" | "running" | "resolved" | "failed" | "cancelled";
   detail?: string;
   /** The proven fix, committed on a detached HEAD (kept alive by a ref). */
   commit?: string;
@@ -189,16 +190,31 @@ async function fixIssueBatch(
     ],
     waves: [issueSteps.map((step) => step.id), ["deliver"]],
   };
+  // A cancelled item is not in progress (its spinner ends) and not done:
+  // TodoItem has no "cancelled" status, so it is "pending" marked "⊘ … (cancelled)".
+  const mark = (i: BatchItem) => (i.state === "resolved" ? "✓" : i.state === "failed" ? "✗" : i.state === "cancelled" ? "⊘" : "");
   const checklist = () =>
     ctx.emit({
       type: "todos",
       agentId: "issues",
       items: items.map((i) => ({
         id: String(i.number),
-        content: `${i.state === "resolved" ? "✓" : i.state === "failed" ? "✗" : ""} #${i.number} ${i.title}${i.detail ? ` (${i.detail})` : ""}`.trim(),
+        content: `${mark(i)} #${i.number} ${i.title}${i.detail ? ` (${i.detail})` : ""}`.trim(),
         status: i.state === "resolved" ? "completed" : i.state === "running" ? "in_progress" : "pending",
       })),
     });
+  // Stop: every issue not yet fixed is cancelled at once (running solves
+  // unwind in the background), so no row keeps spinning while they do.
+  const cancelOpen = () => {
+    let changed = false;
+    for (const i of items) {
+      if (i.state !== "pending" && i.state !== "running") continue;
+      Object.assign(i, { state: "cancelled", detail: "cancelled" });
+      changed = true;
+    }
+    if (changed) checklist();
+  };
+  ctx.signal.addEventListener("abort", cancelOpen, { once: true });
   const say = (text: string) => ctx.emit({ type: "agent_text", agentId: "issues", text: `${text}\n` });
   ctx.emit({ type: "run_start", runId: task.id, mode: "single", model, at: startedAt });
   ctx.emit({ type: "plan", plan, awaitingApproval: false });
@@ -221,14 +237,21 @@ async function fixIssueBatch(
     item.state = "running";
     checklist();
     const began = Date.now();
+    const stopped = () => {
+      if (ctx.signal.aborted) throw new Error("cancelled");
+    };
     try {
       const { text, issue } = await fetchIssueTask(item.url);
+      stopped();
       item.title = issue.title;
       if (issue.state !== "open") throw new Error("issue is closed");
       checklist();
       const tree = await issueTree();
       try {
-        const handle = await openWorkspace((await registerLocalWorkspace(tree.dir)).repoKey);
+        stopped();
+        // The signal also stops the worktree's scan and index midway.
+        const handle = await openWorkspace((await registerLocalWorkspace(tree.dir, {}, { signal: ctx.signal })).repoKey);
+        stopped();
         const result = await solveTask({
           handle,
           task: withProjectLessons(home, task.instructions
@@ -248,6 +271,7 @@ async function fixIssueBatch(
           useRepoRules: true,
         });
         batchUsage = addUsage(batchUsage, usageFromResult(result));
+        stopped();
         if (result.status === "error" || (result.metrics.modelCalls === 0 && result.error)) {
           fatal = result.error ?? "the solver could not start";
           throw new Error(fatal);
@@ -268,20 +292,29 @@ async function fixIssueBatch(
         await removeIssueWorktree(home, tree.dir);
       }
     } catch (error) {
-      item.state = "failed";
-      item.detail = (error instanceof Error ? error.message : String(error)).slice(0, 160);
-      say(`✗ #${item.number} not fixed: ${item.detail}`);
+      if (ctx.signal.aborted) {
+        Object.assign(item, { state: "cancelled", detail: "cancelled" });
+      } else {
+        item.state = "failed";
+        item.detail = (error instanceof Error ? error.message : String(error)).slice(0, 160);
+        say(`✗ #${item.number} not fixed: ${item.detail}`);
+      }
     }
     checklist();
   }
 
-  // A small worker pool over the issues, in order.
+  // A small worker pool over the issues, in order; Stop ends it between issues.
   let next = 0;
   await Promise.all(
     Array.from({ length: Math.min(BATCH_CONCURRENCY, items.length) }, async () => {
-      while (next < items.length) await solveOne(items[next++]!);
+      while (next < items.length && !ctx.signal.aborted) await solveOne(items[next++]!);
     }),
   );
+  ctx.signal.removeEventListener("abort", cancelOpen);
+  if (ctx.signal.aborted) {
+    cancelOpen();
+    say("Stopped.");
+  }
   if (fatal) {
     for (const i of items) if (i.state === "pending") Object.assign(i, { state: "failed", detail: "skipped" });
     checklist();

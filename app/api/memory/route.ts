@@ -25,7 +25,7 @@ import {
   type MemoryEntryKind,
 } from "@/lib/memory";
 import { addEntry, removeEntry, type AnchoredKind } from "@/lib/memory/graph";
-import { openWorkspace, refreshMemory, writeMemoryMirror } from "@/lib/workspace";
+import { findWorkspace, openWorkspace, refreshMemory, writeMemoryMirror } from "@/lib/workspace";
 
 const ENTRY_KINDS: MemoryEntryKind[] = ["decision", "fact", "convention", "suggestion"];
 const NOTE_KINDS: AnchoredKind[] = [...ENTRY_KINDS, "note"];
@@ -39,7 +39,8 @@ export async function GET(request: Request) {
     return Response.json({ error: "repoKey is required" }, { status: 400 });
   }
 
-  const handle = await openWorkspace(repoKey);
+  const handle = await findWorkspace(repoKey);
+  if (!handle) return Response.json({ error: "Unknown workspace" }, { status: 404 });
   // `?view=graph`: the graph-anchored memory (entries, summaries, runs with staleness).
   if (url.searchParams.get("view") === "graph") {
     return Response.json({ graph: getMemoryGraph(handle.rootPath ?? `store:${repoKey}`) });

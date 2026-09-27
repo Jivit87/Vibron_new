@@ -413,14 +413,25 @@ describe("Stop", () => {
       });
     const { tasks } = await fixIssues({ repoKey, numbers: [7, 9, 10, 11], combined: true, deliver: true });
     const queue = getTaskQueue();
+    const events: OrchestrationEvent[] = [];
+    await queue.subscribe(tasks[0]!.id, (event) => events.push(event), () => undefined);
     for (let i = 0; i < 400 && solved.length < 3; i += 1) await new Promise((r) => setTimeout(r, 10));
     expect(solved).toHaveLength(3);
     const stoppedAt = Date.now();
     await queue.cancel(tasks[0]!.id);
+    // The checklist is updated as soon as Stop lands: nothing is left spinning.
+    const atStop = events.filter((e) => e.type === "todos").at(-1);
+    expect(atStop?.type === "todos" && atStop.items.every((item) => item.status !== "in_progress")).toBe(true);
     await queue.idle();
     expect(Date.now() - stoppedAt).toBeLessThan(2_000);
     expect(solved).toHaveLength(3);
     expect(await queue.get(tasks[0]!.id)).toMatchObject({ state: "cancelled" });
+    const last = events.filter((e) => e.type === "todos").at(-1);
+    expect(last?.type === "todos" && last.items.map((item) => [item.status, item.content.startsWith("⊘")])).toEqual(
+      Array.from({ length: 4 }, () => ["pending", true]),
+    );
+    expect(events.at(-1)).toMatchObject({ type: "run_done", status: "cancelled" });
+    expect((await queue.get(tasks[0]!.id))?.issueResults?.map((r) => r.detail)).toEqual(["cancelled", "cancelled", "cancelled", "cancelled"]);
     expect(posted).toEqual([]);
     expect(repo.git("worktree", "list").trim().split("\n")).toHaveLength(1);
     expect(repo.git("for-each-ref", "refs/viberon").trim()).toBe("");

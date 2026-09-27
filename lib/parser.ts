@@ -204,6 +204,33 @@ function extractJs(file: RepoFile, hash: string): FileExtract {
 
 /** Link per-file extracts into one graph: resolve imports, then calls. Pure and cheap. */
 export function linkGraph(extracts: Iterable<FileExtract>, ctx: LinkContext): Graph {
+  const steps = linkGraphSteps(extracts, ctx);
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+  }
+}
+
+/**
+ * `linkGraph` that yields to the event loop while it works (a large repo's
+ * link is hundreds of ms of CPU) and stops when `signal` aborts. Same result.
+ */
+export async function linkGraphAsync(
+  extracts: Iterable<FileExtract>,
+  ctx: LinkContext,
+  tick: (signal?: AbortSignal) => Promise<void>,
+  signal?: AbortSignal,
+): Promise<Graph> {
+  const steps = linkGraphSteps(extracts, ctx);
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+    await tick(signal);
+  }
+}
+
+/** The link, as a generator that pauses once per file of each pass. */
+function* linkGraphSteps(extracts: Iterable<FileExtract>, ctx: LinkContext): Generator<void, Graph, void> {
   const all = [...extracts];
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
@@ -213,6 +240,7 @@ export function linkGraph(extracts: Iterable<FileExtract>, ctx: LinkContext): Gr
   const resolver = makeResolver(ctx);
 
   for (const extract of all) {
+    yield;
     for (const node of extract.nodes) {
       nodes.push(node);
       nodesByFileAndName.set(`${node.file}#${node.name}`, node);
@@ -224,6 +252,7 @@ export function linkGraph(extracts: Iterable<FileExtract>, ctx: LinkContext): Gr
   }
 
   for (const extract of all) {
+    yield;
     for (const imp of extract.imports) {
       for (const target of resolver(extract, imp.request, imp.specifiers, Boolean(imp.wildcard))) {
         if (target.to === extract.path) continue;
@@ -247,7 +276,9 @@ export function linkGraph(extracts: Iterable<FileExtract>, ctx: LinkContext): Gr
     edges.push(edge);
   };
 
+  let sinceYield = 0;
   for (const fileImport of imports) {
+    if ((sinceYield += 1) % 64 === 0) yield;
     // Same-package visibility is not an import; only written imports get edges.
     if (fileImport.implicit) continue;
     const sources = fileToNodeIds.get(fileImport.from) ?? [];
@@ -266,6 +297,7 @@ export function linkGraph(extracts: Iterable<FileExtract>, ctx: LinkContext): Gr
     importsByFile.set(fileImport.from, list);
   }
   for (const extract of all) {
+    yield;
     for (const call of extract.calls) {
       const target = resolveCallTarget(
         { ...call, file: extract.path },

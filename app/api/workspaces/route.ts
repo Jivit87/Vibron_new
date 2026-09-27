@@ -1,6 +1,19 @@
+/**
+ * GET  /api/workspaces → {workspaces: [{repoKey, label, rootPath, repoRef, registeredAt}]} (newest first)
+ * POST /api/workspaces {rootPath} → {repoKey, label}
+ */
+
 import { registerLocalWorkspace, WorkspacePathError } from "@/lib/local-disk-workspace";
+import { listLocalWorkspaces } from "@/lib/store";
 
 export const runtime = "nodejs";
+
+export async function GET() {
+  const workspaces = await listLocalWorkspaces();
+  return Response.json({
+    workspaces: workspaces.map(({ repoKey, label, rootPath, repoRef, registeredAt }) => ({ repoKey, label, rootPath, repoRef, registeredAt })),
+  });
+}
 
 export async function POST(request: Request) {
   let body: unknown;

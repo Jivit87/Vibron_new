@@ -18,7 +18,9 @@ import type { Graph } from "@/lib/graph";
 import type { RepoFile } from "@/lib/github";
 import { isSourceFilePath } from "@/lib/github";
 import { loadPathAliases, type PathAliases } from "@/lib/lang/tsconfig";
-import { extractFile, goModuleOf, hashSource, linkGraph, type FileExtract } from "@/lib/parser";
+import { extractFile, goModuleOf, hashSource, linkGraphAsync, type FileExtract } from "@/lib/parser";
+import { timeSlicer } from "@/lib/workers/yield";
+import { onEphemeralRelease } from "@/lib/workspace/ephemeral";
 
 export const GRAPH_INDEX_VERSION = 1;
 export const VIBERON_DIR = ".viberon";
@@ -35,10 +37,18 @@ export interface IndexStats {
   parsed: number;
   reused: number;
   removed: number;
+  /** The scan hit a cap (file count or bytes): the graph covers part of the repo. */
+  truncated?: boolean;
 }
 
 const memoryIndexes = ((globalThis as { __viberonGraphIndexes?: Map<string, GraphIndexDoc> })
   .__viberonGraphIndexes ??= new Map<string, GraphIndexDoc>());
+
+// A released issue worktree's index goes with it (its extracts stay shared
+// with the workspace it was checked out from).
+onEphemeralRelease((_repoKey, rootPath) => {
+  memoryIndexes.delete(`disk:${path.resolve(rootPath)}`);
+});
 
 function indexPath(rootPath: string): string {
   return path.join(rootPath, VIBERON_DIR, "graph.json");
@@ -126,25 +136,49 @@ export async function excludeFromGit(rootPath: string, pattern: string): Promise
   return true;
 }
 
-function linkDoc(doc: GraphIndexDoc): Graph {
-  return linkGraph(Object.values(doc.files), {
-    repoRef: doc.repoRef,
-    knownFiles: new Set(Object.keys(doc.files)),
-    aliases: doc.aliases,
-    goModule: doc.goModule,
-  });
+/** Link the doc's extracts, yielding to the event loop as it goes. */
+function linkDoc(doc: GraphIndexDoc, signal?: AbortSignal): Promise<Graph> {
+  return linkGraphAsync(
+    Object.values(doc.files),
+    {
+      repoRef: doc.repoRef,
+      knownFiles: new Set(Object.keys(doc.files)),
+      aliases: doc.aliases,
+      goModule: doc.goModule,
+    },
+    timeSlicer(),
+    signal,
+  );
+}
+
+/**
+ * An extract of the same path and content from any other loaded index. An
+ * issue worktree is a fresh checkout of a workspace that is already indexed:
+ * without this every worktree re-parsed the whole repository.
+ */
+function donorExtract(previous: GraphIndexDoc | null, filePath: string, hash: string): FileExtract | null {
+  for (const doc of memoryIndexes.values()) {
+    if (doc === previous) continue;
+    const hit = doc.files[filePath];
+    if (hit && hit.hash === hash) return hit;
+  }
+  return null;
 }
 
 /**
  * Bring the index in line with `files` (the full workspace listing): reuse
  * extracts whose hash matches, parse the rest, drop deleted files, re-link.
+ * Yields to the event loop between files (requests, Stop, stay responsive)
+ * and throws when `signal` aborts.
  */
 export async function indexWorkspaceFiles(
   key: string,
   rootPath: string | null,
   repoRef: string,
   files: RepoFile[],
+  options: { signal?: AbortSignal } = {},
 ): Promise<{ graph: Graph; stats: IndexStats }> {
+  const tick = timeSlicer();
   const previous = await loadIndex(key, rootPath);
   const doc: GraphIndexDoc = {
     version: GRAPH_INDEX_VERSION,
@@ -156,9 +190,11 @@ export async function indexWorkspaceFiles(
   const stats: IndexStats = { parsed: 0, reused: 0, removed: 0 };
   for (const file of files) {
     if (!isSourceFilePath(file.path)) continue;
+    await tick(options.signal);
     const hash = hashSource(file.source);
-    const cached = previous?.files[file.path];
-    if (cached && cached.hash === hash) {
+    const own = previous?.files[file.path];
+    const cached = own && own.hash === hash ? own : donorExtract(previous, file.path, hash);
+    if (cached) {
       doc.files[file.path] = cached;
       stats.reused += 1;
     } else {
@@ -170,7 +206,7 @@ export async function indexWorkspaceFiles(
     stats.removed = Object.keys(previous.files).filter((p) => !(p in doc.files)).length;
   }
   await saveIndex(key, rootPath, doc);
-  return { graph: linkDoc(doc), stats };
+  return { graph: await linkDoc(doc, options.signal), stats };
 }
 
 /**

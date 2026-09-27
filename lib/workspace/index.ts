@@ -26,6 +26,7 @@ import {
 } from "@/lib/store";
 import {
   patchWorkspaceFile,
+  tokenIndex,
   readLocalWorkspaceFile,
   resolveWorkspaceFilePath,
   scanLocalWorkspace,
@@ -33,7 +34,6 @@ import {
   writeLocalWorkspaceFile,
 } from "@/lib/local-disk-workspace";
 import { indexWorkspaceFiles } from "@/lib/workspace/graph-index";
-import { countTokens } from "@/lib/tokens";
 import { deriveMemory, importLegacyEntries, loadMemory, saveMemory } from "@/lib/memory";
 import type { ProjectMemory } from "@/lib/memory/types";
 
@@ -62,6 +62,18 @@ export async function openWorkspace(repoKey: string): Promise<WorkspaceHandle> {
     repoRef: graph?.meta.repoRef ?? `store/${repoKey}`,
     label: graph?.meta.repoRef?.split("/")[1]?.split("@")[0] ?? "Workspace",
   };
+}
+
+/**
+ * `openWorkspace` for a repoKey the app actually knows (a registered folder,
+ * or an ingested repo with a graph or files); null for anything else, so
+ * routes can answer 404 instead of fabricating an empty workspace.
+ */
+export async function findWorkspace(repoKey: string): Promise<WorkspaceHandle | null> {
+  if (await getLocalWorkspace(repoKey)) return openWorkspace(repoKey);
+  if (await getGraph(repoKey)) return openWorkspace(repoKey);
+  if ((await getRawFiles(repoKey)).length) return openWorkspace(repoKey);
+  return null;
 }
 
 /* ------------------------------ reads ------------------------------------ */
@@ -192,10 +204,7 @@ export async function fullReindex(
 
   await Promise.all([
     putGraph(handle.repoKey, parsed.graph),
-    putFileInfo(
-      handle.repoKey,
-      files.map((f) => ({ path: f.path, tokenCount: countTokens(f.source) })),
-    ),
+    putFileInfo(handle.repoKey, await tokenIndex(files)),
     handle.rootPath ? Promise.resolve() : putRawFiles(handle.repoKey, files),
   ]);
 

@@ -2,7 +2,7 @@
  * Ephemeral workspaces: an issue fix runs in a throwaway `git worktree`, and
  * registering it like a real workspace used to copy every file, the file
  * index and the symbol graph of that checkout into the persisted dev store
- * (`.viberon-dev-store.json` / Firestore) — once per issue, never removed.
+ * (the disk store / Firestore) — once per issue, never removed.
  *
  * A root registered here keeps all its store entries (`<kind>:<repoKey>`)
  * in process memory only. They are dropped when the worktree is released, or
@@ -20,7 +20,7 @@ export const ISSUE_WORKTREE_PREFIX = "viberon-issue-";
 
 const SWEEP_MS = 15_000;
 const roots = new Map<string, string>();
-const releaseListeners = new Set<(repoKey: string) => void>();
+const releaseListeners = new Set<(repoKey: string, rootPath: string) => void>();
 let sweeper: ReturnType<typeof setInterval> | null = null;
 
 function realTmp(): string {
@@ -68,8 +68,9 @@ export function isEphemeralStoreKey(key: string): boolean {
 
 /** Drop the workspace and everything the store held for it. */
 export function releaseEphemeralWorkspace(repoKey: string): void {
-  if (!roots.delete(repoKey)) return;
-  for (const listener of releaseListeners) listener(repoKey);
+  const rootPath = roots.get(repoKey);
+  if (rootPath === undefined || !roots.delete(repoKey)) return;
+  for (const listener of releaseListeners) listener(repoKey, rootPath);
   if (!roots.size && sweeper) {
     clearInterval(sweeper);
     sweeper = null;
@@ -97,7 +98,7 @@ export function ephemeralWorkspaceCount(): number {
 }
 
 /** The store subscribes to drop a released workspace's entries. */
-export function onEphemeralRelease(listener: (repoKey: string) => void): () => void {
+export function onEphemeralRelease(listener: (repoKey: string, rootPath: string) => void): () => void {
   releaseListeners.add(listener);
   return () => releaseListeners.delete(listener);
 }
