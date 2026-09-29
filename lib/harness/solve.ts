@@ -46,6 +46,7 @@ import {
 } from "@/lib/harness/gate";
 import { fastLessons, isSourceFile, runFastPath, touchesCode, type FastResult } from "@/lib/harness/fastpath";
 import { condenseIssueText } from "@/lib/text/condense";
+import { signatureImpact, signatureIndex } from "@/lib/harness/impact";
 import { GIVE_UP, gaveUpAfterTokens, issueTokenBudget, NUDGES, TrajectoryGuards } from "@/lib/harness/recovery";
 import { triage } from "@/lib/harness/triage";
 import {
@@ -139,6 +140,9 @@ class SolveController implements RunController {
   private proofChecks = 0;
   private lastProofStep = 0;
   private step = 0;
+  /** Every file this attempt edited, and the symbols the impact check has named. */
+  private readonly edited = new Set<string>();
+  private readonly impactReported = new Set<string>();
 
   constructor(
     private readonly opts: {
@@ -156,6 +160,9 @@ class SolveController implements RunController {
       noEditTurns?: number;
       /** Wall-time a phase (the gate's rulings). */
       timed: <T>(phase: string, fn: () => Promise<T>) => Promise<T>;
+      /** For the impact check: the workspace graph and the original code's signatures. */
+      repoKey?: string;
+      baseSignatures?: Map<string, string>;
     },
   ) {
     this.guards = new TrajectoryGuards(opts.maxTurns);
@@ -244,10 +251,21 @@ class SolveController implements RunController {
       }
     }
     const notes: string[] = this.pending.splice(0);
+    const impact = await this.impactCheck(filesChanged);
+    if (impact) notes.push(impact);
     const proof = await this.harnessCheckpoint(step);
     if (proof) notes.push(proof);
     for (const g of this.guards.guards(step)) notes.push(this.recovery(g));
     return notes.length ? notes.join("\n\n") : null;
+  }
+
+  /** Zero model tokens: callers left behind by a changed signature (lib/harness/impact.ts). */
+  private async impactCheck(filesChanged: string[]): Promise<string | null> {
+    for (const f of filesChanged) this.edited.add(f);
+    const { repoKey, baseSignatures } = this.opts;
+    if (!repoKey || !baseSignatures?.size || !filesChanged.some(isSourceFile)) return null;
+    const now = await getGraph(repoKey).catch(() => null);
+    return now ? signatureImpact(baseSignatures, now, filesChanged, this.edited, this.impactReported) : null;
   }
 
   /**
@@ -657,6 +675,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
     const [ref, eng, suite] = await Promise.all([baseRefP, engineP, suiteP]);
     baseRef = ref;
     engine = eng;
+    const baseSignatures = signatureIndex(engine.graph);
     emit({ type: "checkpoint", id: randomUUID(), label: "Original code", fileCount: 0, kind: "edit_batch", ref });
 
     const gate = new Gate({
@@ -925,6 +944,8 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
         budget,
         startedAt,
         timed,
+        repoKey: handle.repoKey,
+        baseSignatures,
       });
       activeController = controller;
       const run = await timed("loop", () => runAgent({

@@ -138,6 +138,7 @@ Memory lives in `lib/memory/graph.ts`. Every entry (fact, decision, convention, 
 - **Compaction.** Past 60% of the window, old tool results are elided first; the middle is summarized only if that is not enough.
 - **Stale-view elision and pruning** (`lib/harness/compact.ts` `pruneTranscript`). After an edit, any earlier view of that file becomes a one-line marker. Old write payloads become a stub that gives path, line count and sha. Pruning waits until it frees enough to be worth a prompt-cache miss.
 - **Zero-token harness work.** Localization and the issue-snippet run (`lib/localize/`) and the harness checkpoint (`lib/harness/solve.ts` `harnessCheckpoint`) spend no model tokens.
+- **Impact check** (`lib/harness/impact.ts`, CodePlan's may-impact analysis). When an edit changes a symbol's signature, the end-of-turn note names its callers in files the agent has not edited, from the code graph. A body-only change is never reported, and each symbol is named once per attempt.
 - **Overflow fallback** (`lib/agents/runner.ts`). A provider that says "too large" gets a compact system prompt and a smaller tool set. Pramana's hard compaction of the transcript and its task shortening (`compact_hard`, `shrink_initial`) are only partly ported.
 - **Fast path.** *Today*: the first attempt runs at `effort: "medium"`. The blind test writer, the reviewer and attempt 2 run only on evidence (`lib/harness/solve.ts`). The single-agent route in `lib/agents/orchestrator.ts` skips team planning. *Planned* (Pramana `agent/fastpath.py`):
   - zero-token triage;
