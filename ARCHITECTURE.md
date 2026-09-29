@@ -145,10 +145,9 @@ Memory lives in `lib/memory/graph.ts`. Every entry (fact, decision, convention, 
   - a near-miss SEARCH apply;
   - a "final answer now" call when a reply is cut off;
   - escalation to the full loop that carries the lessons learned.
-- **Planned token savers.**
-  - Condense issue text once at intake, eliding long logs and package lists (Pramana `repo/issue.py`).
-  - A limiter shared per endpoint for parallel issue tasks (Pramana `_Throttle`).
-  - Never mark a docs- or config-only patch as verified (`touches_code`).
+- **Issue condensed at intake** (`lib/text/condense.ts`, Pramana `repo/issue.py`). Long logs, package lists and deep tracebacks in the issue are cut to start and end once, before any model sees them. Localization still reads the full text.
+- **`touches_code`.** A patch that changes no non-test source file (docs, config, CI or tests only) never ends `resolved`, whatever the checks say.
+- **Planned token saver.** A limiter shared per endpoint for parallel issue tasks (Pramana `_Throttle`).
 
   The module-by-module status is in [`docs/PORT-AI-HARNESS.md`](docs/PORT-AI-HARNESS.md).
 - **Output hygiene** (`lib/verify/extract.ts`).

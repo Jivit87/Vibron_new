@@ -27,7 +27,7 @@ Target: a small project stays under **100k tokens** for a whole task, and respon
 | `compact_hard` on context overflow | partial | overflow is detected in `lib/ai/retry.ts` `classifyProviderError`. `lib/agents/runner.ts` then retries in compact mode (`compactSystemPrompt`, reduced tool set). Pramana's forced hard compaction of the *transcript* has no dedicated path yet |
 | `shrink_initial`: shorten the task when the window is too small | partial | `lib/agents/runner.ts` compact mode shrinks the system prompt and the tools, but not the task text |
 | `strip_private`: drop reasoning the next call must not see | ported | `lib/harness/compact.ts` `withoutStaleThinking` |
-| Issue condensed once at intake (long logs and package lists, `repo/issue.py` `condense`/`_elide_lines`) | **missing** | planned for the issue/task-text path (`lib/issues/index.ts` `issueTaskText` or a shared `lib/text/` helper). Today a pasted log is sent again on every turn |
+| Issue condensed once at intake (long logs and package lists, `repo/issue.py` `condense`/`_elide_lines`) | ported | `lib/text/condense.ts` `condenseIssueText`, applied once in `lib/harness/solve.ts` to every model-facing copy of the task (solver, fast path, criteria, reviewer, test writer). Localization and triage keep the full text. `result.json` `metrics.issueChars` records before/after |
 | Zero-token localization (`repo/localize.py`) | ported | `lib/localize/index.ts` (`extractSignals`, BM25, traceback paths, test imports, `lessons`) |
 | Zero-token issue-snippet repro (`repo/snippets.py`) | ported | `lib/localize/snippets.ts` |
 | Harness checkpoint: proof re-run with no model tokens (`agent/loop.py`) | ported | `lib/harness/solve.ts` `SolveController.harnessCheckpoint` |
@@ -55,7 +55,7 @@ Target: a small project stays under **100k tokens** for a whole task, and respon
 | `loop.py` `FatalModelError` | endpoint that stops answering ends the run cleanly | ported | `lib/ai/retry.ts` + `lib/agents/runner.ts` `friendlyProviderError` |
 | `orchestrator.py` `Orchestrator` | attempts, fresh context and lessons, `pick_best` | ported | `lib/harness/solve.ts` `solveTask`, `lessonsFrom`, `pickBest` |
 | `orchestrator.py` `triage` | size the issue with zero tokens | **missing** | planned `lib/harness/` |
-| `orchestrator.py` `touches_code` | a docs/config/CI-only or empty patch is never "verified" | **missing** | planned in `lib/harness/gate.ts` (accept path) |
+| `orchestrator.py` `touches_code` | a docs/config/CI-only or empty patch is never "verified" | ported | `lib/harness/fastpath.ts` `touchesCode` (a non-test source file must change), applied to the final status in `lib/harness/solve.ts`: such a patch ends `incomplete`, with the reason in `gate.reason`. Test-only patches count as not touching code too |
 | `orchestrator.py` `TrajectoryRecorder` | `trajectory.jsonl` | ported | `lib/headless/run.ts` |
 | `fastpath.py` | one-call fix, `gather_files`, `parse_reply`, `near_miss_apply`, retry with reason, escalate with lessons | **missing** | planned `lib/harness/` (fast path) |
 | `context.py` | estimate, elide, compact, compact_hard, shrink_initial, strip_private | ported / partial | `lib/harness/compact.ts`, `lib/agents/runner.ts` (see the table above) |
@@ -120,10 +120,9 @@ Target: a small project stays under **100k tokens** for a whole task, and respon
 
 1. **One-call fast path + triage** (`fastpath.py`). Pramana measured 10/10 verified in 6 min 52 s
    with 54 calls, against 8/10 in about 11.5 min with about 204 calls on the full pipeline. Owner: `lib/harness/`.
-2. **Issue condense at intake** (`issue.condense`). It removes a pasted log from every later turn. Owner: the
-   issue/task-text path.
+2. ~~**Issue condense at intake**~~ (ported).
 3. **Shared per-endpoint limiter** (`_Throttle`). Parallel issue tasks back off once per burst of 429s
    instead of each retrying on its own. Owner: `lib/ai/`.
-4. **`touches_code` guard.** A docs/config-only or empty patch is never "verified". Owner: `lib/harness/gate.ts`.
+4. ~~**`touches_code` guard**~~ (ported).
 
 Measure every one of these before and after the change with the token benchmark (`scripts/bench-tokens.ts`, which a parallel branch is adding) and with `result.json.metrics`.
