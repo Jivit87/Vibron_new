@@ -188,6 +188,22 @@ const MUTATING_TOOLS = new Set([
   "create_directory",
 ]);
 
+/**
+ * Tools that only read the workspace. A turn's leading run of these starts
+ * together; nothing they do depends on another call in the same turn.
+ */
+const PARALLEL_SAFE_TOOLS = new Set([
+  "view",
+  "read_file",
+  "find_symbols",
+  "grep",
+  "list_files",
+  "symbol_index",
+  "graph_search",
+  "symbol_outline",
+  "workspace_stats",
+]);
+
 /** Plain-text replies cut off by the output cap are continued at most this often. */
 const MAX_TEXT_CONTINUATIONS = 3;
 
@@ -854,11 +870,21 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
       });
       messages.push({ role: "assistant", content });
 
-      // Execute tool calls in order. Sequential rather than parallel: later
-      // calls in a turn frequently depend on earlier ones (write then read),
-      // and a readable trace matters more here than a few hundred ms.
+      // Execute tool calls in order: later calls in a turn frequently depend
+      // on earlier ones (write then read). The exception is the turn's leading
+      // run of read-only calls, which start together here; their results are
+      // still consumed, reported and deduped one by one, in order below.
       const results: Extract<AiMessage["content"][number], { type: "tool_result" }>[] = [];
       batchChanges = [];
+      const prefetched = new Map<string, Promise<string>>();
+      if (calls.length > 1 && !input.signal?.aborted && !controller?.isDone?.()) {
+        for (const call of calls) {
+          if (call.inputError || !PARALLEL_SAFE_TOOLS.has(call.name)) break;
+          const pending = runTool(call.name, call.input, ctx);
+          pending.catch(() => {}); // awaited below; never an unhandled rejection
+          prefetched.set(call.id, pending);
+        }
+      }
       for (const call of calls) {
         const args = formatArgs(call.input);
         input.emit({
@@ -884,7 +910,7 @@ export async function runAgent(input: AgentRunInput): Promise<AgentRunResult> {
           const refusal = MUTATING_TOOLS.has(call.name)
             ? await controller?.beforeMutation?.({ name: call.name, input: call.input })
             : null;
-          output = refusal ? refusal : await runTool(call.name, call.input, ctx);
+          output = refusal ? refusal : await (prefetched.get(call.id) ?? runTool(call.name, call.input, ctx));
         }
         const failed = isToolFailure(output);
         const hint = await controller?.onToolResult?.({
