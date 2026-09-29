@@ -814,6 +814,8 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
     };
     const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
     let lessons: string | null = null;
+    /** Lessons from each full attempt so far; a third attempt sees them all, not just the last. */
+    const attemptLessons: string[] = [];
     let retryReason: string | undefined;
     let reviewTask: string | null = null;
     let reviewTitle = "Address review finding";
@@ -1123,7 +1125,13 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
         });
         break;
       }
-      lessons = lessonsFrom(record);
+      attemptLessons.push(lessonsFrom(record));
+      lessons =
+        attemptLessons.length === 1
+          ? attemptLessons[0]!
+          : attemptLessons
+              .map((l, i) => `Attempt ${i + 1}${i === attemptLessons.length - 1 ? " (the most recent)" : ""}:\n${l}`)
+              .join("\n\n");
       // Fast path missed: switch on the evidence layers for the retry.
       if (n < maxAttempts) await escalate();
       retryReason = `Attempt ${n} ended without proof (${verification ? `gate: ${verification.decision}` : record.stopReason}); retrying from a fresh context with its diff as a rejected alternative.`;

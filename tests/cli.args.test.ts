@@ -83,6 +83,9 @@ describe("parseCliArgs", () => {
     expect(() => parseCliArgs(["run", "--repo", "r"])).toThrow(/--task/);
     expect(() => parseCliArgs(["run", "--repo", "r", "--task", "a", "--task-file", "f"])).toThrow(/only one/);
     expect(() => parseCliArgs(["run", "--repo", "r", "--task", "a", "--max-turns", "zero"])).toThrow(/positive/);
+    expect(parseCliArgs(["run", "--repo", "r", "--task", "a", "--attempts", "3"])).toMatchObject({ attempts: 3 });
+    expect(parseCliArgs(["eval", "--attempts", "3"])).toMatchObject({ command: "eval", attempts: 3 });
+    expect(() => parseCliArgs(["eval", "--attempts", "0"])).toThrow(/positive/);
     expect(() => parseCliArgs(["run", "--repo", "r", "--task", "a", "--bogus", "1"])).toThrow(/Unknown option/);
     expect(() => parseCliArgs(["run", "--repo"])).toThrow(/needs a value/);
     expect(() => parseCliArgs(["deploy"])).toThrow(/Unknown command/);

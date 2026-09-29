@@ -11,7 +11,7 @@
  *   viberon review [--repo <path>] [--base <ref> | --pr <url>] [--model <id>] [--json]
  *   viberon issues [--repo <path>] [--label <l>] [--fix <n,n|all>] [--refix] [--no-deliver] [--model <id>] [--json]
  *   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
- *   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
+ *   viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--attempts <n>] [--timeout <sec>]
  *   viberon swe --ids a,b [--model <id>] [--limit <n>] [--max-turns <n>] [--timeout <sec>] [--data <file>] [--out <dir>] [--gold]
  *   viberon arena report <results.jsonl> [--json]
  */
@@ -25,6 +25,8 @@ export const USAGE = `Usage:
       --test-cmd <cmd>    verification command (default: auto-detected)
       --no-gate           disable the verification gate
       --max-turns <n>     agent turn budget (default 40)
+      --attempts <n>      full attempts when one ends without proof (default 2); the best-proven
+                          patch is kept, and each retry sees every earlier attempt's lessons
       --timeout <sec>     wall-clock budget
       --model <id>        model id (default $VIBERON_MODEL, else the best configured model)
       --task-id <id>      id used for the bundle directory
@@ -45,7 +47,7 @@ export const USAGE = `Usage:
       re-fixes an issue that already has a PR too (updates it, or opens a new one if it was merged);
       --refix is accepted as an explicit alias for that same default
   viberon clone <url|owner/repo|issue-url> [--ref <ref>] [--depth <n>] [--setup] [--json]
-  viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--timeout <sec>]
+  viberon eval [--only a,b] [--model <id>] [--max-turns <n>] [--attempts <n>] [--timeout <sec>]
   viberon swe --ids a,b [--model <id>] [--limit <n>] [--max-turns <n>] [--timeout <sec>] [--data <rows.json>] [--out <dir>] [--gold]
       SWE-bench Verified instances graded by their hidden tests (FAIL_TO_PASS / PASS_TO_PASS);
       --gold applies the official patch instead of running the agent (validates the environment)
@@ -70,6 +72,7 @@ export interface RunArgs {
   testCmd?: string;
   noGate: boolean;
   maxTurns?: number;
+  attempts?: number;
   timeoutSec?: number;
   model?: string;
   json: boolean;
@@ -115,6 +118,7 @@ export interface EvalArgs {
   only?: string[];
   model?: string;
   maxTurns?: number;
+  attempts?: number;
   timeoutSec?: number;
 }
 
@@ -195,13 +199,13 @@ function stringFlag(flags: Map<string, string | true>, name: string): string | u
 const KNOWN: Record<string, Set<string>> = {
   run: new Set([
     "repo", "task", "issue", "task-file", "task-id", "worktree", "keep-worktree", "out", "test-cmd",
-    "no-gate", "max-turns", "timeout", "model", "json", "help", "deliver", "issue-url",
+    "no-gate", "max-turns", "attempts", "timeout", "model", "json", "help", "deliver", "issue-url",
     "review", "no-review", "thorough", "review-model", "independent-test",
   ]),
   review: new Set(["repo", "base", "pr", "model", "json", "help"]),
   issues: new Set(["repo", "label", "fix", "refix", "no-deliver", "model", "json", "help"]),
   clone: new Set(["ref", "depth", "setup", "json", "help"]),
-  eval: new Set(["only", "model", "max-turns", "timeout", "help"]),
+  eval: new Set(["only", "model", "max-turns", "attempts", "timeout", "help"]),
   swe: new Set(["ids", "model", "limit", "max-turns", "timeout", "data", "out", "gold", "help"]),
   arena: new Set(["json", "help"]),
 };
@@ -248,6 +252,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
       testCmd: stringFlag(flags, "test-cmd"),
       noGate: flags.has("no-gate"),
       maxTurns: intFlag(flags, "max-turns"),
+      attempts: intFlag(flags, "attempts"),
       timeoutSec: intFlag(flags, "timeout"),
       model: stringFlag(flags, "model"),
       json: flags.has("json"),
@@ -331,6 +336,7 @@ export function parseCliArgs(argv: string[]): CliArgs {
     only: only ? only.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
     model: stringFlag(flags, "model"),
     maxTurns: intFlag(flags, "max-turns"),
+    attempts: intFlag(flags, "attempts"),
     timeoutSec: intFlag(flags, "timeout"),
   };
 }
@@ -393,6 +399,7 @@ export async function main(argv: string[]): Promise<number> {
       testCmd: args.testCmd,
       noGate: args.noGate,
       maxTurns: args.maxTurns,
+      attempts: args.attempts,
       timeoutMs: args.timeoutSec ? args.timeoutSec * 1000 : undefined,
       model: args.model,
       log,
@@ -568,6 +575,7 @@ export async function main(argv: string[]): Promise<number> {
       only: args.only,
       model: args.model,
       maxTurns: args.maxTurns,
+      attempts: args.attempts,
       timeoutMs: args.timeoutSec ? args.timeoutSec * 1000 : undefined,
       log,
     });

@@ -107,6 +107,8 @@ export interface RunEvalOptions {
   suite?: string;
   model?: string;
   maxTurns?: number;
+  /** Full attempts per task when one ends without proof (default 2). */
+  attempts?: number;
   timeoutMs?: number;
   log?: (line: string) => void;
   /** Injected solver (tests); defaults to the real `solveTask`. */
@@ -145,6 +147,7 @@ export async function runEval(options: RunEvalOptions = {}): Promise<EvalSummary
         out: outDir,
         model,
         maxTurns: options.maxTurns,
+        ...(options.attempts ? { attempts: options.attempts } : {}),
         timeoutMs: options.timeoutMs,
         log: (line) => log(`   ${line}`),
       },

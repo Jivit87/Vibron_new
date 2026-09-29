@@ -49,6 +49,8 @@ export interface HeadlessOptions {
   testCmd?: string;
   noGate?: boolean;
   maxTurns?: number;
+  /** Full attempts when an attempt ends without proof (default 2; each extra one costs a fresh context). */
+  attempts?: number;
   /** Wall-clock budget for the whole solve, ms. */
   timeoutMs?: number;
   verifyTimeoutMs?: number;
@@ -383,6 +385,7 @@ export async function runHeadless(options: HeadlessOptions, deps: HeadlessDeps =
         ...(options.thorough ? { mode: "thorough" as const } : {}),
         ...(options.reviewModel ? { reviewModel: options.reviewModel } : {}),
         ...(options.independentTest ? { independentTest: true } : {}),
+        ...(options.attempts ? { maxAttempts: options.attempts } : {}),
       });
     } finally {
       if (timer) clearTimeout(timer);

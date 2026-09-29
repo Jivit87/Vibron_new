@@ -289,6 +289,37 @@ describe("solveTask", () => {
     expect(log.of("gate").map((g) => g.decision)).toEqual(["give_up", "accept"]);
   });
 
+  it("shows a third attempt the lessons of both earlier attempts", async () => {
+    const WRONG_TOO = "exports.mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / (xs.length * 2) : 0);";
+    const regressThenStop = (find: string, replace: string) => [
+      { calls: [{ name: "edit_file", input: { path: "lib.js", find, replace, summary: "x" } }] },
+      { text: "Done." },
+      { text: "Done." },
+    ];
+    installFakeProvider([
+      ...regressThenStop(ORIGINAL_LINE, WRONG_LINE),
+      ...regressThenStop(ORIGINAL_LINE, WRONG_TOO),
+      (req) => {
+        const first = JSON.stringify(req.messages[0]);
+        expect(first).toMatch(/Attempt 1:/);
+        expect(first).toMatch(/Attempt 2 \(the most recent\):/);
+        expect(first).toContain(WRONG_LINE.slice(0, 60));
+        expect(first).toContain("(xs.length * 2)");
+        return {
+          calls: [
+            { name: "create_file", input: { path: REPRO_PATH, content: REPRO_SRC } },
+            { name: "edit_file", input: { path: "lib.js", find: ORIGINAL_LINE, replace: RIGHT_LINE, summary: "fix" } },
+          ],
+        };
+      },
+      { calls: [{ name: "finish", input: { summary: "fixed", reproduction: REPRO } }] },
+    ]);
+    const result = await solveTask(await options({ maxAttempts: 3 }));
+    expect(result.status).toBe("resolved");
+    expect(repo.read("lib.js")).toBe(`${RIGHT_LINE}\n`);
+    expect(log.of("agent_start").map((a) => a.attempt)).toEqual([1, 2, 3]);
+  });
+
   it("hands a small repository's whole source to the agent in its first message", async () => {
     installFakeProvider([
       (req) => {
