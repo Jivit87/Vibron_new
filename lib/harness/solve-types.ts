@@ -122,6 +122,8 @@ export interface SolveResult {
     phaseMs?: Record<string, number>;
     /** The one-call fast path: whether it ran, its model calls, and whether its proof was accepted. */
     fastPath?: { used: boolean; calls: number; accepted: boolean };
+    /** Issue text sent to the model, before and after intake condensing (chars). */
+    issueChars?: { original: number; condensed: number };
     /** Why the harness stopped spending on an unproven run (give-up rules, token budget). */
     gaveUp?: string;
   };

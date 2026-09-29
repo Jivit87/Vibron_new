@@ -44,7 +44,9 @@ import {
   type GateResult,
   type Outcome,
 } from "@/lib/harness/gate";
-import { fastLessons, isSourceFile, runFastPath, type FastResult } from "@/lib/harness/fastpath";
+import { fastLessons, isSourceFile, runFastPath, touchesCode, type FastResult } from "@/lib/harness/fastpath";
+import { condenseIssueText } from "@/lib/text/condense";
+import { signatureImpact, signatureIndex } from "@/lib/harness/impact";
 import { GIVE_UP, gaveUpAfterTokens, issueTokenBudget, NUDGES, TrajectoryGuards } from "@/lib/harness/recovery";
 import { triage } from "@/lib/harness/triage";
 import {
@@ -138,6 +140,9 @@ class SolveController implements RunController {
   private proofChecks = 0;
   private lastProofStep = 0;
   private step = 0;
+  /** Every file this attempt edited, and the symbols the impact check has named. */
+  private readonly edited = new Set<string>();
+  private readonly impactReported = new Set<string>();
 
   constructor(
     private readonly opts: {
@@ -155,6 +160,9 @@ class SolveController implements RunController {
       noEditTurns?: number;
       /** Wall-time a phase (the gate's rulings). */
       timed: <T>(phase: string, fn: () => Promise<T>) => Promise<T>;
+      /** For the impact check: the workspace graph and the original code's signatures. */
+      repoKey?: string;
+      baseSignatures?: Map<string, string>;
     },
   ) {
     this.guards = new TrajectoryGuards(opts.maxTurns);
@@ -243,10 +251,21 @@ class SolveController implements RunController {
       }
     }
     const notes: string[] = this.pending.splice(0);
+    const impact = await this.impactCheck(filesChanged);
+    if (impact) notes.push(impact);
     const proof = await this.harnessCheckpoint(step);
     if (proof) notes.push(proof);
     for (const g of this.guards.guards(step)) notes.push(this.recovery(g));
     return notes.length ? notes.join("\n\n") : null;
+  }
+
+  /** Zero model tokens: callers left behind by a changed signature (lib/harness/impact.ts). */
+  private async impactCheck(filesChanged: string[]): Promise<string | null> {
+    for (const f of filesChanged) this.edited.add(f);
+    const { repoKey, baseSignatures } = this.opts;
+    if (!repoKey || !baseSignatures?.size || !filesChanged.some(isSourceFile)) return null;
+    const now = await getGraph(repoKey).catch(() => null);
+    return now ? signatureImpact(baseSignatures, now, filesChanged, this.edited, this.impactReported) : null;
   }
 
   /**
@@ -591,6 +610,11 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
   let baseline: Promise<void> = Promise.resolve();
   const phaseMs: Record<string, number> = {};
   result.metrics.phaseMs = phaseMs;
+  // Every model-facing copy of the issue is condensed once (long logs, package
+  // lists, deep tracebacks cut to start + end). Localization and triage keep
+  // the full text: tracebacks and quoted snippets are their signal.
+  const task = condenseIssueText(options.task);
+  result.metrics.issueChars = { original: options.task.length, condensed: task.length };
   const endPhase = (name: string, since: number) => {
     const ms = Date.now() - since;
     phaseMs[name] = (phaseMs[name] ?? 0) + ms;
@@ -632,7 +656,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
     let criteriaP: Promise<string[]> | null = null;
     const startCriteria = (): Promise<string[]> =>
       (criteriaP ??= timed("criteria", () =>
-        predictCriteria({ task: options.task, model: sideModel, signal: options.signal, onTurn: account }),
+        predictCriteria({ task, model: sideModel, signal: options.signal, onTurn: account }),
       ).catch((): string[] => []));
     if (options.criteria ?? thorough) startCriteria();
     const baseRefP = ensureScratch(workRoot).then(() => snapshot(workRoot));
@@ -651,6 +675,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
     const [ref, eng, suite] = await Promise.all([baseRefP, engineP, suiteP]);
     baseRef = ref;
     engine = eng;
+    const baseSignatures = signatureIndex(engine.graph);
     emit({ type: "checkpoint", id: randomUUID(), label: "Original code", fileCount: 0, kind: "edit_batch", ref });
 
     const gate = new Gate({
@@ -721,7 +746,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
         const wide = await diff(workRoot, ref, { toRef: record.tree, context: 25 }).catch(() => "");
         const review = await reviewDiff({
           diff: wide.trim() && wide.length < 80_000 ? wide : record.patch,
-          task: options.task,
+          task,
           model: sideModel,
           signal: options.signal,
           root: workRoot,
@@ -747,7 +772,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
               draftIndependentTest({
                 root: workRoot,
                 baseRef: ref,
-                task: options.task,
+                task,
                 // Like the solver, the writer does not wait on a slow criteria call.
                 criteria: [...criteria],
                 ...(criteria.length ? {} : { lateCriteria: criteriaReady }),
@@ -789,6 +814,8 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
     };
     const maxAttempts = Math.max(1, options.maxAttempts ?? 2);
     let lessons: string | null = null;
+    /** Lessons from each full attempt so far; a third attempt sees them all, not just the last. */
+    const attemptLessons: string[] = [];
     let retryReason: string | undefined;
     let reviewTask: string | null = null;
     let reviewTitle = "Address review finding";
@@ -834,7 +861,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
         runFastPath({
           root: workRoot,
           baseRef: ref,
-          task: options.task,
+          task,
           model: options.model,
           overview,
           sources: loc.files.slice(0, 4).map((f) => f.path),
@@ -919,6 +946,8 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
         budget,
         startedAt,
         timed,
+        repoKey: handle.repoKey,
+        baseSignatures,
       });
       activeController = controller;
       const run = await timed("loop", () => runAgent({
@@ -929,7 +958,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
         // Fast path: light reasoning (measured on the CLI: 11-16 s instead of
         // 25 s per fix, same result). Escalated or thorough runs think hard.
         ...(escalated ? {} : { effort: "medium" as const }),
-        task: reviewTask ?? initialMessage(options.task, overview, renderLocalization(loc), lessons, source, criteria),
+        task: reviewTask ?? initialMessage(task, overview, renderLocalization(loc), lessons, source, criteria),
         title: reviewPass ? reviewTitle : n === 1 ? "Solve task" : `Solve task (attempt ${n}, fresh context)`,
         attempt: n,
         attemptReason: reviewPass ? "A check after the accept (blind test or reviewer) flagged the change." : retryReason,
@@ -1058,7 +1087,7 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
           const failing = blind?.status === "still_failing" || blind?.status === "regression" ? blind : null;
           if (failing || finding) {
             independentRetryCommand = failing?.command ?? null;
-            reviewTask = followUpMessage(options.task, overview, record.patch, finding, failing);
+            reviewTask = followUpMessage(task, overview, record.patch, finding, failing);
             reviewTitle = finding ? "Address review finding" : "Address independent test failure";
             if (failing) {
               emit({
@@ -1096,7 +1125,13 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
         });
         break;
       }
-      lessons = lessonsFrom(record);
+      attemptLessons.push(lessonsFrom(record));
+      lessons =
+        attemptLessons.length === 1
+          ? attemptLessons[0]!
+          : attemptLessons
+              .map((l, i) => `Attempt ${i + 1}${i === attemptLessons.length - 1 ? " (the most recent)" : ""}:\n${l}`)
+              .join("\n\n");
       // Fast path missed: switch on the evidence layers for the retry.
       if (n < maxAttempts) await escalate();
       retryReason = `Attempt ${n} ended without proof (${verification ? `gate: ${verification.decision}` : record.stopReason}); retrying from a fresh context with its diff as a rejected alternative.`;
@@ -1156,6 +1191,10 @@ async function solveTaskInner(options: SolveOptions): Promise<SolveResult> {
     else if (v?.decision === "accept_unverified") result.status = "unverified";
     else result.status = "incomplete";
     if (options.signal?.aborted && result.status !== "resolved") result.status = "incomplete";
+    if (result.status === "resolved" && !touchesCode(result.filesChanged)) {
+      result.status = "incomplete";
+      result.gate.reason = `patch changes no source code (${result.filesChanged.join(", ")}); passing checks do not prove a fix`;
+    }
     // A give-up reason only explains a run that ended without proof.
     if (result.status === "resolved") delete result.metrics.gaveUp;
     else if (result.metrics.gaveUp) result.gate.reason = `${result.metrics.gaveUp}${v ? ` (${result.gate.reason})` : ""}`;

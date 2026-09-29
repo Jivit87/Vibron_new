@@ -138,6 +138,7 @@ Memory lives in `lib/memory/graph.ts`. Every entry (fact, decision, convention, 
 - **Compaction.** Past 60% of the window, old tool results are elided first; the middle is summarized only if that is not enough.
 - **Stale-view elision and pruning** (`lib/harness/compact.ts` `pruneTranscript`). After an edit, any earlier view of that file becomes a one-line marker. Old write payloads become a stub that gives path, line count and sha. Pruning waits until it frees enough to be worth a prompt-cache miss.
 - **Zero-token harness work.** Localization and the issue-snippet run (`lib/localize/`) and the harness checkpoint (`lib/harness/solve.ts` `harnessCheckpoint`) spend no model tokens.
+- **Impact check** (`lib/harness/impact.ts`, CodePlan's may-impact analysis). When an edit changes a symbol's signature, the end-of-turn note names its callers in files the agent has not edited, from the code graph. A body-only change is never reported, and each symbol is named once per attempt.
 - **Overflow fallback** (`lib/agents/runner.ts`). A provider that says "too large" gets a compact system prompt and a smaller tool set. Pramana's hard compaction of the transcript and its task shortening (`compact_hard`, `shrink_initial`) are only partly ported.
 - **Fast path.** *Today*: the first attempt runs at `effort: "medium"`. The blind test writer, the reviewer and attempt 2 run only on evidence (`lib/harness/solve.ts`). The single-agent route in `lib/agents/orchestrator.ts` skips team planning. *Planned* (Pramana `agent/fastpath.py`):
   - zero-token triage;
@@ -145,10 +146,9 @@ Memory lives in `lib/memory/graph.ts`. Every entry (fact, decision, convention, 
   - a near-miss SEARCH apply;
   - a "final answer now" call when a reply is cut off;
   - escalation to the full loop that carries the lessons learned.
-- **Planned token savers.**
-  - Condense issue text once at intake, eliding long logs and package lists (Pramana `repo/issue.py`).
-  - A limiter shared per endpoint for parallel issue tasks (Pramana `_Throttle`).
-  - Never mark a docs- or config-only patch as verified (`touches_code`).
+- **Issue condensed at intake** (`lib/text/condense.ts`, Pramana `repo/issue.py`). Long logs, package lists and deep tracebacks in the issue are cut to start and end once, before any model sees them. Localization still reads the full text.
+- **`touches_code`.** A patch that changes no non-test source file (docs, config, CI or tests only) never ends `resolved`, whatever the checks say.
+- **Planned token saver.** A limiter shared per endpoint for parallel issue tasks (Pramana `_Throttle`).
 
   The module-by-module status is in [`docs/PORT-AI-HARNESS.md`](docs/PORT-AI-HARNESS.md).
 - **Output hygiene** (`lib/verify/extract.ts`).

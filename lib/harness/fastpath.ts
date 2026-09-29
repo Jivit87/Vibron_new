@@ -20,7 +20,7 @@ import path from "node:path";
 import type { EventSink } from "@/lib/agents/events";
 import { runTurn, type EnrichedTurnResult } from "@/lib/ai";
 import type { AiMessage, AiTurnRequest } from "@/lib/ai/types";
-import { renderChecks, type Gate, type GateResult } from "@/lib/harness/gate";
+import { isTestPath, renderChecks, type Gate, type GateResult } from "@/lib/harness/gate";
 import { changedFiles, diff, restore, SCRATCH_DIR } from "@/lib/harness/snapshot";
 import { strReplace } from "@/lib/tools/editor";
 
@@ -330,6 +330,16 @@ const NON_SOURCE = /(^|\/)(\.github|\.circleci|\.gitlab|docs?|\.vscode|\.idea)(\
 /** A file whose change a behavioural test can prove: source code, not docs, config or CI. */
 export function isSourceFile(p: string): boolean {
   return CODE_EXT.test(p) && !NON_SOURCE.test(p) && !p.startsWith(`${SCRATCH_DIR}/`);
+}
+
+/**
+ * Whether a patch changes behaviour-bearing code (Pramana `touches_code`):
+ * at least one source file that is not a test. A docs-, config-, CI- or
+ * test-only patch can make checks pass without fixing anything, so it is
+ * never reported as verified.
+ */
+export function touchesCode(files: string[]): boolean {
+  return files.some((f) => isSourceFile(f) && !isTestPath(f));
 }
 
 /* ------------------------------- the run --------------------------------- */

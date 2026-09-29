@@ -185,6 +185,27 @@ export function isTestPath(p: string): boolean {
   );
 }
 
+/**
+ * Pass/fail counts for a run that is not a detected suite (a targeted
+ * re-run, the agent's reproduction): what the runner printed, else one
+ * per command. Reporting only; verdicts never read counts.
+ */
+export function outputCounts(output: string, passed: boolean): Outcome["counts"] {
+  const parsed = verify.parseTestOutput("custom", output);
+  const outcomes = Object.values(parsed.tests);
+  const fromSummary = parsed.summary && (parsed.summary.passed ?? 0) + (parsed.summary.failed ?? 0) + (parsed.summary.errors ?? 0) > 0;
+  if (fromSummary) {
+    return { passed: parsed.summary!.passed ?? 0, failed: (parsed.summary!.failed ?? 0) + (parsed.summary!.errors ?? 0) };
+  }
+  if (outcomes.length) {
+    return {
+      passed: outcomes.filter((o) => o === "pass").length,
+      failed: outcomes.filter((o) => o === "fail" || o === "error").length,
+    };
+  }
+  return { passed: passed ? 1 : 0, failed: passed ? 0 : 1 };
+}
+
 function tailOf(output: string, lines = 40): string {
   return output.trimEnd().split("\n").slice(-lines).join("\n");
 }
@@ -439,7 +460,7 @@ export class Gate {
       tests: report?.parsed ? report.tests : {},
       counts: report
         ? { passed: report.counts.passed, failed: report.counts.failed + report.counts.errors }
-        : { passed: passed ? 1 : 0, failed: passed ? 0 : 1 },
+        : outputCounts(raw.output, passed),
     };
   }
 
